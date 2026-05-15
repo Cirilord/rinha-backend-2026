@@ -49,17 +49,17 @@ client
 - The API loads the index at startup using `mmap`.
 - For each transaction:
 - A 14-dim vector is built in `transaction_context.c`.
-- `x-score.c` runs IVF + KNN classification.
+- `x-score.c` runs exact kNN (`k=5`) with specialist partitions and `key-first` pruning.
 - The response returns `approved` and `fraud_score`.
 
 ## API environment variables
 
 - `PORT` (required)
 - `WORKERS` (required)
-- `NPROBE` (optional, read by `x-score.c`)
 
 Notes:
-- `KNN_K` and `FRAUD_THRESHOLD` may appear in compose files from previous tuning rounds, but current C code uses fixed values in the hot path.
+- `k=5` is fixed in the hot path (`fraud_score = fraud_count/5`).
+- search mode is fixed to specialist `key-first` in the code.
 
 ## Run locally
 

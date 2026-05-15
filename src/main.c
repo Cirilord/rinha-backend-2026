@@ -40,10 +40,10 @@ int main(void) {
     return 1;
   }
   printf(
-      "x-score index loaded: count=%u dims=%u centroids=%u\n",
-      xscore.sections.header->count,
-      xscore.sections.header->dims,
-      xscore.sections.header->centroids_count);
+      "x-score index loaded: count=%u dims=%d partitions=%u\n",
+      xscore.count,
+      xscore.header ? xscore.header->dims : -1,
+      xscore.partition_count);
 
   for (int i = 1; i < workers; i++) {
     pid_t pid = fork();
@@ -265,8 +265,8 @@ int main(void) {
 
       double vector[14];
       ctx.to_vector(&ctx, vector);
-      uint8_t predicted_label = x_score_predict_label(&xscore, vector);
-      double fraud_score = predicted_label == 1 ? 1.0 : 0.0;
+      uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+      double fraud_score = (double)fraud_count / 5.0;
       int approved = fraud_score < 0.6 ? 1 : 0;
 
       char response_body[256];

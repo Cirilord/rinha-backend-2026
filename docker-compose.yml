@@ -7,9 +7,6 @@ services:
     environment:
       PORT: '9999'
       WORKERS: '4'
-      NPROBE: '10'
-      KNN_K: '5'
-      FRAUD_THRESHOLD: '57'
     # deploy:
     #   resources:
     #     limits:
@@ -26,9 +23,6 @@ services:
     environment:
       PORT: '9999'
       WORKERS: '4'
-      NPROBE: '10'
-      KNN_K: '5'
-      FRAUD_THRESHOLD: '57'
     # deploy:
     #   resources:
     #     limits:

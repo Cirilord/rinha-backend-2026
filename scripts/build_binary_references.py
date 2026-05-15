@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build `resources/references.idx` in the binary layout expected by x-score.c.
+Build `resources/references.idx` in a specialist exact-kNN format.
 
 Input:
 - resources/references.json.gz
@@ -8,16 +8,13 @@ Input:
 Output:
 - resources/references.idx
 
-Current strategy:
-- Uses fixed 3D bucketing clusters (k=128):
-  - amount_bin: 8 buckets from vector[0]
-  - hour_bin: 4 buckets from vector[3]
-  - is_online_bin: 2 buckets from vector[9]
-  - card_present_bin: 2 buckets from vector[10]
-  - cluster_id = (((amount_bin * 4) + hour_bin) * 2 + is_online_bin) * 2 + card_present_bin
-- Reorders vectors by cluster to enable fast contiguous range scans.
-- Labels are bit-packed (fraud=1, legit=0), lsb-first.
-- Vectors are quantized int16 in range [-10000, 10000], from float range [-1, 1].
+Layout (little-endian):
+- header: magic(8) + scale(i32) + dims(i32) + ref_count(i32) +
+          partition_count(i32) + node_count(i32) + block_count(i32)
+- partition directory (72 bytes each)
+- node directory (72 bytes each)
+- vectors in AoSoA blocks (LANES=8): for each block -> dims -> lanes -> i16
+- labels in block order: for each block -> lanes -> u8
 """
 
 from __future__ import annotations
@@ -25,31 +22,67 @@ from __future__ import annotations
 import gzip
 import json
 import struct
+from array import array
+from dataclasses import dataclass, field
 from pathlib import Path
-
 
 INPUT_PATH = Path("resources/references.json.gz")
 OUTPUT_IDX_PATH = Path("resources/references.idx")
 
 DIMS = 14
-MAGIC = 0x3145564F43535852  # must match X_SCORE_MAGIC
-AMOUNT_BUCKETS = 8
-HOUR_BUCKETS = 4
-ONLINE_BUCKETS = 2
-CARD_BUCKETS = 2
-CENTROIDS_COUNT = AMOUNT_BUCKETS * HOUR_BUCKETS * ONLINE_BUCKETS * CARD_BUCKETS
+LANES = 8
+SCALE = 10000
+MAGIC = b"RNSPCST1"
 
 
-def align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) & ~(alignment - 1)
+@dataclass
+class PartitionData:
+    key: int
+    count: int = 0
+    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
+    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
+    vectors: array = field(default_factory=lambda: array("h"))
+    labels: bytearray = field(default_factory=bytearray)
 
 
-def qround(v: float) -> int:
-    if v < -1.0:
-        v = -1.0
-    if v > 1.0:
-        v = 1.0
-    return int(round(v * 10000.0))
+def quantize(value: float) -> int:
+    if value <= -1.0:
+        return -SCALE
+    if value <= 0.0:
+        return 0
+    if value >= 1.0:
+        return SCALE
+    return int(round(value * SCALE))
+
+
+def compute_partition_key(qvec: list[int]) -> int:
+    key = 0
+
+    if qvec[5] >= 0:
+        key |= 1 << 0
+    if qvec[9] > 0:
+        key |= 1 << 1
+    if qvec[10] > 0:
+        key |= 1 << 2
+    if qvec[11] > 0:
+        key |= 1 << 3
+
+    if qvec[12] <= 2000:
+        mcc_bucket = 0
+    elif qvec[12] <= 3000:
+        mcc_bucket = 1
+    elif qvec[12] <= 7500:
+        mcc_bucket = 2
+    else:
+        mcc_bucket = 3
+    key |= mcc_bucket << 4
+
+    if qvec[2] > 1013:
+        key |= 1 << 6
+    if qvec[8] > 2500:
+        key |= 1 << 7
+
+    return key
 
 
 def main() -> None:
@@ -59,111 +92,126 @@ def main() -> None:
     with gzip.open(INPUT_PATH, "rt", encoding="utf-8") as f:
         rows = json.load(f)
 
-    count = len(rows)
-    if count == 0:
-        raise ValueError("empty dataset")
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise ValueError("invalid or empty dataset")
 
-    clusters: list[list[tuple[list[int], int, list[float]]]] = [[] for _ in range(CENTROIDS_COUNT)]
+    partitions: dict[int, PartitionData] = {}
+    total_count = 0
 
     for i, row in enumerate(rows):
         vector = row.get("vector")
         label = row.get("label")
-
         if not isinstance(vector, list) or len(vector) != DIMS:
             raise ValueError(f"invalid vector at index {i}")
 
-        fvec = [float(x) for x in vector]
-        qvec = [qround(x) for x in fvec]
+        qvec = [quantize(float(x)) for x in vector]
         lbl = 1 if label == "fraud" else 0
+        key = compute_partition_key(qvec)
 
-        amount = fvec[0]
-        hour = fvec[3]
-        amount_bin = int(amount * AMOUNT_BUCKETS)
-        hour_bin = int(hour * HOUR_BUCKETS)
-        is_online_bin = 1 if int(fvec[9]) != 0 else 0
-        card_present_bin = 1 if int(fvec[10]) != 0 else 0
-        if amount_bin < 0:
-            amount_bin = 0
-        if amount_bin >= AMOUNT_BUCKETS:
-            amount_bin = AMOUNT_BUCKETS - 1
-        if hour_bin < 0:
-            hour_bin = 0
-        if hour_bin >= HOUR_BUCKETS:
-            hour_bin = HOUR_BUCKETS - 1
-        cluster_id = (
-            ((amount_bin * HOUR_BUCKETS) + hour_bin) * ONLINE_BUCKETS + is_online_bin
-        ) * CARD_BUCKETS + card_present_bin
-        clusters[cluster_id].append((qvec, lbl, fvec))
+        p = partitions.get(key)
+        if p is None:
+            p = PartitionData(key=key)
+            partitions[key] = p
 
-    centroids_q16: list[int] = []
-    cluster_counts: list[int] = []
-    cluster_offsets: list[int] = [0]
-    vectors_q16: list[int] = []
-    labels_in_order: list[int] = []
+        p.count += 1
+        p.labels.append(lbl)
+        p.vectors.extend(qvec)
+        for d in range(DIMS):
+            v = qvec[d]
+            if v < p.minv[d]:
+                p.minv[d] = v
+            if v > p.maxv[d]:
+                p.maxv[d] = v
 
-    for c in range(CENTROIDS_COUNT):
-        items = clusters[c]
-        ccount = len(items)
-        cluster_counts.append(ccount)
-        cluster_offsets.append(cluster_offsets[-1] + ccount)
+        total_count += 1
 
-        if ccount == 0:
-            centroids_q16.extend([0] * DIMS)
-        else:
-            sums = [0.0] * DIMS
-            for _, _, fvec in items:
-                for d in range(DIMS):
-                    sums[d] += fvec[d]
-            centroids_q16.extend([qround(sums[d] / ccount) for d in range(DIMS)])
+    sorted_keys = sorted(partitions.keys())
+    partition_count = len(sorted_keys)
+    node_count = partition_count
 
-        for qvec, lbl, _ in items:
-            vectors_q16.extend(qvec)
-            labels_in_order.append(lbl)
+    partition_entries: list[tuple[int, int, int, list[int], list[int]]] = []
+    node_entries: list[tuple[int, int, int, int, list[int], list[int]]] = []
+    running_blocks = 0
 
-    if len(vectors_q16) != count * DIMS or len(labels_in_order) != count:
-        raise RuntimeError("internal error: reordered dataset size mismatch")
+    for node_idx, key in enumerate(sorted_keys):
+        p = partitions[key]
+        blocks = (p.count + LANES - 1) // LANES
+        start_block = running_blocks
+        running_blocks += blocks
 
-    labels_bits = bytearray((count + 7) // 8)
-    for i, lbl in enumerate(labels_in_order):
-        if lbl == 1:
-            labels_bits[i // 8] |= 1 << (i % 8)
+        partition_entries.append((key, node_idx, p.count, p.minv, p.maxv))
+        node_entries.append((-1, -1, start_block, p.count, p.minv, p.maxv))
 
-    # Header layout in C:
-    # uint64 magic;
-    # uint32 count;
-    # uint32 dims;
-    # uint32 centroids_count;
-    # uint32 reserved[12];
-    header = struct.pack(
-        "<QIII12I",
-        MAGIC,
-        count,
-        DIMS,
-        CENTROIDS_COUNT,
-        *([0] * 12),
-    )
+    total_blocks = running_blocks
 
-    centroids_blob = struct.pack("<" + "h" * (CENTROIDS_COUNT * DIMS), *centroids_q16)
-    offsets_blob = struct.pack("<" + "I" * (CENTROIDS_COUNT + 1), *cluster_offsets)
-    counts_blob = struct.pack("<" + "I" * CENTROIDS_COUNT, *cluster_counts)
-    labels_blob = bytes(labels_bits)
-    vectors_blob = struct.pack("<" + "h" * (count * DIMS), *vectors_q16)
+    vectors_blob = array("h")
+    labels_blob = bytearray()
+
+    for key in sorted_keys:
+        p = partitions[key]
+        count = p.count
+        blocks = (count + LANES - 1) // LANES
+        data = p.vectors
+        labels = p.labels
+
+        for b in range(blocks):
+            base_idx = b * LANES
+            for d in range(DIMS):
+                for lane in range(LANES):
+                    i = base_idx + lane
+                    if i < count:
+                        vectors_blob.append(data[i * DIMS + d])
+                    else:
+                        vectors_blob.append(0)
+            for lane in range(LANES):
+                i = base_idx + lane
+                if i < count:
+                    labels_blob.append(labels[i])
+                else:
+                    labels_blob.append(0)
+
+        # release partition payload after emitting
+        p.vectors = array("h")
+        p.labels = bytearray()
+
+    if len(vectors_blob) != total_blocks * DIMS * LANES:
+        raise RuntimeError("invalid vectors blob size")
+    if len(labels_blob) != total_blocks * LANES:
+        raise RuntimeError("invalid labels blob size")
 
     out = bytearray()
-    out += header
-    out += centroids_blob
+    out.extend(
+        struct.pack(
+            "<8siiiiii",
+            MAGIC,
+            SCALE,
+            DIMS,
+            total_count,
+            partition_count,
+            node_count,
+            total_blocks,
+        )
+    )
 
-    out += b"\x00" * (align_up(len(out), 4) - len(out))
-    out += offsets_blob
-    out += counts_blob
-    out += labels_blob
+    for key, root, length, minv, maxv in partition_entries:
+        out.extend(struct.pack("<Iiii", key, root, 0, length))
+        out.extend(struct.pack("<" + "h" * DIMS, *minv))
+        out.extend(struct.pack("<" + "h" * DIMS, *maxv))
 
-    out += b"\x00" * (align_up(len(out), 2) - len(out))
-    out += vectors_blob
+    for left, right, start_block, length, minv, maxv in node_entries:
+        out.extend(struct.pack("<iiii", left, right, start_block, length))
+        out.extend(struct.pack("<" + "h" * DIMS, *minv))
+        out.extend(struct.pack("<" + "h" * DIMS, *maxv))
+
+    out.extend(vectors_blob.tobytes())
+    out.extend(labels_blob)
 
     OUTPUT_IDX_PATH.write_bytes(out)
 
-    print(f"done: {count} vectors")
+    print(f"done: {total_count} vectors")
+    print(f"partitions: {partition_count}")
+    print(f"nodes: {node_count}")
+    print(f"blocks: {total_blocks}")
     print(f"wrote: {OUTPUT_IDX_PATH}")
     print(f"size: {len(out)} bytes")
 
