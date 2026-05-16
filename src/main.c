@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "env.h"
+#include "responses.h"
 #include "server.h"
 #include "transaction_context.h"
 #include "utils.h"
@@ -59,34 +61,10 @@ int main(void) {
   }
   printf("worker pid=%d ready on port=%d\n", getpid(), port);
 
-  const char *response =
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Type: text/plain\r\n"
-      "Content-Length: 2\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "ok";
-  const char *ready_response =
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Type: application/json\r\n"
-      "Content-Length: 11\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"ok\":true}";
-  const char *not_found_response =
-      "HTTP/1.1 404 Not Found\r\n"
-      "Content-Type: application/json\r\n"
-      "Content-Length: 21\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"not found\"}";
-  const char *bad_request_response =
-      "HTTP/1.1 400 Bad Request\r\n"
-      "Content-Type: application/json\r\n"
-      "Content-Length: 24\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"invalid body\"}";
+  const Response *response = &RESPONSE_OK;
+  const Response *ready_response = &RESPONSE_READY;
+  const Response *not_found_response = &RESPONSE_NOT_FOUND;
+  const Response *bad_request_response = &RESPONSE_BAD_REQUEST;
 
   while (1) {
     int client_fd = accept(server_fd, NULL, NULL);
@@ -107,37 +85,35 @@ int main(void) {
     char pathname[2048] = {0};
 
     if (sscanf(buffer, "%7s %2047s", method, url) != 2) {
-      (void)write(client_fd, not_found_response, strlen(not_found_response));
+      (void)write(client_fd, not_found_response->data, not_found_response->len);
       close(client_fd);
       continue;
     }
 
     if (!extract_pathname(url, pathname, sizeof(pathname))) {
-      (void)write(client_fd, not_found_response, strlen(not_found_response));
+      (void)write(client_fd, not_found_response->data, not_found_response->len);
       close(client_fd);
       continue;
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(pathname, "/ready") == 0) {
-      (void)write(client_fd, ready_response, strlen(ready_response));
+      (void)write(client_fd, ready_response->data, ready_response->len);
     } else if (strcmp(method, "POST") == 0 && strcmp(pathname, "/fraud-score") == 0) {
       const char *body = strstr(buffer, "\r\n\r\n");
       if (!body || *(body + 4) == '\0') {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
 
       body += 4;
       char out[2048];
-      char tx_id[256] = {0};
       TransactionContext ctx = transaction_context_new();
 
       if (find_value(body, "id", out, sizeof(out))) {
         ctx.id = strdup(out);
-        (void)snprintf(tx_id, sizeof(tx_id), "%s", out);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -145,21 +121,21 @@ int main(void) {
       if (find_value(body, "transaction.amount", out, sizeof(out))) {
         (void)to_double(out, &ctx.transaction.amount);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "transaction.installments", out, sizeof(out))) {
         (void)to_int(out, &ctx.transaction.installments);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "transaction.requested_at", out, sizeof(out))) {
         (void)to_epoch_time(out, &ctx.transaction.requested_at);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -167,14 +143,14 @@ int main(void) {
       if (find_value(body, "customer.avg_amount", out, sizeof(out))) {
         (void)to_double(out, &ctx.customer.avg_amount);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "customer.tx_count_24h", out, sizeof(out))) {
         (void)to_int(out, &ctx.customer.tx_count_24h);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -191,7 +167,7 @@ int main(void) {
         if (count > 0) {
           ctx.customer.known_merchants = (char **)malloc(sizeof(char *) * count);
           if (!ctx.customer.known_merchants) {
-            (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+            (void)write(client_fd, bad_request_response->data, bad_request_response->len);
             close(client_fd);
             continue;
           }
@@ -212,7 +188,7 @@ int main(void) {
           }
         }
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -220,21 +196,21 @@ int main(void) {
       if (find_value(body, "merchant.id", out, sizeof(out))) {
         ctx.merchant.id = strdup(out);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "merchant.mcc", out, sizeof(out))) {
         ctx.merchant.mcc = strdup(out);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "merchant.avg_amount", out, sizeof(out))) {
         (void)to_double(out, &ctx.merchant.avg_amount);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -242,21 +218,21 @@ int main(void) {
       if (find_value(body, "terminal.is_online", out, sizeof(out))) {
         (void)to_bool(out, &ctx.terminal.is_online);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "terminal.card_present", out, sizeof(out))) {
         (void)to_bool(out, &ctx.terminal.card_present);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
       if (find_value(body, "terminal.km_from_home", out, sizeof(out))) {
         (void)to_double(out, &ctx.terminal.km_from_home);
       } else {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+        (void)write(client_fd, bad_request_response->data, bad_request_response->len);
         close(client_fd);
         continue;
       }
@@ -276,47 +252,15 @@ int main(void) {
       ctx.destroy(&ctx);
 
       uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-      double fraud_score = (double)fraud_count / 5.0;
-      int approved = fraud_score < 0.6 ? 1 : 0;
-
-      char response_body[256];
-      int body_len = snprintf(
-          response_body,
-          sizeof(response_body),
-          "{\"transaction_id\":\"%s\",\"approved\":%s,\"fraud_score\":%.1f}",
-          tx_id,
-          approved ? "true" : "false",
-          fraud_score);
-
-      if (body_len < 0 || body_len >= (int)sizeof(response_body)) {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
-        close(client_fd);
-        continue;
+      if (fraud_count >= FRAUD_RESPONSES_LEN) {
+        fraud_count = FRAUD_RESPONSES_LEN - 1;
       }
-
-      char response_header[256];
-      int header_len = snprintf(
-          response_header,
-          sizeof(response_header),
-          "HTTP/1.1 200 OK\r\n"
-          "Content-Type: application/json\r\n"
-          "Content-Length: %d\r\n"
-          "Connection: close\r\n"
-          "\r\n",
-          body_len);
-
-      if (header_len < 0 || header_len >= (int)sizeof(response_header)) {
-        (void)write(client_fd, bad_request_response, strlen(bad_request_response));
-        close(client_fd);
-        continue;
-      }
-
-      (void)write(client_fd, response_header, (size_t)header_len);
-      (void)write(client_fd, response_body, (size_t)body_len);
+      const Response *fraud_response = &FRAUD_RESPONSES[fraud_count];
+      (void)write(client_fd, fraud_response->data, fraud_response->len);
     } else if (strcmp(method, "GET") == 0 && strcmp(pathname, "/") == 0) {
-      (void)write(client_fd, response, strlen(response));
+      (void)write(client_fd, response->data, response->len);
     } else {
-      (void)write(client_fd, not_found_response, strlen(not_found_response));
+      (void)write(client_fd, not_found_response->data, not_found_response->len);
     }
 
     close(client_fd);
