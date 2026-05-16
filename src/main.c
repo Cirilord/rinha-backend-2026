@@ -130,10 +130,12 @@ int main(void) {
 
       body += 4;
       char out[2048];
+      char tx_id[256] = {0};
       TransactionContext ctx = transaction_context_new();
 
       if (find_value(body, "id", out, sizeof(out))) {
         ctx.id = strdup(out);
+        (void)snprintf(tx_id, sizeof(tx_id), "%s", out);
       } else {
         (void)write(client_fd, bad_request_response, strlen(bad_request_response));
         close(client_fd);
@@ -188,6 +190,12 @@ int main(void) {
         ctx.customer.known_merchants_count = count;
         if (count > 0) {
           ctx.customer.known_merchants = (char **)malloc(sizeof(char *) * count);
+          if (!ctx.customer.known_merchants) {
+            (void)write(client_fd, bad_request_response, strlen(bad_request_response));
+            close(client_fd);
+            continue;
+          }
+
           size_t idx = 0;
           char *start = out;
           p = out;
@@ -265,6 +273,8 @@ int main(void) {
 
       double vector[14];
       ctx.to_vector(&ctx, vector);
+      ctx.destroy(&ctx);
+
       uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
       double fraud_score = (double)fraud_count / 5.0;
       int approved = fraud_score < 0.6 ? 1 : 0;
@@ -274,7 +284,7 @@ int main(void) {
           response_body,
           sizeof(response_body),
           "{\"transaction_id\":\"%s\",\"approved\":%s,\"fraud_score\":%.1f}",
-          ctx.id ? ctx.id : "",
+          tx_id,
           approved ? "true" : "false",
           fraud_score);
 

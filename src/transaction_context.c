@@ -1,5 +1,6 @@
 #include "transaction_context.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "utils.h"
@@ -17,6 +18,32 @@ static inline double mcc_risk_or_default(const char *mcc) {
   if (strcmp(mcc, "5311") == 0) return 0.25;
   if (strcmp(mcc, "5999") == 0) return 0.5;
   return 0.5;
+}
+
+static void transaction_context_destroy(TransactionContext *ctx) {
+  if (!ctx) return;
+
+  free(ctx->id);
+  ctx->id = NULL;
+
+  if (ctx->customer.known_merchants) {
+    for (size_t i = 0; i < ctx->customer.known_merchants_count; i++) {
+      free(ctx->customer.known_merchants[i]);
+      ctx->customer.known_merchants[i] = NULL;
+    }
+    free(ctx->customer.known_merchants);
+    ctx->customer.known_merchants = NULL;
+  }
+  ctx->customer.known_merchants_count = 0;
+
+  free(ctx->merchant.id);
+  ctx->merchant.id = NULL;
+
+  free(ctx->merchant.mcc);
+  ctx->merchant.mcc = NULL;
+
+  free(ctx->last_transaction);
+  ctx->last_transaction = NULL;
 }
 
 static void transaction_context_to_vector(const TransactionContext *self, double out[14]) {
@@ -74,6 +101,7 @@ static void transaction_context_to_vector(const TransactionContext *self, double
 
 static void transaction_context_init(TransactionContext *ctx) {
   memset(ctx, 0, sizeof(*ctx));
+  ctx->destroy = transaction_context_destroy;
   ctx->to_vector = transaction_context_to_vector;
 }
 
