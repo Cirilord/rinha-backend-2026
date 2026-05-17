@@ -1,4 +1,4 @@
-# Rinha de Backend 2026 — C + Nginx
+# Rinha de Backend 2026 — C + HAProxy
 
 A low-latency, low-overhead backend implementation for Rinha de Backend 2026.
 
@@ -6,7 +6,7 @@ A low-latency, low-overhead backend implementation for Rinha de Backend 2026.
 
 ```text
 client
-  -> nginx (load balancer)
+  -> haproxy (load balancer)
       -> api1 (C)
       -> api2 (C)
 ```
@@ -14,7 +14,7 @@ client
 ## Current stack
 
 - C API (no HTTP framework)
-- Nginx as load balancer / reverse proxy
+- HAProxy as load balancer / reverse proxy
 - Binary vector index (`references.idx`) loaded with `mmap`
 - Docker Compose for local orchestration
 
@@ -24,7 +24,7 @@ client
 .
 ├── docker-compose.yml
 ├── Dockerfile
-├── nginx.conf
+├── haproxy.cfg
 ├── scripts/build_binary_references.py
 ├── resources/
 │   ├── references.json.gz
@@ -70,7 +70,7 @@ docker compose up --build -d
 View logs:
 
 ```bash
-docker compose logs -f api1 api2 nginx
+docker compose logs -f api1 api2 haproxy
 ```
 
 Stop:
