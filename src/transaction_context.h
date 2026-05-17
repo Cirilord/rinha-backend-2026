@@ -44,6 +44,7 @@ typedef struct {
 
 struct TransactionContext;
 typedef void (*TransactionContextDestroyFn)(struct TransactionContext *self);
+typedef bool (*TransactionContextFromBodyFn)(struct TransactionContext *self, const char *body);
 typedef void (*TransactionContextToVectorFn)(const struct TransactionContext *self, double out[14]);
 
 typedef struct TransactionContext {
@@ -55,6 +56,7 @@ typedef struct TransactionContext {
   LastTransaction *last_transaction;
 
   TransactionContextDestroyFn destroy;
+  TransactionContextFromBodyFn from_body;
   TransactionContextToVectorFn to_vector;
 } TransactionContext;
 
