@@ -22,18 +22,18 @@ int main(void) {
     return 1;
   }
 
-  int port = 0;
-  if (!env_read_int("PORT", true, &port) || port <= 0 || port > 65535) {
-    fprintf(stderr, "PORT env var must be an integer between 1 and 65535\n");
+  const char *socket_path = getenv("SOCKET_PATH");
+  if (!socket_path || socket_path[0] == '\0') {
+    fprintf(stderr, "SOCKET_PATH env var must be a non-empty path\n");
     return 1;
   }
 
   int server_fd = -1;
-  if (!create_server(port, &server_fd)) {
-    fprintf(stderr, "failed to create server on port %d\n", port);
+  if (!create_unix_server(socket_path, &server_fd)) {
+    fprintf(stderr, "failed to create server on unix socket %s\n", socket_path);
     return 1;
   }
-  printf("server listening on 0.0.0.0:%d\n", port);
+  printf("server listening on unix socket: %s\n", socket_path);
 
   XScoreIndexView xscore;
   if (!x_score_open("resources/references.idx", &xscore)) {
@@ -59,7 +59,7 @@ int main(void) {
       break;
     }
   }
-  printf("worker pid=%d ready on port=%d\n", getpid(), port);
+  printf("worker pid=%d ready on socket=%s\n", getpid(), socket_path);
 
   const Response *response = &RESPONSE_OK;
   const Response *ready_response = &RESPONSE_READY;

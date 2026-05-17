@@ -3,6 +3,6 @@
 
 #include <stdbool.h>
 
-bool create_server(int port, int *out_server_fd);
+bool create_unix_server(const char *socket_path, int *out_server_fd);
 
 #endif
