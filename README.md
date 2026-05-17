@@ -54,7 +54,7 @@ client
 
 ## API environment variables
 
-- `PORT` (required)
+- `SOCKET_PATH` (required; server listens only on Unix socket)
 - `WORKERS` (required)
 
 Notes:

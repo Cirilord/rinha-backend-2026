@@ -5,8 +5,10 @@ services:
       dockerfile: Dockerfile
     hostname: api1
     environment:
-      PORT: '9999'
       WORKERS: '4'
+      SOCKET_PATH: '/tmp/app1.sock'
+    volumes:
+      - uds_sockets:/tmp
     # deploy:
     #   resources:
     #     limits:
@@ -21,8 +23,10 @@ services:
       dockerfile: Dockerfile
     hostname: api2
     environment:
-      PORT: '9999'
       WORKERS: '4'
+      SOCKET_PATH: '/tmp/app2.sock'
+    volumes:
+      - uds_sockets:/tmp
     # deploy:
     #   resources:
     #     limits:
@@ -37,6 +41,7 @@ services:
       - '9999:9999'
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - uds_sockets:/tmp
     depends_on:
       - api1
       - api2
@@ -51,3 +56,6 @@ services:
 networks:
   rinha-net:
     driver: bridge
+
+volumes:
+  uds_sockets:
