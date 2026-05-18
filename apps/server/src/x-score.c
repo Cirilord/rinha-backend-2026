@@ -18,12 +18,19 @@ typedef struct {
   unsigned long long bound;
 } NodeStackEntry;
 
-static int partition_candidate_cmp(const void *a, const void *b) {
-  const PartitionCandidate *pa = (const PartitionCandidate *)a;
-  const PartitionCandidate *pb = (const PartitionCandidate *)b;
-  if (pa->bound < pb->bound) return -1;
-  if (pa->bound > pb->bound) return 1;
-  return 0;
+static void insert_partition_candidate_sorted(
+    PartitionCandidate entries[256],
+    uint32_t *entry_len,
+    unsigned long long bound,
+    uint32_t index) {
+  uint32_t pos = *entry_len;
+  while (pos > 0 && entries[pos - 1].bound > bound) {
+    entries[pos] = entries[pos - 1];
+    pos--;
+  }
+  entries[pos].bound = bound;
+  entries[pos].index = index;
+  (*entry_len)++;
 }
 
 bool x_score_open(const char *path, XScoreIndexView *out_view) {
@@ -126,6 +133,18 @@ bool x_score_open(const char *path, XScoreIndexView *out_view) {
   out_view->partition_count = partition_count;
   out_view->node_count = node_count;
   out_view->block_count = block_count;
+
+  // Pre-fault mapped pages to reduce first-request latency variance.
+  {
+    volatile uint8_t sink = 0;
+    size_t i = 0;
+    for (i = 0; i < size; i += 4096) {
+      sink ^= raw[i];
+    }
+    sink ^= raw[size - 1];
+    (void)sink;
+  }
+
   return true;
 }
 
@@ -410,15 +429,12 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
 
   if (view->partition_count == 0 || !view->partitions || !view->nodes) {
     search_exact(view, q, top_dist, top_label);
+  } else if (view->partition_count > 256) {
+    // Partition key is 8-bit in this index format; values above 256 should not happen.
+    // Fallback keeps correctness if a malformed/custom index is loaded.
+    search_exact(view, q, top_dist, top_label);
   } else {
-    PartitionCandidate *entries = NULL;
-    if (view->partition_count > 0) {
-      entries = (PartitionCandidate *)malloc((size_t)view->partition_count * sizeof(PartitionCandidate));
-      if (!entries) {
-        search_exact(view, q, top_dist, top_label);
-        goto done;
-      }
-    }
+    PartitionCandidate entries[256];
     uint32_t entry_len = 0;
     uint32_t qkey = compute_partition_key(q);
 
@@ -429,15 +445,9 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
         if (p->root >= 0 && bound < top_dist[X_SCORE_TOPK - 1]) {
           search_node_iterative(view, (uint32_t)p->root, bound, q, top_dist, top_label);
         }
-      } else if (entry_len < view->partition_count) {
-        entries[entry_len].bound = bound;
-        entries[entry_len].index = i;
-        entry_len++;
+      } else if (bound < top_dist[X_SCORE_TOPK - 1]) {
+        insert_partition_candidate_sorted(entries, &entry_len, bound, i);
       }
-    }
-
-    if (entry_len > 1) {
-      qsort(entries, entry_len, sizeof(entries[0]), partition_candidate_cmp);
     }
 
     for (uint32_t i = 0; i < entry_len; i++) {
@@ -450,11 +460,8 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
       }
       search_node_iterative(view, (uint32_t)p->root, entries[i].bound, q, top_dist, top_label);
     }
-
-    free(entries);
   }
 
-done:
   for (int i = 0; i < X_SCORE_TOPK; i++) {
     if (top_dist[i] == ULLONG_MAX) {
       continue;

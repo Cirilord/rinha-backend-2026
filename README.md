@@ -1,113 +1,134 @@
-# Rinha de Backend 2026 — C + HAProxy
+# rinha-backend
 
-A low-latency, low-overhead backend implementation for Rinha de Backend 2026.
+C implementation for Rinha de Backend 2026, with:
+- `load-balancer` listening on TCP port `9999`
+- `api1` and `api2` receiving connections through **FD passing** (`SCM_RIGHTS`) over Unix sockets
+- minimal HTTP parsing
+- transaction parsing and vector pipeline for scoring
 
 ## Architecture
 
-```text
-client
-  -> haproxy (load balancer)
-      -> api1 (C)
-      -> api2 (C)
-```
+- `apps/load-balancer`
+  - Listens on `0.0.0.0:9999`
+  - Uses round-robin across `/shared/api1.sock` and `/shared/api2.sock`
+  - Forwards accepted sockets to API instances via `sendmsg(..., SCM_RIGHTS)`
 
-## Current stack
+- `apps/server`
+  - Listens on a Unix socket (`UNIX_SOCKET_PATH`)
+  - Receives FDs from the LB via `recvmsg(..., SCM_RIGHTS)`
+  - Endpoints:
+    - `GET /ready`
+    - `POST /fraud-score`
 
-- C API (no HTTP framework)
-- HAProxy as load balancer / reverse proxy
-- Binary vector index (`references.idx`) loaded with `mmap`
-- Docker Compose for local orchestration
+## Tech Stack and Decisions
 
-## Project layout
+- Language: C (C11)
+- Build: GCC with `-O3`
+- Runtime: Docker + Docker Compose
+- LB/API IPC: Unix domain socket + FD passing (`SCM_RIGHTS`)
+- Reference data: index file in `resources/references.idx`
 
-```text
-.
-├── docker-compose.yml
-├── Dockerfile
-├── haproxy.cfg
-├── scripts/build_binary_references.py
-├── resources/
-│   ├── references.json.gz
-│   └── references.idx
-├── src/
-│   ├── main.c
-│   ├── server.c
-│   ├── utils.c
-│   ├── transaction_context.c
-│   ├── x-score.c
-│   └── ...
-└── test/
-    ├── smoke.js
-    ├── test.js
-    └── test-data.json
-```
+## Project Structure
 
-## Runtime flow
+- `apps/load-balancer/src/main.c`
+- `apps/load-balancer/Dockerfile`
+- `apps/server/src/main.c`
+- `apps/server/src/server.c`
+- `apps/server/src/transaction_context.c`
+- `apps/server/src/x-score.c`
+- `docker-compose.yml`
+- `test/` (k6 benchmark scripts)
 
-- `scripts/build_binary_references.py` reads `resources/references.json.gz`.
-- The script generates `resources/references.idx` in a binary format.
-- The API loads the index at startup using `mmap`.
-- For each transaction:
-- A 14-dim vector is built in `transaction_context.c`.
-- `x-score.c` runs exact kNN (`k=5`) with specialist partitions and `key-first` pruning.
-- The response returns `approved` and `fraud_score`.
+## How to Run
 
-## API environment variables
-
-- `SOCKET_PATH` (required; server listens only on Unix socket)
-- `WORKERS` (required)
-
-Notes:
-- `k=5` is fixed in the hot path (`fraud_score = fraud_count/5`).
-- search mode is fixed to specialist `key-first` in the code.
-
-## Run locally
+From the project root:
 
 ```bash
 docker compose up --build -d
 ```
 
-View logs:
+Follow logs:
 
 ```bash
-docker compose logs -f api1 api2 haproxy
+docker compose logs -f
 ```
 
-Stop:
+Stop everything:
 
 ```bash
 docker compose down
 ```
 
-## Load tests
+## How to Test with curl
 
-Smoke test:
+Health check:
+
+```bash
+curl -i http://localhost:9999/ready
+```
+
+Fraud score:
+
+```bash
+curl -i http://localhost:9999/fraud-score \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "id": "tx-3576980410",
+    "transaction": {
+      "amount": 384.88,
+      "installments": 3,
+      "requested_at": "2026-03-11T20:23:35Z"
+    },
+    "customer": {
+      "avg_amount": 769.76,
+      "tx_count_24h": 3,
+      "known_merchants": ["MERC-009", "MERC-001", "MERC-001"]
+    },
+    "merchant": {
+      "id": "MERC-001",
+      "mcc": "5912",
+      "avg_amount": 298.95
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 13.7090520965
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-11T14:58:35Z",
+      "km_from_current": 18.8626479774
+    }
+  }'
+```
+
+## How to Benchmark with k6
+
+With the stack running:
 
 ```bash
 docker run --rm -i \
+  --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  grafana/k6 run -e BASE_URL=http://host.docker.internal:9999 test/smoke.js
+  -e BASE_URL=http://load-balancer:9999 \
+  grafana/k6 run test/test.js
 ```
 
-Main benchmark:
-
-```bash
-docker run --rm -i \
-  -v "$PWD:/work" -w /work \
-  grafana/k6 run -e BASE_URL=http://host.docker.internal:9999 test/test.js
-```
-
-Result file:
-
+Generated summary:
 - `test/results.json`
+
+## Environment Variables
+
+### API
+- `UNIX_SOCKET_PATH` (required)
+- `X_SCORE_INDEX_PATH` (required)
+
+### Load Balancer
+- `PORT` (expected default: `9999`)
+- `WORKER_SOCKETS` (comma-separated list)
 
 ## Notes
 
-- Hot path focus: socket -> parse -> vectorize -> classify -> respond.
-- Binary index avoids heavy JSON parsing at startup.
-- CPU/memory limits can be enabled in `docker-compose.yml` to simulate challenge constraints.
-
-## References
-
-- Official challenge repo: <https://github.com/zanfranceschi/rinha-de-backend-2026>
-- Challenge website: <https://rinhadebackend.com.br/>
+- Official Rinha submission requires `linux-amd64` compatibility.
+- Compose setup must respect the competition resource budget (1 CPU / 350 MB total).
+- Depending on your current benchmark phase, fraud scoring in `main.c` may be temporarily simplified for latency testing.

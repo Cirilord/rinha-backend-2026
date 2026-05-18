@@ -2,60 +2,46 @@ services:
   api1:
     build:
       context: .
-      dockerfile: Dockerfile
-    hostname: api1
+      dockerfile: ./apps/server/Dockerfile
     environment:
-      WORKERS: '4'
-      SOCKET_PATH: '/tmp/app1.sock'
+      UNIX_SOCKET_PATH: "/shared/api1.sock"
+      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
-      - uds_sockets:/tmp
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.40"
-    #       memory: "130MB"
+      - shared-sockets:/shared
     networks:
-      - rinha-net
+      - rinha
 
   api2:
     build:
       context: .
-      dockerfile: Dockerfile
-    hostname: api2
+      dockerfile: ./apps/server/Dockerfile
     environment:
-      WORKERS: '4'
-      SOCKET_PATH: '/tmp/app2.sock'
+      UNIX_SOCKET_PATH: "/shared/api2.sock"
+      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
-      - uds_sockets:/tmp
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.40"
-    #       memory: "130MB"
+      - shared-sockets:/shared
     networks:
-      - rinha-net
+      - rinha
 
-  haproxy:
-    image: haproxy:3.0-alpine
+  load-balancer:
+    build:
+      context: ./apps/load-balancer
     ports:
-      - '9999:9999'
+      - "9999:9999"
+    environment:
+      PORT: "9999"
+      WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - uds_sockets:/tmp
+      - shared-sockets:/shared
     depends_on:
       - api1
       - api2
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.20"
-    #       memory: "90MB"
     networks:
-      - rinha-net
+      - rinha
 
 networks:
-  rinha-net:
+  rinha:
     driver: bridge
 
 volumes:
-  uds_sockets:
+  shared-sockets:

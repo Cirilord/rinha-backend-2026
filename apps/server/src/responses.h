@@ -11,10 +11,14 @@ typedef struct {
 
 #define FRAUD_RESPONSES_LEN 6
 
-extern const Response RESPONSE_OK;
-extern const Response FRAUD_RESPONSES[FRAUD_RESPONSES_LEN];
 extern const Response RESPONSE_READY;
 extern const Response RESPONSE_NOT_FOUND;
 extern const Response RESPONSE_BAD_REQUEST;
+extern const Response RESPONSE_FRAUD_00;
+extern const Response RESPONSE_FRAUD_02;
+extern const Response RESPONSE_FRAUD_04;
+extern const Response RESPONSE_FRAUD_06;
+extern const Response RESPONSE_FRAUD_08;
+extern const Response RESPONSE_FRAUD_10;
 
 #endif
