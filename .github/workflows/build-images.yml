@@ -55,7 +55,7 @@ jobs:
       - name: Build and push load-balancer image
         uses: docker/build-push-action@v6
         with:
-          context: apps/load-balancer
+          context: .
           file: apps/load-balancer/Dockerfile
           platforms: linux/amd64
           push: true
