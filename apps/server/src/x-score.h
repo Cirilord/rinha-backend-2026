@@ -46,6 +46,12 @@ typedef struct {
 _Static_assert(sizeof(XScoreNodeEntry) == 72, "XScoreNodeEntry must be 72 bytes");
 
 typedef struct {
+  uint32_t start_block;
+  uint16_t block_count;
+  uint16_t len;
+} XScoreBlockGroup;
+
+typedef struct {
   uint8_t *raw;
   size_t size;
   int mapped;
@@ -54,6 +60,16 @@ typedef struct {
   const XScoreNodeEntry *nodes;
   const int16_t *vectors_q16;
   const uint8_t *labels;
+  uint32_t *key_partition_indices;
+  uint32_t key_partition_offsets[257];
+  int32_t key_partition_direct[256];
+  uint32_t *partition_start_blocks;
+  uint32_t *partition_lens;
+  uint32_t *partition_group_offsets;
+  XScoreBlockGroup *groups;
+  uint32_t total_groups;
+  uint32_t max_groups_per_partition;
+  uint8_t direct_leaf_mode;
   uint32_t count;
   uint32_t partition_count;
   uint32_t node_count;

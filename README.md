@@ -31,6 +31,7 @@ This avoids extra TCP hops between LB and API.
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
 - **Persistent control sockets** to APIs (reconnect only on failure).
+- **Non-blocking listener + accept drain loop**: accepts until `EAGAIN` per wakeup to reduce burst overhead.
 - **Small hot path**: accept -> select upstream -> send FD -> close client FD in LB process.
 - **Minimal dependencies** (single C binary).
 
@@ -39,6 +40,7 @@ This avoids extra TCP hops between LB and API.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
   - `POST /fraud-score`
+  - fixed-format request-line matching with a single header-boundary scan
 - **Fast body extraction with known request length** (`get_body(..., request_len, ...)`) to avoid extra scans.
 - **Warm-up phase** at startup to reduce first-request latency variance:
   - touches parser/vector path
@@ -46,13 +48,19 @@ This avoids extra TCP hops between LB and API.
 
 ### Scoring (`apps/server/src/x-score.c`)
 - Uses quantized vectors and top-k nearest-neighbor style lookup.
+- Builds partition-key lookup tables once at index-open time to accelerate same-key candidate selection.
 - Includes **early pruning / early-exit**:
-  - partition/node bound pruning
+  - partition bound pruning
+  - same-key partition first
+  - node branch-and-bound when partitions have internal subindex nodes
+  - direct leaf-scan fast path when index roots are leaf nodes
   - leaf scan early stop when top-k threshold is good enough
 - SIMD hot path in `scan_block`:
   - `__AVX2__` on `amd64`
   - `__ARM_NEON__` on `arm64`
   - scalar fallback otherwise
+- Query SIMD constants are pre-expanded once per request.
+- Distance accumulation uses chunked 32-bit partial sums widened to 64-bit.
 
 ## 3. Vector Search Details (x-score)
 
@@ -65,7 +73,8 @@ This section describes the vector search strategy used in `apps/server/src/x-sco
 - **Quantization (float -> int16 / q16)**
 - **Space Partitioning (Partition Key)**
 - **Bounding Boxes (AABB: Axis-Aligned Bounding Box)**
-- **Branch and Bound Search**
+- **Leaf-Partition Fast Path**
+- **Branch-and-Bound Tree Traversal**
 - **Top-K Maintenance**
 - **Lower-Bound Pruning**
 - **Early Exit Heuristic**
@@ -101,8 +110,8 @@ This puts likely neighbors close in partition space and reduces search work.
 2. Initialize top-k (`K=5`) with max distances.
 3. Search matching partition key first.
 4. Evaluate remaining partitions by lower-bound distance (sorted candidates).
-5. Traverse nodes iteratively (branch-and-bound with min/max boxes).
-6. Scan leaf blocks and update top-k.
+5. Traverse subindex nodes with branch-and-bound (or direct leaf scan when partition root is a leaf).
+6. Scan selected leaf blocks (AoSoA + SIMD) and update top-k.
 7. Count fraud labels in top-k and return fraud count.
 
 ### SIMD and Hot Path
@@ -114,8 +123,8 @@ The `scan_block` hot path is architecture-specific:
 
 ### Pruning and Early Exit
 
-- Skip partition/node when its bound is worse than current top-k worst distance.
-- Stop early when confidence threshold is reached (`X_SCORE_EARLY_DISTANCE_MILLI`).
+- Skip partition and node branches when bounds are worse than current top-k worst distance.
+- Stop early when confidence threshold is reached (`X_SCORE_EARLY_DISTANCE_MILLI`, default `143`).
 
 This is the main reason search stays fast under load.
 
@@ -173,6 +182,10 @@ Builds the binary scoring index used at runtime.
 - Input: `resources/references.json.gz`
 - Output: `resources/references.idx`
 - Format: custom little-endian structure with header, partitions, nodes, vectors, labels.
+- Builds a second-level subindex inside each partition (small binary tree over sub-buckets),
+  enabling branch-and-bound pruning before leaf vector scan.
+- Current default split profile emphasizes `day_of_week` (three thresholds) plus
+  `amount`, `tx_count_24h`, and `merchant_avg_amount`.
 
 Command:
 

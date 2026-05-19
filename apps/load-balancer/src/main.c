@@ -2,7 +2,9 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -192,6 +194,12 @@ static int create_tcp_listener(int port) {
     return -1;
   }
 
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    close(fd);
+    return -1;
+  }
+
   return fd;
 }
 
@@ -219,44 +227,66 @@ int main(void) {
   }
 
   int rr = 0;
+  struct pollfd listener_pfd;
+  listener_pfd.fd = listener;
+  listener_pfd.events = POLLIN;
+  listener_pfd.revents = 0;
 
   while (keep_running) {
-    int client_fd = accept(listener, NULL, NULL);
-    if (client_fd < 0) {
+    int nready = poll(&listener_pfd, 1, -1);
+    if (nready < 0) {
       if (errno == EINTR) {
         continue;
       }
-      log_msg("WARN", "accept failed: %s", strerror(errno));
+      log_msg("WARN", "poll failed: %s", strerror(errno));
+      break;
+    }
+
+    if ((listener_pfd.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
       continue;
     }
 
-    bool forwarded = false;
-    for (int tries = 0; tries < worker_count; tries++) {
-      int idx = (rr + tries) % worker_count;
-
-      if (ensure_worker_connected(&workers[idx]) < 0) {
-        continue;
-      }
-
-      if (send_fd(workers[idx].control_fd, client_fd) == 0) {
-        rr = (idx + 1) % worker_count;
-        forwarded = true;
+    while (keep_running) {
+      int client_fd = accept(listener, NULL, NULL);
+      if (client_fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;
+        }
+        if (errno == EINTR) {
+          continue;
+        }
+        log_msg("WARN", "accept failed: %s", strerror(errno));
         break;
       }
 
-      close(workers[idx].control_fd);
-      workers[idx].control_fd = -1;
-    }
+      bool forwarded = false;
+      for (int tries = 0; tries < worker_count; tries++) {
+        int idx = (rr + tries) % worker_count;
 
-    if (!forwarded) {
-      const char *resp = "HTTP/1.1 503 Service Unavailable\r\n"
-                         "Content-Length: 19\r\n"
-                         "Connection: close\r\n\r\n"
-                         "no worker available";
-      (void)write(client_fd, resp, strlen(resp));
-    }
+        if (ensure_worker_connected(&workers[idx]) < 0) {
+          continue;
+        }
 
-    close(client_fd);
+        if (send_fd(workers[idx].control_fd, client_fd) == 0) {
+          rr = (idx + 1) % worker_count;
+          forwarded = true;
+          break;
+        }
+
+        close(workers[idx].control_fd);
+        workers[idx].control_fd = -1;
+      }
+
+      if (!forwarded) {
+        const char *resp = "HTTP/1.1 503 Service Unavailable\r\n"
+                           "Content-Length: 19\r\n"
+                           "Connection: close\r\n\r\n"
+                           "no worker available";
+        (void)write(client_fd, resp, strlen(resp));
+      }
+
+      close(client_fd);
+    }
   }
 
   close(listener);

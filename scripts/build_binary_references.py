@@ -34,6 +34,25 @@ LANES = 8
 SCALE = 10000
 MAGIC = b"RNSPCST1"
 
+# Second-level split bits (inside each primary partition key)
+SUBINDEX_SPLITS: tuple[tuple[int, int], ...] = (
+    (4, 2500),   # day_of_week
+    (4, 5000),   # day_of_week
+    (4, 7500),   # day_of_week
+    (0, 2500),   # amount
+    (8, 2500),   # tx_count_24h
+    (13, 2000),  # merchant_avg_amount
+)
+
+
+@dataclass
+class BucketData:
+    count: int = 0
+    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
+    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
+    vectors: array = field(default_factory=lambda: array("h"))
+    labels: bytearray = field(default_factory=bytearray)
+
 
 @dataclass
 class PartitionData:
@@ -41,8 +60,17 @@ class PartitionData:
     count: int = 0
     minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
     maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
-    vectors: array = field(default_factory=lambda: array("h"))
-    labels: bytearray = field(default_factory=bytearray)
+    buckets: dict[int, BucketData] = field(default_factory=dict)
+
+
+@dataclass
+class TreeNode:
+    minv: list[int]
+    maxv: list[int]
+    length: int
+    left: TreeNode | None = None
+    right: TreeNode | None = None
+    bucket: BucketData | None = None
 
 
 def quantize(value: float) -> int:
@@ -85,6 +113,120 @@ def compute_partition_key(qvec: list[int]) -> int:
     return key
 
 
+def compute_subindex_key(qvec: list[int]) -> int:
+    key = 0
+    for bit, (dim, cutoff) in enumerate(SUBINDEX_SPLITS):
+        if qvec[dim] > cutoff:
+            key |= 1 << bit
+    return key
+
+
+def update_minmax(minv: list[int], maxv: list[int], qvec: list[int]) -> None:
+    for d, v in enumerate(qvec):
+        if v < minv[d]:
+            minv[d] = v
+        if v > maxv[d]:
+            maxv[d] = v
+
+
+def merge_bounds(a_min: list[int], a_max: list[int], b_min: list[int], b_max: list[int]) -> tuple[list[int], list[int]]:
+    out_min = [0] * DIMS
+    out_max = [0] * DIMS
+    for d in range(DIMS):
+        out_min[d] = a_min[d] if a_min[d] < b_min[d] else b_min[d]
+        out_max[d] = a_max[d] if a_max[d] > b_max[d] else b_max[d]
+    return out_min, out_max
+
+
+def build_tree_from_leaves(leaves: list[TreeNode]) -> TreeNode:
+    if len(leaves) == 1:
+        return leaves[0]
+
+    gmin = [32767] * DIMS
+    gmax = [-32768] * DIMS
+    for leaf in leaves:
+        for d in range(DIMS):
+            if leaf.minv[d] < gmin[d]:
+                gmin[d] = leaf.minv[d]
+            if leaf.maxv[d] > gmax[d]:
+                gmax[d] = leaf.maxv[d]
+
+    split_dim = 0
+    split_span = gmax[0] - gmin[0]
+    for d in range(1, DIMS):
+        span = gmax[d] - gmin[d]
+        if span > split_span:
+            split_span = span
+            split_dim = d
+
+    ordered = sorted(leaves, key=lambda n: n.minv[split_dim] + n.maxv[split_dim])
+    mid = len(ordered) // 2
+    left = build_tree_from_leaves(ordered[:mid])
+    right = build_tree_from_leaves(ordered[mid:])
+
+    merged_min, merged_max = merge_bounds(left.minv, left.maxv, right.minv, right.maxv)
+    return TreeNode(
+        minv=merged_min,
+        maxv=merged_max,
+        length=left.length + right.length,
+        left=left,
+        right=right,
+        bucket=None,
+    )
+
+
+def emit_bucket(bucket: BucketData, vectors_blob: array, labels_blob: bytearray, running_blocks: int) -> tuple[int, int]:
+    start_block = running_blocks
+    count = bucket.count
+    blocks = (count + LANES - 1) // LANES
+
+    data = bucket.vectors
+    labels = bucket.labels
+
+    for b in range(blocks):
+        base_idx = b * LANES
+        for d in range(DIMS):
+            for lane in range(LANES):
+                i = base_idx + lane
+                if i < count:
+                    vectors_blob.append(data[i * DIMS + d])
+                else:
+                    vectors_blob.append(0)
+        for lane in range(LANES):
+            i = base_idx + lane
+            if i < count:
+                labels_blob.append(labels[i])
+            else:
+                labels_blob.append(0)
+
+    return start_block, blocks
+
+
+def emit_tree(
+    node: TreeNode,
+    vectors_blob: array,
+    labels_blob: bytearray,
+    node_entries: list[tuple[int, int, int, int, list[int], list[int]]],
+    running_blocks: int,
+) -> tuple[int, int]:
+    if node.bucket is not None:
+        start_block, blocks = emit_bucket(node.bucket, vectors_blob, labels_blob, running_blocks)
+        running_blocks += blocks
+        node_idx = len(node_entries)
+        node_entries.append((-1, -1, start_block, node.length, node.minv, node.maxv))
+        return node_idx, running_blocks
+
+    if node.left is None or node.right is None:
+        raise RuntimeError("invalid internal tree node")
+
+    left_idx, running_blocks = emit_tree(node.left, vectors_blob, labels_blob, node_entries, running_blocks)
+    right_idx, running_blocks = emit_tree(node.right, vectors_blob, labels_blob, node_entries, running_blocks)
+
+    node_idx = len(node_entries)
+    node_entries.append((left_idx, right_idx, -1, node.length, node.minv, node.maxv))
+    return node_idx, running_blocks
+
+
 def main() -> None:
     if not INPUT_PATH.exists():
         raise FileNotFoundError(f"input not found: {INPUT_PATH}")
@@ -106,78 +248,83 @@ def main() -> None:
 
         qvec = [quantize(float(x)) for x in vector]
         lbl = 1 if label == "fraud" else 0
-        key = compute_partition_key(qvec)
+        pkey = compute_partition_key(qvec)
 
-        p = partitions.get(key)
+        p = partitions.get(pkey)
         if p is None:
-            p = PartitionData(key=key)
-            partitions[key] = p
+            p = PartitionData(key=pkey)
+            partitions[pkey] = p
 
         p.count += 1
-        p.labels.append(lbl)
-        p.vectors.extend(qvec)
-        for d in range(DIMS):
-            v = qvec[d]
-            if v < p.minv[d]:
-                p.minv[d] = v
-            if v > p.maxv[d]:
-                p.maxv[d] = v
+        update_minmax(p.minv, p.maxv, qvec)
+
+        skey = compute_subindex_key(qvec)
+        bucket = p.buckets.get(skey)
+        if bucket is None:
+            bucket = BucketData()
+            p.buckets[skey] = bucket
+
+        bucket.count += 1
+        bucket.labels.append(lbl)
+        bucket.vectors.extend(qvec)
+        update_minmax(bucket.minv, bucket.maxv, qvec)
 
         total_count += 1
 
     sorted_keys = sorted(partitions.keys())
     partition_count = len(sorted_keys)
-    node_count = partition_count
 
-    partition_entries: list[tuple[int, int, int, list[int], list[int]]] = []
+    partition_entries: list[tuple[int, int, int, list[int], list[int], int]] = []
     node_entries: list[tuple[int, int, int, int, list[int], list[int]]] = []
-    running_blocks = 0
-
-    for node_idx, key in enumerate(sorted_keys):
-        p = partitions[key]
-        blocks = (p.count + LANES - 1) // LANES
-        start_block = running_blocks
-        running_blocks += blocks
-
-        partition_entries.append((key, node_idx, p.count, p.minv, p.maxv))
-        node_entries.append((-1, -1, start_block, p.count, p.minv, p.maxv))
-
-    total_blocks = running_blocks
 
     vectors_blob = array("h")
     labels_blob = bytearray()
+    running_blocks = 0
+    max_leaves_per_partition = 0
 
     for key in sorted_keys:
         p = partitions[key]
-        count = p.count
-        blocks = (count + LANES - 1) // LANES
-        data = p.vectors
-        labels = p.labels
 
-        for b in range(blocks):
-            base_idx = b * LANES
-            for d in range(DIMS):
-                for lane in range(LANES):
-                    i = base_idx + lane
-                    if i < count:
-                        vectors_blob.append(data[i * DIMS + d])
-                    else:
-                        vectors_blob.append(0)
-            for lane in range(LANES):
-                i = base_idx + lane
-                if i < count:
-                    labels_blob.append(labels[i])
-                else:
-                    labels_blob.append(0)
+        leaves: list[TreeNode] = []
+        for _, bucket in sorted(p.buckets.items(), key=lambda kv: kv[0]):
+            if bucket.count <= 0:
+                continue
+            leaves.append(
+                TreeNode(
+                    minv=bucket.minv.copy(),
+                    maxv=bucket.maxv.copy(),
+                    length=bucket.count,
+                    left=None,
+                    right=None,
+                    bucket=bucket,
+                )
+            )
+
+        if not leaves:
+            continue
+
+        if len(leaves) > max_leaves_per_partition:
+            max_leaves_per_partition = len(leaves)
+
+        root = build_tree_from_leaves(leaves)
+        root_idx, running_blocks = emit_tree(root, vectors_blob, labels_blob, node_entries, running_blocks)
+        partition_entries.append((key, root_idx, p.count, p.minv, p.maxv, len(leaves)))
 
         # release partition payload after emitting
-        p.vectors = array("h")
-        p.labels = bytearray()
+        for bucket in p.buckets.values():
+            bucket.vectors = array("h")
+            bucket.labels = bytearray()
+        p.buckets.clear()
+
+    node_count = len(node_entries)
+    total_blocks = running_blocks
 
     if len(vectors_blob) != total_blocks * DIMS * LANES:
         raise RuntimeError("invalid vectors blob size")
     if len(labels_blob) != total_blocks * LANES:
         raise RuntimeError("invalid labels blob size")
+    if partition_count != len(partition_entries):
+        raise RuntimeError("partition count mismatch")
 
     out = bytearray()
     out.extend(
@@ -193,7 +340,7 @@ def main() -> None:
         )
     )
 
-    for key, root, length, minv, maxv in partition_entries:
+    for key, root, length, minv, maxv, _leaf_count in partition_entries:
         out.extend(struct.pack("<Iiii", key, root, 0, length))
         out.extend(struct.pack("<" + "h" * DIMS, *minv))
         out.extend(struct.pack("<" + "h" * DIMS, *maxv))
@@ -212,6 +359,7 @@ def main() -> None:
     print(f"partitions: {partition_count}")
     print(f"nodes: {node_count}")
     print(f"blocks: {total_blocks}")
+    print(f"max leaves per partition: {max_leaves_per_partition}")
     print(f"wrote: {OUTPUT_IDX_PATH}")
     print(f"size: {len(out)} bytes")
 
