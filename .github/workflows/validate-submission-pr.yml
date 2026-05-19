@@ -1,0 +1,79 @@
+name: Validate Submission PR
+
+on:
+  pull_request:
+    branches:
+      - submission
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure required files exist
+        run: |
+          set -euo pipefail
+          test -f docker-compose.yml
+          test -f info.json
+
+      - name: Validate submission constraints
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          compose = pathlib.Path("docker-compose.yml").read_text(encoding="utf-8")
+
+          errors = []
+
+          if re.search(r"^\s*build\s*:", compose, re.MULTILINE):
+              errors.append("docker-compose.yml must not contain 'build:' in submission branch")
+
+          for required in ("api1:", "api2:", "load-balancer:"):
+              if required not in compose:
+                  errors.append(f"missing required service '{required[:-1]}'")
+
+          if "9999:9999" not in compose:
+              errors.append("load balancer must publish port 9999")
+
+          if "driver: bridge" not in compose:
+              errors.append("network mode must be bridge")
+
+          cpus = [float(m.group(1)) for m in re.finditer(r'cpus:\s*"?([0-9]+(?:\.[0-9]+)?)"?', compose)]
+          cpu_sum = sum(cpus)
+          if not cpus:
+              errors.append("no CPU limits found")
+          elif cpu_sum > 1.0 + 1e-9:
+              errors.append(f"sum of CPU limits exceeds 1.0 (found {cpu_sum})")
+
+          mem_sum_mb = 0.0
+          mem_matches = list(re.finditer(r'memory:\s*"?([0-9]+(?:\.[0-9]+)?)\s*([KMG]B)"?', compose, re.IGNORECASE))
+          if not mem_matches:
+              errors.append("no memory limits found")
+          else:
+              for m in mem_matches:
+                  value = float(m.group(1))
+                  unit = m.group(2).upper()
+                  if unit == "KB":
+                      mem_sum_mb += value / 1024.0
+                  elif unit == "MB":
+                      mem_sum_mb += value
+                  elif unit == "GB":
+                      mem_sum_mb += value * 1024.0
+              if mem_sum_mb > 350.0 + 1e-9:
+                  errors.append(f"sum of memory limits exceeds 350MB (found {mem_sum_mb:.2f}MB)")
+
+          if errors:
+              for err in errors:
+                  print(f"ERROR: {err}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"OK: cpu_sum={cpu_sum:.2f}, memory_sum_mb={mem_sum_mb:.2f}")
+          PY

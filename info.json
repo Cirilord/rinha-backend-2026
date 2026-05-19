@@ -11,7 +11,8 @@
     "c",
     "docker",
     "docker-compose",
-    "k6"
+    "k6",
+    "github-actions"
   ],
   "open_to_work": false
 }

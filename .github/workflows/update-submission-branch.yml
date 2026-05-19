@@ -1,0 +1,76 @@
+name: Update Submission Branch
+
+on:
+  workflow_run:
+    workflows:
+      - Build and Push Images
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  update-submission:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Prepare submission files
+        env:
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
+
+          api_image="ghcr.io/${owner}/${repo}-api:sha-${WORKFLOW_SHA}"
+          lb_image="ghcr.io/${owner}/${repo}-lb:sha-${WORKFLOW_SHA}"
+
+          if [ ! -f docker-compose.submission.yml ]; then
+            echo "Missing docker-compose.submission.yml in main branch root." >&2
+            exit 1
+          fi
+
+          if [ ! -f info.json ]; then
+            echo "Missing required info.json in main branch root." >&2
+            exit 1
+          fi
+
+          tmp_dir="$(mktemp -d)"
+          mkdir -p "${tmp_dir}"
+
+          sed \
+            -e "s#__API_IMAGE__#${api_image}#g" \
+            -e "s#__LB_IMAGE__#${lb_image}#g" \
+            docker-compose.submission.yml > "${tmp_dir}/docker-compose.yml"
+
+          cp info.json "${tmp_dir}/info.json"
+
+          if git ls-remote --exit-code --heads origin submission >/dev/null 2>&1; then
+            git fetch origin submission:submission
+            git checkout submission
+          else
+            git checkout --orphan submission
+          fi
+
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -a "${tmp_dir}/." .
+
+          git add docker-compose.yml info.json
+
+          if git diff --cached --quiet; then
+            echo "No submission changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(submission): update images for ${WORKFLOW_SHA}"
+          git push origin submission --force
