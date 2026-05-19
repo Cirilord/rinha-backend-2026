@@ -63,7 +63,9 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
           cp -a "${tmp_dir}/." .
 
-          git add docker-compose.yml info.json
+          # Stage additions, modifications and deletions so submission keeps
+          # only the expected files.
+          git add -A
 
           if git diff --cached --quiet; then
             echo "No submission changes to commit."
