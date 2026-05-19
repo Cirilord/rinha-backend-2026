@@ -1,0 +1,18 @@
+{
+  "participants": [
+    "Cirilo"
+  ],
+  "social": [
+    "https://github.com/Cirilord",
+    "https://www.linkedin.com/in/pedro-cirilo/"
+  ],
+  "source-code-repo": "https://github.com/Cirilord/rinha-backend-2026",
+  "stack": [
+    "c",
+    "docker",
+    "docker-compose",
+    "k6",
+    "github-actions"
+  ],
+  "open_to_work": false
+}
