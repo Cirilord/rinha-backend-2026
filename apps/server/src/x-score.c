@@ -31,14 +31,11 @@ typedef struct {
 #endif
 
 static const unsigned long long x_score_early_distance_limit =
-    ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL) *
-    ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL);
+  ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL) *
+  ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL);
 
-static void insert_partition_candidate_sorted(
-    PartitionCandidate entries[256],
-    uint32_t *entry_len,
-    unsigned long long bound,
-    uint32_t index) {
+static void insert_partition_candidate_sorted(PartitionCandidate entries[256], uint32_t *entry_len,
+                                              unsigned long long bound, uint32_t index) {
   uint32_t pos = *entry_len;
   while (pos > 0 && entries[pos - 1].bound > bound) {
     entries[pos] = entries[pos - 1];
@@ -88,7 +85,8 @@ bool x_score_open(const char *path, XScoreIndexView *out_view) {
     munmap(raw, size);
     return false;
   }
-  if (header->count < 0 || header->partition_count < 0 || header->node_count < 0 || header->block_count < 0) {
+  if (header->count < 0 || header->partition_count < 0 || header->node_count < 0 ||
+      header->block_count < 0) {
     munmap(raw, size);
     return false;
   }
@@ -231,10 +229,9 @@ static uint32_t compute_partition_key(const int16_t q[X_SCORE_DIMS]) {
   return key;
 }
 
-static unsigned long long lower_bound_box_sq(
-    const int16_t q[X_SCORE_DIMS],
-    const int16_t minv[X_SCORE_DIMS],
-    const int16_t maxv[X_SCORE_DIMS]) {
+static unsigned long long lower_bound_box_sq(const int16_t q[X_SCORE_DIMS],
+                                             const int16_t minv[X_SCORE_DIMS],
+                                             const int16_t maxv[X_SCORE_DIMS]) {
   unsigned long long sum = 0;
   for (int d = 0; d < X_SCORE_DIMS; d++) {
     long long qq = (long long)q[d];
@@ -251,11 +248,9 @@ static unsigned long long lower_bound_box_sq(
   return sum;
 }
 
-static void insert_best(
-    unsigned long long dist,
-    uint8_t label,
-    unsigned long long top_dist[X_SCORE_TOPK],
-    uint8_t top_label[X_SCORE_TOPK]) {
+static void insert_best(unsigned long long dist, uint8_t label,
+                        unsigned long long top_dist[X_SCORE_TOPK],
+                        uint8_t top_label[X_SCORE_TOPK]) {
   if (dist >= top_dist[X_SCORE_TOPK - 1]) {
     return;
   }
@@ -274,18 +269,15 @@ static inline bool early_done(const unsigned long long top_dist[X_SCORE_TOPK]) {
   return top_dist[X_SCORE_TOPK - 1] <= x_score_early_distance_limit;
 }
 
-static void scan_block(
-    const int16_t *vectors,
-    size_t block_base,
-    const int16_t q[X_SCORE_DIMS],
-    unsigned long long out_dist[X_SCORE_LANES]) {
+static void scan_block(const int16_t *vectors, size_t block_base, const int16_t q[X_SCORE_DIMS],
+                       unsigned long long out_dist[X_SCORE_LANES]) {
 #if defined(__AVX2__)
   __m256i acc_lo = _mm256_setzero_si256();
   __m256i acc_hi = _mm256_setzero_si256();
 
   for (int d = 0; d < X_SCORE_DIMS; d++) {
-    const __m128i packed =
-        _mm_loadu_si128((const __m128i *)(const void *)(vectors + block_base + (size_t)d * X_SCORE_LANES));
+    const __m128i packed = _mm_loadu_si128(
+      (const __m128i *)(const void *)(vectors + block_base + (size_t)d * X_SCORE_LANES));
     const __m256i values = _mm256_cvtepi16_epi32(packed);
     const __m256i qq = _mm256_set1_epi32((int)q[d]);
     const __m256i diff = _mm256_sub_epi32(values, qq);
@@ -352,12 +344,9 @@ static void scan_block(
 #endif
 }
 
-static bool scan_leaf(
-    const XScoreIndexView *view,
-    const XScoreNodeEntry *node,
-    const int16_t q[X_SCORE_DIMS],
-    unsigned long long top_dist[X_SCORE_TOPK],
-    uint8_t top_label[X_SCORE_TOPK]) {
+static bool scan_leaf(const XScoreIndexView *view, const XScoreNodeEntry *node,
+                      const int16_t q[X_SCORE_DIMS], unsigned long long top_dist[X_SCORE_TOPK],
+                      uint8_t top_label[X_SCORE_TOPK]) {
   if (!node || node->len <= 0 || node->start_block < 0) {
     return false;
   }
@@ -395,13 +384,10 @@ static bool scan_leaf(
   return false;
 }
 
-static bool search_node_iterative(
-    const XScoreIndexView *view,
-    uint32_t root,
-    unsigned long long root_bound,
-    const int16_t q[X_SCORE_DIMS],
-    unsigned long long top_dist[X_SCORE_TOPK],
-    uint8_t top_label[X_SCORE_TOPK]) {
+static bool search_node_iterative(const XScoreIndexView *view, uint32_t root,
+                                  unsigned long long root_bound, const int16_t q[X_SCORE_DIMS],
+                                  unsigned long long top_dist[X_SCORE_TOPK],
+                                  uint8_t top_label[X_SCORE_TOPK]) {
   if (root >= view->node_count) {
     return false;
   }
@@ -423,17 +409,18 @@ static bool search_node_iterative(
         uint32_t left = (uint32_t)node->left;
         uint32_t right = (uint32_t)node->right;
         if (left >= view->node_count || right >= view->node_count) {
-          if (stack_len == 0) break;
+          if (stack_len == 0) {
+            break;
+          }
           stack_len--;
           current = (uint32_t)stack[stack_len].node_index;
           current_bound = stack[stack_len].bound;
           continue;
         }
 
-        unsigned long long lb =
-            lower_bound_box_sq(q, view->nodes[left].min, view->nodes[left].max);
+        unsigned long long lb = lower_bound_box_sq(q, view->nodes[left].min, view->nodes[left].max);
         unsigned long long rb =
-            lower_bound_box_sq(q, view->nodes[right].min, view->nodes[right].max);
+          lower_bound_box_sq(q, view->nodes[right].min, view->nodes[right].max);
 
         uint32_t near_idx = left;
         uint32_t far_idx = right;
@@ -446,7 +433,8 @@ static bool search_node_iterative(
           far_bound = lb;
         }
 
-        if (far_bound <= top_dist[X_SCORE_TOPK - 1] && stack_len < (sizeof(stack) / sizeof(stack[0]))) {
+        if (far_bound <= top_dist[X_SCORE_TOPK - 1] &&
+            stack_len < (sizeof(stack) / sizeof(stack[0]))) {
           stack[stack_len].node_index = far_idx;
           stack[stack_len].bound = far_bound;
           stack_len++;
@@ -470,11 +458,9 @@ static bool search_node_iterative(
   return false;
 }
 
-static void search_exact(
-    const XScoreIndexView *view,
-    const int16_t q[X_SCORE_DIMS],
-    unsigned long long top_dist[X_SCORE_TOPK],
-    uint8_t top_label[X_SCORE_TOPK]) {
+static void search_exact(const XScoreIndexView *view, const int16_t q[X_SCORE_DIMS],
+                         unsigned long long top_dist[X_SCORE_TOPK],
+                         uint8_t top_label[X_SCORE_TOPK]) {
   const int16_t *vectors = view->vectors_q16;
   const uint8_t *labels = view->labels;
   unsigned long long dists[X_SCORE_LANES];
@@ -547,7 +533,8 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
       if (p->root < 0) {
         continue;
       }
-      if (search_node_iterative(view, (uint32_t)p->root, entries[i].bound, q, top_dist, top_label)) {
+      if (search_node_iterative(view, (uint32_t)p->root, entries[i].bound, q, top_dist,
+                                top_label)) {
         break;
       }
     }

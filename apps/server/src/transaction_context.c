@@ -73,26 +73,36 @@ static double mcc_risk_or_default(const char *mcc) {
   if (mcc == NULL) {
     return 0.5;
   }
-  if (strcmp(mcc, "5411") == 0)
+  if (strcmp(mcc, "5411") == 0) {
     return 0.15;
-  if (strcmp(mcc, "5812") == 0)
+  }
+  if (strcmp(mcc, "5812") == 0) {
     return 0.30;
-  if (strcmp(mcc, "5912") == 0)
+  }
+  if (strcmp(mcc, "5912") == 0) {
     return 0.20;
-  if (strcmp(mcc, "5944") == 0)
+  }
+  if (strcmp(mcc, "5944") == 0) {
     return 0.45;
-  if (strcmp(mcc, "7801") == 0)
+  }
+  if (strcmp(mcc, "7801") == 0) {
     return 0.80;
-  if (strcmp(mcc, "7802") == 0)
+  }
+  if (strcmp(mcc, "7802") == 0) {
     return 0.75;
-  if (strcmp(mcc, "7995") == 0)
+  }
+  if (strcmp(mcc, "7995") == 0) {
     return 0.85;
-  if (strcmp(mcc, "4511") == 0)
+  }
+  if (strcmp(mcc, "4511") == 0) {
     return 0.35;
-  if (strcmp(mcc, "5311") == 0)
+  }
+  if (strcmp(mcc, "5311") == 0) {
     return 0.25;
-  if (strcmp(mcc, "5999") == 0)
+  }
+  if (strcmp(mcc, "5999") == 0) {
     return 0.50;
+  }
   return 0.5;
 }
 
@@ -246,8 +256,7 @@ static int parse_4d(const char *s) {
       !isdigit((unsigned char)s[2]) || !isdigit((unsigned char)s[3])) {
     return -1;
   }
-  return (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 +
-         (s[3] - '0');
+  return (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
 }
 
 static bool parse_iso8601_utc_epoch(const char *s, long long *out) {
@@ -261,8 +270,7 @@ static bool parse_iso8601_utc_epoch(const char *s, long long *out) {
   if (strlen(s) != 20) {
     return false;
   }
-  if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' ||
-      s[16] != ':' || s[19] != 'Z') {
+  if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' || s[19] != 'Z') {
     return false;
   }
 
@@ -273,13 +281,13 @@ static bool parse_iso8601_utc_epoch(const char *s, long long *out) {
   mm = parse_2d(s + 14);
   ss = parse_2d(s + 17);
 
-  if (year < 0 || mon < 1 || mon > 12 || day < 1 || day > 31 || hh < 0 ||
-      hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) {
+  if (year < 0 || mon < 1 || mon > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mm < 0 ||
+      mm > 59 || ss < 0 || ss > 59) {
     return false;
   }
 
-  *out = days_from_civil(year, (unsigned)mon, (unsigned)day) * 86400LL +
-         (long long)hh * 3600LL + (long long)mm * 60LL + (long long)ss;
+  *out = days_from_civil(year, (unsigned)mon, (unsigned)day) * 86400LL + (long long)hh * 3600LL +
+         (long long)mm * 60LL + (long long)ss;
   return true;
 }
 
@@ -323,7 +331,9 @@ static bool parse_known_merchants_n(const char **p, const char *end, char ***out
 
     if (!parse_string_dup_n(p, end, &value)) {
       int i = 0;
-      for (i = 0; i < len; i++) free(items[i]);
+      for (i = 0; i < len; i++) {
+        free(items[i]);
+      }
       free(items);
       return false;
     }
@@ -334,7 +344,9 @@ static bool parse_known_merchants_n(const char **p, const char *end, char ***out
       if (new_items == NULL) {
         int i = 0;
         free(value);
-        for (i = 0; i < len; i++) free(items[i]);
+        for (i = 0; i < len; i++) {
+          free(items[i]);
+        }
         free(items);
         return false;
       }
@@ -354,7 +366,9 @@ static bool parse_known_merchants_n(const char **p, const char *end, char ***out
 
     {
       int i = 0;
-      for (i = 0; i < len; i++) free(items[i]);
+      for (i = 0; i < len; i++) {
+        free(items[i]);
+      }
       free(items);
       return false;
     }
@@ -388,8 +402,7 @@ static void transaction_context_destroy(TransactionContext *self) {
   memset(self, 0, sizeof(*self));
 }
 
-static bool transaction_context_parse_n(TransactionContext *self,
-                                        const char *body,
+static bool transaction_context_parse_n(TransactionContext *self, const char *body,
                                         size_t body_len) {
   const char *p = NULL;
   const char *end = NULL;
@@ -402,145 +415,206 @@ static bool transaction_context_parse_n(TransactionContext *self,
   p = body;
   end = body + body_len;
 
-  if (!expect_char_n(&p, end, '{'))
+  if (!expect_char_n(&p, end, '{')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"id\""))
+  if (!expect_key_n(&p, end, "\"id\"")) {
     goto fail;
-  if (!parse_string_dup_n(&p, end, &self->id))
+  }
+  if (!parse_string_dup_n(&p, end, &self->id)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"transaction\""))
+  if (!expect_key_n(&p, end, "\"transaction\"")) {
     goto fail;
-  if (!expect_char_n(&p, end, '{'))
+  }
+  if (!expect_char_n(&p, end, '{')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"amount\""))
+  }
+  if (!expect_key_n(&p, end, "\"amount\"")) {
     goto fail;
-  if (!parse_double_n(&p, end, &self->transaction_amount))
+  }
+  if (!parse_double_n(&p, end, &self->transaction_amount)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"installments\""))
+  }
+  if (!expect_key_n(&p, end, "\"installments\"")) {
     goto fail;
-  if (!parse_int_n(&p, end, &self->transaction_installments))
+  }
+  if (!parse_int_n(&p, end, &self->transaction_installments)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"requested_at\""))
+  }
+  if (!expect_key_n(&p, end, "\"requested_at\"")) {
     goto fail;
-  if (!parse_timestamp_field(&p, &self->transaction_requested_at))
+  }
+  if (!parse_timestamp_field(&p, &self->transaction_requested_at)) {
     goto fail;
-  if (!expect_char_n(&p, end, '}'))
+  }
+  if (!expect_char_n(&p, end, '}')) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"customer\""))
+  if (!expect_key_n(&p, end, "\"customer\"")) {
     goto fail;
-  if (!expect_char_n(&p, end, '{'))
+  }
+  if (!expect_char_n(&p, end, '{')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"avg_amount\""))
+  }
+  if (!expect_key_n(&p, end, "\"avg_amount\"")) {
     goto fail;
-  if (!parse_double_n(&p, end, &self->customer_avg_amount))
+  }
+  if (!parse_double_n(&p, end, &self->customer_avg_amount)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"tx_count_24h\""))
+  }
+  if (!expect_key_n(&p, end, "\"tx_count_24h\"")) {
     goto fail;
-  if (!parse_int_n(&p, end, &self->customer_tx_count_24h))
+  }
+  if (!parse_int_n(&p, end, &self->customer_tx_count_24h)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"known_merchants\""))
+  }
+  if (!expect_key_n(&p, end, "\"known_merchants\"")) {
     goto fail;
+  }
   if (!parse_known_merchants_n(&p, end, &self->customer_known_merchants,
-                               &self->customer_known_merchants_len))
+                               &self->customer_known_merchants_len)) {
     goto fail;
-  if (!expect_char_n(&p, end, '}'))
+  }
+  if (!expect_char_n(&p, end, '}')) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"merchant\""))
+  if (!expect_key_n(&p, end, "\"merchant\"")) {
     goto fail;
-  if (!expect_char_n(&p, end, '{'))
+  }
+  if (!expect_char_n(&p, end, '{')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"id\""))
+  }
+  if (!expect_key_n(&p, end, "\"id\"")) {
     goto fail;
-  if (!parse_string_dup_n(&p, end, &self->merchant_id))
+  }
+  if (!parse_string_dup_n(&p, end, &self->merchant_id)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"mcc\""))
+  }
+  if (!expect_key_n(&p, end, "\"mcc\"")) {
     goto fail;
-  if (!parse_string_dup_n(&p, end, &self->merchant_mcc))
+  }
+  if (!parse_string_dup_n(&p, end, &self->merchant_mcc)) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"avg_amount\""))
+  }
+  if (!expect_key_n(&p, end, "\"avg_amount\"")) {
     goto fail;
-  if (!parse_double_n(&p, end, &self->merchant_avg_amount))
+  }
+  if (!parse_double_n(&p, end, &self->merchant_avg_amount)) {
     goto fail;
-  if (!expect_char_n(&p, end, '}'))
+  }
+  if (!expect_char_n(&p, end, '}')) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"terminal\""))
+  if (!expect_key_n(&p, end, "\"terminal\"")) {
     goto fail;
-  if (!expect_char_n(&p, end, '{'))
+  }
+  if (!expect_char_n(&p, end, '{')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"is_online\""))
+  }
+  if (!expect_key_n(&p, end, "\"is_online\"")) {
     goto fail;
-  if (!parse_bool_n(&p, end, &b))
+  }
+  if (!parse_bool_n(&p, end, &b)) {
     goto fail;
+  }
   self->terminal_is_online = b ? 1 : 0;
-  if (!expect_char_n(&p, end, ','))
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"card_present\""))
+  }
+  if (!expect_key_n(&p, end, "\"card_present\"")) {
     goto fail;
-  if (!parse_bool_n(&p, end, &b))
+  }
+  if (!parse_bool_n(&p, end, &b)) {
     goto fail;
+  }
   self->terminal_card_present = b ? 1 : 0;
-  if (!expect_char_n(&p, end, ','))
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
-  if (!expect_key_n(&p, end, "\"km_from_home\""))
+  }
+  if (!expect_key_n(&p, end, "\"km_from_home\"")) {
     goto fail;
-  if (!parse_double_n(&p, end, &self->terminal_km_from_home))
+  }
+  if (!parse_double_n(&p, end, &self->terminal_km_from_home)) {
     goto fail;
-  if (!expect_char_n(&p, end, '}'))
+  }
+  if (!expect_char_n(&p, end, '}')) {
     goto fail;
-  if (!expect_char_n(&p, end, ','))
+  }
+  if (!expect_char_n(&p, end, ',')) {
     goto fail;
+  }
 
-  if (!expect_key_n(&p, end, "\"last_transaction\""))
+  if (!expect_key_n(&p, end, "\"last_transaction\"")) {
     goto fail;
+  }
   p = skip_ws_n(p, end);
   if ((size_t)(end - p) >= 4 && memcmp(p, "null", 4) == 0) {
     self->has_last_transaction = false;
     p += 4;
   } else {
     self->has_last_transaction = true;
-    if (!expect_char_n(&p, end, '{'))
+    if (!expect_char_n(&p, end, '{')) {
       goto fail;
-    if (!expect_key_n(&p, end, "\"timestamp\""))
+    }
+    if (!expect_key_n(&p, end, "\"timestamp\"")) {
       goto fail;
-    if (!parse_timestamp_field(&p, &self->last_transaction_timestamp))
+    }
+    if (!parse_timestamp_field(&p, &self->last_transaction_timestamp)) {
       goto fail;
-    if (!expect_char_n(&p, end, ','))
+    }
+    if (!expect_char_n(&p, end, ',')) {
       goto fail;
-    if (!expect_key_n(&p, end, "\"km_from_current\""))
+    }
+    if (!expect_key_n(&p, end, "\"km_from_current\"")) {
       goto fail;
-    if (!parse_double_n(&p, end, &self->last_transaction_km_from_current))
+    }
+    if (!parse_double_n(&p, end, &self->last_transaction_km_from_current)) {
       goto fail;
-    if (!expect_char_n(&p, end, '}'))
+    }
+    if (!expect_char_n(&p, end, '}')) {
       goto fail;
+    }
   }
 
-  if (!expect_char_n(&p, end, '}'))
+  if (!expect_char_n(&p, end, '}')) {
     goto fail;
+  }
   p = skip_ws_n(p, end);
   return p == end;
 
@@ -549,8 +623,7 @@ fail:
   return false;
 }
 
-static void transaction_context_to_vector(const TransactionContext *self,
-                                          double out[14]) {
+static void transaction_context_to_vector(const TransactionContext *self, double out[14]) {
   double amount = 0.0;
   double installments = 0.0;
   double customer_avg = 0.0;
@@ -573,37 +646,29 @@ static void transaction_context_to_vector(const TransactionContext *self,
   }
 
   amount = clamp_01(self->transaction_amount / NORMALIZATION_MAX_AMOUNT);
-  installments = clamp_01((double)self->transaction_installments /
-                          NORMALIZATION_MAX_INSTALLMENTS);
+  installments = clamp_01((double)self->transaction_installments / NORMALIZATION_MAX_INSTALLMENTS);
 
-  customer_avg =
-      self->customer_avg_amount < 1e-9 ? 1e-9 : self->customer_avg_amount;
-  amount_vs_avg = clamp_01(self->transaction_amount / customer_avg /
-                           NORMALIZATION_AMOUNT_VS_AVG_RATIO);
+  customer_avg = self->customer_avg_amount < 1e-9 ? 1e-9 : self->customer_avg_amount;
+  amount_vs_avg =
+    clamp_01(self->transaction_amount / customer_avg / NORMALIZATION_AMOUNT_VS_AVG_RATIO);
 
-  hour_of_day =
-      (double)hour_of_day_from_epoch(self->transaction_requested_at) / 23.0;
-  day_of_week =
-      (double)day_of_week_from_epoch(self->transaction_requested_at) / 6.0;
+  hour_of_day = (double)hour_of_day_from_epoch(self->transaction_requested_at) / 23.0;
+  day_of_week = (double)day_of_week_from_epoch(self->transaction_requested_at) / 6.0;
 
   if (self->has_last_transaction) {
-    minutes_since_last = clamp_01(((double)(self->transaction_requested_at -
-                                            self->last_transaction_timestamp) /
-                                   60.0) /
-                                  NORMALIZATION_MAX_MINUTES);
-    km_from_last_tx =
-        clamp_01(self->last_transaction_km_from_current / NORMALIZATION_MAX_KM);
+    minutes_since_last = clamp_01(
+      ((double)(self->transaction_requested_at - self->last_transaction_timestamp) / 60.0) /
+      NORMALIZATION_MAX_MINUTES);
+    km_from_last_tx = clamp_01(self->last_transaction_km_from_current / NORMALIZATION_MAX_KM);
   }
 
   km_from_home = clamp_01(self->terminal_km_from_home / NORMALIZATION_MAX_KM);
-  tx_count_24h = clamp_01((double)self->customer_tx_count_24h /
-                          NORMALIZATION_MAX_TX_COUNT_24H);
+  tx_count_24h = clamp_01((double)self->customer_tx_count_24h / NORMALIZATION_MAX_TX_COUNT_24H);
   is_online = self->terminal_is_online ? 1.0 : 0.0;
   card_present = self->terminal_card_present ? 1.0 : 0.0;
   unknown_merchant = merchant_is_known(self) ? 0.0 : 1.0;
   mcc_risk = mcc_risk_or_default(self->merchant_mcc);
-  merchant_avg_amount = clamp_01(self->merchant_avg_amount /
-                                 NORMALIZATION_MAX_MERCHANT_AVG_AMOUNT);
+  merchant_avg_amount = clamp_01(self->merchant_avg_amount / NORMALIZATION_MAX_MERCHANT_AVG_AMOUNT);
 
   out[0] = amount;
   out[1] = installments;

@@ -6,8 +6,7 @@
 
 struct TransactionContext;
 typedef void (*TransactionContextDestroyFn)(struct TransactionContext *self);
-typedef void (*TransactionContextToVectorFn)(
-    const struct TransactionContext *self, double out[14]);
+typedef void (*TransactionContextToVectorFn)(const struct TransactionContext *self, double out[14]);
 
 typedef struct TransactionContext {
   char *id;

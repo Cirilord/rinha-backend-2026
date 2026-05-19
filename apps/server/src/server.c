@@ -36,9 +36,7 @@ int create_unix_server(const char *path) {
   return fd;
 }
 
-static const char *find_headers_end(const char *buf) {
-  return strstr(buf, "\r\n\r\n");
-}
+static const char *find_headers_end(const char *buf) { return strstr(buf, "\r\n\r\n"); }
 
 static size_t parse_content_length(const char *buf) {
   const char *p = strstr(buf, "\r\nContent-Length:");
@@ -96,8 +94,7 @@ ssize_t read_http_request(int fd, char *buf, size_t cap) {
   return (ssize_t)(cap - 1);
 }
 
-bool get_body(const char *request, size_t request_len, const char **out_body,
-              size_t *out_len) {
+bool get_body(const char *request, size_t request_len, const char **out_body, size_t *out_len) {
   const char *body_start = NULL;
   const char *headers_end = NULL;
 

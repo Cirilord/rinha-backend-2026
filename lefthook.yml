@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    c-format:
+      glob: "**/*.{c,h}"
+      run: clang-format -i {staged_files}
+      stage_fixed: true

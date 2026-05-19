@@ -8,7 +8,11 @@
   "customer": {
     "avg_amount": 769.76,
     "tx_count_24h": 3,
-    "known_merchants": ["MERC-009", "MERC-001", "MERC-001"]
+    "known_merchants": [
+      "MERC-009",
+      "MERC-001",
+      "MERC-001"
+    ]
   },
   "merchant": {
     "id": "MERC-001",

@@ -1,12 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -37,8 +37,8 @@ static int recv_fd(int unix_sock) {
 
   char buf[1];
   struct iovec io = {
-      .iov_base = buf,
-      .iov_len = sizeof(buf),
+    .iov_base = buf,
+    .iov_len = sizeof(buf),
   };
   msg.msg_iov = &io;
   msg.msg_iovlen = 1;
@@ -53,8 +53,7 @@ static int recv_fd(int unix_sock) {
   }
 
   struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET ||
-      cmsg->cmsg_type != SCM_RIGHTS) {
+  if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
     return -1;
   }
 
@@ -65,20 +64,19 @@ static int recv_fd(int unix_sock) {
 
 static void warm_up(const XScoreIndexView *xscore) {
   static const char warmup_body[] =
-      "{\"id\":\"tx-warmup\","
-      "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
-      "\"2026-03-11T20:23:35Z\"},"
-      "\"customer\":{\"avg_amount\":769.76,\"tx_count_24h\":3,\"known_"
-      "merchants\":[\"MERC-009\",\"MERC-001\",\"MERC-001\"]},"
-      "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"5912\",\"avg_amount\":298."
-      "95},"
-      "\"terminal\":{\"is_online\":false,\"card_present\":true,\"km_from_"
-      "home\":13.7090520965},"
-      "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_"
-      "current\":18.8626479774}}";
+    "{\"id\":\"tx-warmup\","
+    "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
+    "\"2026-03-11T20:23:35Z\"},"
+    "\"customer\":{\"avg_amount\":769.76,\"tx_count_24h\":3,\"known_"
+    "merchants\":[\"MERC-009\",\"MERC-001\",\"MERC-001\"]},"
+    "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"5912\",\"avg_amount\":298."
+    "95},"
+    "\"terminal\":{\"is_online\":false,\"card_present\":true,\"km_from_"
+    "home\":13.7090520965},"
+    "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_"
+    "current\":18.8626479774}}";
 
-  TransactionContext ctx =
-      transaction_context_from_body_n(warmup_body, sizeof(warmup_body) - 1);
+  TransactionContext ctx = transaction_context_from_body_n(warmup_body, sizeof(warmup_body) - 1);
   if (ctx.id != NULL) {
     double vector[14];
     volatile uint8_t warmup_sink = 0;
@@ -112,16 +110,14 @@ int main(void) {
 
   XScoreIndexView xscore;
   if (!x_score_open(xscore_path, &xscore)) {
-    fprintf(stderr,
-            "failed to load x-score index from resources/references.idx\n");
+    fprintf(stderr, "failed to load x-score index from resources/references.idx\n");
     return 1;
   }
   warm_up(&xscore);
 
   int server_fd = create_unix_server(socket_path);
   if (server_fd < 0) {
-    fprintf(stderr, "failed to bind unix socket '%s': %s\n", socket_path,
-            strerror(errno));
+    fprintf(stderr, "failed to bind unix socket '%s': %s\n", socket_path, strerror(errno));
     return 1;
   }
 
@@ -196,13 +192,11 @@ int main(void) {
         continue;
       }
 
-      if (strcmp(method, "POST") == 0 &&
-          strcmp(pathname, "/fraud-score") == 0) {
+      if (strcmp(method, "POST") == 0 && strcmp(pathname, "/fraud-score") == 0) {
         const char *body = NULL;
         size_t body_len = 0;
         if (!get_body(request, (size_t)nread, &body, &body_len)) {
-          (void)write(client_fd, RESPONSE_NOT_FOUND.data,
-                      RESPONSE_NOT_FOUND.len);
+          (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
           close(client_fd);
           continue;
         }
@@ -210,8 +204,7 @@ int main(void) {
         TransactionContext ctx = transaction_context_from_body_n(body, body_len);
         if (ctx.id == NULL) {
           ctx.destroy(&ctx);
-          (void)write(client_fd, RESPONSE_BAD_REQUEST.data,
-                      RESPONSE_BAD_REQUEST.len);
+          (void)write(client_fd, RESPONSE_BAD_REQUEST.data, RESPONSE_BAD_REQUEST.len);
           close(client_fd);
           continue;
         }

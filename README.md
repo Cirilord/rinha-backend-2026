@@ -144,6 +144,27 @@ make server TARGETARCH=amd64
 make load-balancer TARGETARCH=amd64
 ```
 
+### Git Hooks (Lefthook)
+
+This repo includes `lefthook.yml` to run C formatting on `pre-commit`.
+
+Hook behavior:
+- formats staged `*.c` and `*.h` files with `clang-format`
+- re-stages fixed files automatically (`stage_fixed: true`)
+
+Setup:
+
+```bash
+brew install lefthook clang-format
+lefthook install
+```
+
+Run manually (optional):
+
+```bash
+lefthook run pre-commit
+```
+
 ## 5. Python Scripts
 
 ### `scripts/build_binary_references.py`
