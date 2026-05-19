@@ -10,6 +10,11 @@ services:
       - shared-sockets:/shared
     networks:
       - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.47"
+          memory: "150MB"
 
   api2:
     build:
@@ -22,10 +27,16 @@ services:
       - shared-sockets:/shared
     networks:
       - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.47"
+          memory: "150MB"
 
   load-balancer:
     build:
-      context: ./apps/load-balancer
+      context: .
+      dockerfile: ./apps/load-balancer/Dockerfile
     ports:
       - "9999:9999"
     environment:
@@ -38,6 +49,11 @@ services:
       - api2
     networks:
       - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.06"
+          memory: "50MB"
 
 networks:
   rinha:

@@ -8,6 +8,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#if defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 typedef struct {
   unsigned long long bound;
   uint32_t index;
@@ -17,6 +25,14 @@ typedef struct {
   size_t node_index;
   unsigned long long bound;
 } NodeStackEntry;
+
+#ifndef X_SCORE_EARLY_DISTANCE_MILLI
+#define X_SCORE_EARLY_DISTANCE_MILLI 140
+#endif
+
+static const unsigned long long x_score_early_distance_limit =
+    ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL) *
+    ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL);
 
 static void insert_partition_candidate_sorted(
     PartitionCandidate entries[256],
@@ -254,11 +270,74 @@ static void insert_best(
   top_label[pos] = label;
 }
 
+static inline bool early_done(const unsigned long long top_dist[X_SCORE_TOPK]) {
+  return top_dist[X_SCORE_TOPK - 1] <= x_score_early_distance_limit;
+}
+
 static void scan_block(
     const int16_t *vectors,
     size_t block_base,
     const int16_t q[X_SCORE_DIMS],
     unsigned long long out_dist[X_SCORE_LANES]) {
+#if defined(__AVX2__)
+  __m256i acc_lo = _mm256_setzero_si256();
+  __m256i acc_hi = _mm256_setzero_si256();
+
+  for (int d = 0; d < X_SCORE_DIMS; d++) {
+    const __m128i packed =
+        _mm_loadu_si128((const __m128i *)(const void *)(vectors + block_base + (size_t)d * X_SCORE_LANES));
+    const __m256i values = _mm256_cvtepi16_epi32(packed);
+    const __m256i qq = _mm256_set1_epi32((int)q[d]);
+    const __m256i diff = _mm256_sub_epi32(values, qq);
+    const __m256i sq = _mm256_mullo_epi32(diff, diff);
+    const __m128i sq_lo = _mm256_castsi256_si128(sq);
+    const __m128i sq_hi = _mm256_extracti128_si256(sq, 1);
+    acc_lo = _mm256_add_epi64(acc_lo, _mm256_cvtepi32_epi64(sq_lo));
+    acc_hi = _mm256_add_epi64(acc_hi, _mm256_cvtepi32_epi64(sq_hi));
+  }
+
+  _mm256_storeu_si256((__m256i *)(void *)out_dist, acc_lo);
+  _mm256_storeu_si256((__m256i *)(void *)(out_dist + 4), acc_hi);
+#elif defined(__ARM_NEON__)
+  int64x2_t acc0 = vdupq_n_s64(0);
+  int64x2_t acc1 = vdupq_n_s64(0);
+  int64x2_t acc2 = vdupq_n_s64(0);
+  int64x2_t acc3 = vdupq_n_s64(0);
+
+  for (int d = 0; d < X_SCORE_DIMS; d++) {
+    const int16x8_t v = vld1q_s16(vectors + block_base + (size_t)d * X_SCORE_LANES);
+    const int16x8_t qq = vdupq_n_s16(q[d]);
+    const int16x8_t diff = vsubq_s16(v, qq);
+
+    const int16x4_t diff_lo = vget_low_s16(diff);
+    const int16x4_t diff_hi = vget_high_s16(diff);
+    const int32x4_t sq_lo = vmull_s16(diff_lo, diff_lo);
+    const int32x4_t sq_hi = vmull_s16(diff_hi, diff_hi);
+
+    acc0 = vaddq_s64(acc0, vmovl_s32(vget_low_s32(sq_lo)));
+    acc1 = vaddq_s64(acc1, vmovl_s32(vget_high_s32(sq_lo)));
+    acc2 = vaddq_s64(acc2, vmovl_s32(vget_low_s32(sq_hi)));
+    acc3 = vaddq_s64(acc3, vmovl_s32(vget_high_s32(sq_hi)));
+  }
+
+  int64_t tmp0[2];
+  int64_t tmp1[2];
+  int64_t tmp2[2];
+  int64_t tmp3[2];
+  vst1q_s64(tmp0, acc0);
+  vst1q_s64(tmp1, acc1);
+  vst1q_s64(tmp2, acc2);
+  vst1q_s64(tmp3, acc3);
+
+  out_dist[0] = (unsigned long long)tmp0[0];
+  out_dist[1] = (unsigned long long)tmp0[1];
+  out_dist[2] = (unsigned long long)tmp1[0];
+  out_dist[3] = (unsigned long long)tmp1[1];
+  out_dist[4] = (unsigned long long)tmp2[0];
+  out_dist[5] = (unsigned long long)tmp2[1];
+  out_dist[6] = (unsigned long long)tmp3[0];
+  out_dist[7] = (unsigned long long)tmp3[1];
+#else
   for (int lane = 0; lane < X_SCORE_LANES; lane++) {
     out_dist[lane] = 0;
   }
@@ -270,23 +349,24 @@ static void scan_block(
       out_dist[lane] += (unsigned long long)(diff * diff);
     }
   }
+#endif
 }
 
-static void scan_leaf(
+static bool scan_leaf(
     const XScoreIndexView *view,
     const XScoreNodeEntry *node,
     const int16_t q[X_SCORE_DIMS],
     unsigned long long top_dist[X_SCORE_TOPK],
     uint8_t top_label[X_SCORE_TOPK]) {
   if (!node || node->len <= 0 || node->start_block < 0) {
-    return;
+    return false;
   }
 
   uint32_t leaf_len = (uint32_t)node->len;
   uint32_t start_block = (uint32_t)node->start_block;
   uint32_t blocks = (leaf_len + X_SCORE_LANES - 1U) / X_SCORE_LANES;
   if ((size_t)start_block + (size_t)blocks > (size_t)view->block_count) {
-    return;
+    return false;
   }
 
   const int16_t *vectors = view->vectors_q16;
@@ -308,10 +388,14 @@ static void scan_leaf(
     for (uint32_t lane = 0; lane < lane_count; lane++) {
       insert_best(dists[lane], labels[label_base + lane], top_dist, top_label);
     }
+    if (early_done(top_dist)) {
+      return true;
+    }
   }
+  return false;
 }
 
-static void search_node_iterative(
+static bool search_node_iterative(
     const XScoreIndexView *view,
     uint32_t root,
     unsigned long long root_bound,
@@ -319,7 +403,7 @@ static void search_node_iterative(
     unsigned long long top_dist[X_SCORE_TOPK],
     uint8_t top_label[X_SCORE_TOPK]) {
   if (root >= view->node_count) {
-    return;
+    return false;
   }
 
   NodeStackEntry stack[128];
@@ -332,7 +416,9 @@ static void search_node_iterative(
     if (current_bound <= top_dist[X_SCORE_TOPK - 1]) {
       const XScoreNodeEntry *node = &view->nodes[current];
       if (node->left < 0 || node->right < 0) {
-        scan_leaf(view, node, q, top_dist, top_label);
+        if (scan_leaf(view, node, q, top_dist, top_label)) {
+          return true;
+        }
       } else {
         uint32_t left = (uint32_t)node->left;
         uint32_t right = (uint32_t)node->right;
@@ -381,6 +467,7 @@ static void search_node_iterative(
     current = (uint32_t)stack[stack_len].node_index;
     current_bound = stack[stack_len].bound;
   }
+  return false;
 }
 
 static void search_exact(
@@ -443,14 +530,16 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
       unsigned long long bound = lower_bound_box_sq(q, p->min, p->max);
       if (p->key == qkey) {
         if (p->root >= 0 && bound < top_dist[X_SCORE_TOPK - 1]) {
-          search_node_iterative(view, (uint32_t)p->root, bound, q, top_dist, top_label);
+          if (search_node_iterative(view, (uint32_t)p->root, bound, q, top_dist, top_label)) {
+            break;
+          }
         }
       } else if (bound < top_dist[X_SCORE_TOPK - 1]) {
         insert_partition_candidate_sorted(entries, &entry_len, bound, i);
       }
     }
 
-    for (uint32_t i = 0; i < entry_len; i++) {
+    for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
       if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
         break;
       }
@@ -458,7 +547,9 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
       if (p->root < 0) {
         continue;
       }
-      search_node_iterative(view, (uint32_t)p->root, entries[i].bound, q, top_dist, top_label);
+      if (search_node_iterative(view, (uint32_t)p->root, entries[i].bound, q, top_dist, top_label)) {
+        break;
+      }
     }
   }
 
