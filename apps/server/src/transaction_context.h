@@ -23,6 +23,8 @@ typedef struct TransactionContext {
   char *merchant_id;
   char *merchant_mcc;
   double merchant_avg_amount;
+  int merchant_known;
+  double merchant_mcc_risk;
 
   int terminal_is_online;
   int terminal_card_present;
