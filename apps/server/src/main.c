@@ -25,6 +25,8 @@
 
 static volatile sig_atomic_t keep_running = 1;
 enum { REQUEST_BUFFER_SIZE = 8192, MAX_CTRL_CONNS = 32 };
+static const char REQ_GET_READY[] = "GET /ready ";
+static const char REQ_POST_FRAUD_SCORE[] = "POST /fraud-score ";
 
 static void on_signal(int signo) {
   (void)signo;
@@ -171,28 +173,15 @@ int main(void) {
       }
 
       request[nread] = '\0';
+      const size_t request_len = (size_t)nread;
 
-      char method[16];
-      if (!get_method(request, method, sizeof(method))) {
-        (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
-        close(client_fd);
-        continue;
-      }
-
-      char pathname[256];
-      if (!get_pathname(request, pathname, sizeof(pathname))) {
-        (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
-        close(client_fd);
-        continue;
-      }
-
-      if (strcmp(method, "GET") == 0 && strcmp(pathname, "/ready") == 0) {
+      if (memcmp(request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
         (void)write(client_fd, RESPONSE_READY.data, RESPONSE_READY.len);
         close(client_fd);
         continue;
       }
 
-      if (strcmp(method, "POST") == 0 && strcmp(pathname, "/fraud-score") == 0) {
+      if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
         const char *body = NULL;
         size_t body_len = 0;
         if (!get_body(request, (size_t)nread, &body, &body_len)) {
