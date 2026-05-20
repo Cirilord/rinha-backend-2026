@@ -1,9 +1,8 @@
 #include "transaction_context.h"
 
-#include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define NORMALIZATION_MAX_AMOUNT 10000.0
@@ -14,11 +13,79 @@
 #define NORMALIZATION_MAX_TX_COUNT_24H 20.0
 #define NORMALIZATION_MAX_MERCHANT_AVG_AMOUNT 10000.0
 
-static const char *skip_ws_n(const char *p, const char *end) {
-  while (p < end && isspace((unsigned char)*p)) {
-    p++;
+typedef enum {
+  PARENT_KEY_NONE = 0,
+  PARENT_KEY_TRANSACTION,
+  PARENT_KEY_CUSTOMER,
+  PARENT_KEY_MERCHANT,
+  PARENT_KEY_TERMINAL,
+  PARENT_KEY_LAST_TRANSACTION,
+} ParentKey;
+
+typedef enum {
+  CHILD_KEY_NONE = 0,
+  CHILD_KEY_ID,
+  CHILD_KEY_AMOUNT,
+  CHILD_KEY_INSTALLMENTS,
+  CHILD_KEY_REQUESTED_AT,
+  CHILD_KEY_AVG_AMOUNT,
+  CHILD_KEY_TX_COUNT_24H,
+  CHILD_KEY_KNOWN_MERCHANTS,
+  CHILD_KEY_MCC,
+  CHILD_KEY_IS_ONLINE,
+  CHILD_KEY_CARD_PRESENT,
+  CHILD_KEY_KM_FROM_HOME,
+  CHILD_KEY_TIMESTAMP,
+  CHILD_KEY_KM_FROM_CURRENT,
+} ChildKey;
+
+static void transaction_context_destroy(TransactionContext *self);
+static void transaction_context_init(TransactionContext *ctx);
+static bool transaction_context_parse(TransactionContext *self, const char *body, size_t body_len);
+static void transaction_context_to_vector(const TransactionContext *self, double out[14]);
+
+static ChildKey child_key_id(const char *body, size_t start, size_t end) {
+  size_t len = end - start;
+  if (len == 2 && memcmp(body + start, "id", 2) == 0) {
+    return CHILD_KEY_ID;
   }
-  return p;
+  if (len == 6 && memcmp(body + start, "amount", 6) == 0) {
+    return CHILD_KEY_AMOUNT;
+  }
+  if (len == 12 && memcmp(body + start, "installments", 12) == 0) {
+    return CHILD_KEY_INSTALLMENTS;
+  }
+  if (len == 12 && memcmp(body + start, "requested_at", 12) == 0) {
+    return CHILD_KEY_REQUESTED_AT;
+  }
+  if (len == 10 && memcmp(body + start, "avg_amount", 10) == 0) {
+    return CHILD_KEY_AVG_AMOUNT;
+  }
+  if (len == 12 && memcmp(body + start, "tx_count_24h", 12) == 0) {
+    return CHILD_KEY_TX_COUNT_24H;
+  }
+  if (len == 15 && memcmp(body + start, "known_merchants", 15) == 0) {
+    return CHILD_KEY_KNOWN_MERCHANTS;
+  }
+  if (len == 3 && memcmp(body + start, "mcc", 3) == 0) {
+    return CHILD_KEY_MCC;
+  }
+  if (len == 9 && memcmp(body + start, "is_online", 9) == 0) {
+    return CHILD_KEY_IS_ONLINE;
+  }
+  if (len == 12 && memcmp(body + start, "card_present", 12) == 0) {
+    return CHILD_KEY_CARD_PRESENT;
+  }
+  if (len == 12 && memcmp(body + start, "km_from_home", 12) == 0) {
+    return CHILD_KEY_KM_FROM_HOME;
+  }
+  if (len == 9 && memcmp(body + start, "timestamp", 9) == 0) {
+    return CHILD_KEY_TIMESTAMP;
+  }
+  if (len == 15 && memcmp(body + start, "km_from_current", 15) == 0) {
+    return CHILD_KEY_KM_FROM_CURRENT;
+  }
+  return CHILD_KEY_NONE;
 }
 
 static double clamp_01(double v) {
@@ -31,16 +98,8 @@ static double clamp_01(double v) {
   return v;
 }
 
-static int hour_of_day_from_epoch(long long epoch) {
-  long long s = epoch % 86400LL;
-  if (s < 0) {
-    s += 86400LL;
-  }
-  return (int)(s / 3600LL);
-}
-
-static int day_of_week_from_epoch(long long epoch) {
-  long long days = epoch / 86400LL;
+static int day_of_week_from_epoch(int64_t epoch) {
+  int64_t days = epoch / 86400LL;
   int dow = (int)((days + 3LL) % 7LL);
   if (dow < 0) {
     dow += 7;
@@ -48,293 +107,325 @@ static int day_of_week_from_epoch(long long epoch) {
   return dow;
 }
 
-static double mcc_risk_or_default_view(const char *mcc, size_t len) {
-  if (mcc == NULL || len == 0) {
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned mp = m + (m > 2 ? -3 : 9);
+  const unsigned doy = (153 * mp + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static int hour_of_day_from_epoch(int64_t epoch) {
+  int64_t s = epoch % 86400LL;
+  if (s < 0) {
+    s += 86400LL;
+  }
+  return (int)(s / 3600LL);
+}
+
+static inline bool is_ascii_space(char c) {
+  return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+static inline bool is_ascii_digit(char c) { return c >= '0' && c <= '9'; }
+
+static double merchant_mcc_risk_or_default(const char *mcc) {
+  if (mcc == NULL || mcc[0] == '\0') {
     return 0.5;
   }
-  if (len == 4 && memcmp(mcc, "5411", 4) == 0) {
+  if (strncmp(mcc, "5411", TX2_MCC_LEN) == 0) {
     return 0.15;
   }
-  if (len == 4 && memcmp(mcc, "5812", 4) == 0) {
+  if (strncmp(mcc, "5812", TX2_MCC_LEN) == 0) {
     return 0.30;
   }
-  if (len == 4 && memcmp(mcc, "5912", 4) == 0) {
+  if (strncmp(mcc, "5912", TX2_MCC_LEN) == 0) {
     return 0.20;
   }
-  if (len == 4 && memcmp(mcc, "5944", 4) == 0) {
+  if (strncmp(mcc, "5944", TX2_MCC_LEN) == 0) {
     return 0.45;
   }
-  if (len == 4 && memcmp(mcc, "7801", 4) == 0) {
+  if (strncmp(mcc, "7801", TX2_MCC_LEN) == 0) {
     return 0.80;
   }
-  if (len == 4 && memcmp(mcc, "7802", 4) == 0) {
+  if (strncmp(mcc, "7802", TX2_MCC_LEN) == 0) {
     return 0.75;
   }
-  if (len == 4 && memcmp(mcc, "7995", 4) == 0) {
+  if (strncmp(mcc, "7995", TX2_MCC_LEN) == 0) {
     return 0.85;
   }
-  if (len == 4 && memcmp(mcc, "4511", 4) == 0) {
+  if (strncmp(mcc, "4511", TX2_MCC_LEN) == 0) {
     return 0.35;
   }
-  if (len == 4 && memcmp(mcc, "5311", 4) == 0) {
+  if (strncmp(mcc, "5311", TX2_MCC_LEN) == 0) {
     return 0.25;
   }
-  if (len == 4 && memcmp(mcc, "5999", 4) == 0) {
+  if (strncmp(mcc, "5999", TX2_MCC_LEN) == 0) {
     return 0.50;
   }
   return 0.5;
 }
 
-static bool expect_char_n(const char **p, const char *end, char c) {
-  *p = skip_ws_n(*p, end);
-  if (*p >= end || **p != c) {
-    return false;
-  }
-  (*p)++;
-  return true;
-}
-
-static bool expect_key_n(const char **p, const char *end, const char *key) {
-  size_t len = 0;
-  *p = skip_ws_n(*p, end);
-  len = strlen(key);
-  if ((size_t)(end - *p) < len || memcmp(*p, key, len) != 0) {
-    return false;
-  }
-  *p += len;
-  return expect_char_n(p, end, ':');
-}
-
-static bool parse_string_view_n(const char **p, const char *end, const char **out_start,
-                                size_t *out_len) {
-  const char *start = NULL;
-  const char *q = NULL;
-  int escaped = 0;
-
-  *p = skip_ws_n(*p, end);
-  if (*p >= end || **p != '"') {
-    return false;
+static uint8_t merchant_in_known_list(const TransactionContext *self) {
+  if (self == NULL || self->merchant_id[0] == '\0') {
+    return 0;
   }
 
-  start = ++(*p);
-  q = start;
-  while (q < end) {
-    char c = *q;
-    if (escaped) {
-      escaped = 0;
-      q++;
-      continue;
+  for (uint8_t i = 0; i < self->customer_known_merchants_len; i++) {
+    if (strncmp(self->customer_known_merchants[i], self->merchant_id, TX2_MERCHANT_ID_LEN) == 0) {
+      return 1;
     }
-    if (c == '\\') {
-      escaped = 1;
-      q++;
-      continue;
-    }
-    if (c == '"') {
-      break;
-    }
-    q++;
   }
-
-  if (q >= end || *q != '"' || escaped) {
-    return false;
-  }
-
-  *out_start = start;
-  *out_len = (size_t)(q - start);
-  *p = q + 1;
-  return true;
+  return 0;
 }
 
-static bool parse_double_n(const char **p, const char *end, double *out) {
-  char *num_end = NULL;
-  *p = skip_ws_n(*p, end);
-  if (*p >= end) {
-    return false;
+static ParentKey parent_key_id(const char *body, size_t start, size_t end) {
+  size_t len = end - start;
+  if (len == 11 && memcmp(body + start, "transaction", 11) == 0) {
+    return PARENT_KEY_TRANSACTION;
   }
-  *out = strtod(*p, &num_end);
-  if (num_end == *p || num_end > end) {
-    return false;
+  if (len == 8 && memcmp(body + start, "customer", 8) == 0) {
+    return PARENT_KEY_CUSTOMER;
   }
-  *p = num_end;
-  return true;
+  if (len == 8 && memcmp(body + start, "merchant", 8) == 0) {
+    return PARENT_KEY_MERCHANT;
+  }
+  if (len == 8 && memcmp(body + start, "terminal", 8) == 0) {
+    return PARENT_KEY_TERMINAL;
+  }
+  if (len == 16 && memcmp(body + start, "last_transaction", 16) == 0) {
+    return PARENT_KEY_LAST_TRANSACTION;
+  }
+  return PARENT_KEY_NONE;
 }
 
-static bool parse_int_n(const char **p, const char *end, int *out) {
-  char *num_end = NULL;
-  long v = 0;
-  *p = skip_ws_n(*p, end);
-  if (*p >= end) {
+static bool to_bool(const char *str, size_t start, size_t end, uint8_t *out) {
+  if (str == NULL || out == NULL || start >= end) {
     return false;
   }
-  v = strtol(*p, &num_end, 10);
-  if (num_end == *p || num_end > end) {
-    return false;
-  }
-  *out = (int)v;
-  *p = num_end;
-  return true;
-}
 
-static bool parse_bool_n(const char **p, const char *end, bool *out) {
-  *p = skip_ws_n(*p, end);
-  if ((size_t)(end - *p) >= 4 && memcmp(*p, "true", 4) == 0) {
-    *out = true;
-    *p += 4;
+  size_t len = end - start;
+  if (len == 4 && strncmp(str + start, "true", 4) == 0) {
+    *out = 1;
     return true;
   }
-  if ((size_t)(end - *p) >= 5 && memcmp(*p, "false", 5) == 0) {
-    *out = false;
-    *p += 5;
+  if (len == 5 && strncmp(str + start, "false", 5) == 0) {
+    *out = 0;
     return true;
   }
   return false;
 }
 
-static long long days_from_civil(int y, unsigned m, unsigned d) {
-  y -= (m <= 2);
-  {
-    int era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return (long long)era * 146097LL + (long long)doe - 719468LL;
-  }
-}
-
-static int parse_2d(const char *s) {
-  if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1])) {
-    return -1;
-  }
-  return (s[0] - '0') * 10 + (s[1] - '0');
-}
-
-static int parse_4d(const char *s) {
-  if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) ||
-      !isdigit((unsigned char)s[2]) || !isdigit((unsigned char)s[3])) {
-    return -1;
-  }
-  return (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
-}
-
-static bool parse_iso8601_utc_epoch_view(const char *s, size_t len, long long *out) {
-  int year = 0;
-  int mon = 0;
-  int day = 0;
-  int hh = 0;
-  int mm = 0;
-  int ss = 0;
-
-  if (len != 20) {
-    return false;
-  }
-  if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' || s[19] != 'Z') {
+static bool to_double(const char *str, size_t start, size_t end, double *out) {
+  if (str == NULL || out == NULL || start >= end) {
     return false;
   }
 
-  year = parse_4d(s);
-  mon = parse_2d(s + 5);
-  day = parse_2d(s + 8);
-  hh = parse_2d(s + 11);
-  mm = parse_2d(s + 14);
-  ss = parse_2d(s + 17);
+  static const double INV_POW10[] = {
+    1.0,   1e-1,  1e-2,  1e-3,  1e-4,  1e-5,  1e-6,  1e-7,  1e-8,  1e-9,
+    1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18,
+  };
 
-  if (year < 0 || mon < 1 || mon > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mm < 0 ||
-      mm > 59 || ss < 0 || ss > 59) {
+  uint64_t int_part = 0;
+  uint64_t frac_part = 0;
+  uint8_t frac_digits = 0;
+  bool has_dot = false;
+  bool has_digit = false;
+
+  for (size_t i = start; i < end; i++) {
+    char c = str[i];
+    if (c == '.') {
+      if (has_dot) {
+        return false;
+      }
+      has_dot = true;
+      continue;
+    }
+
+    if (!is_ascii_digit(c)) {
+      return false;
+    }
+
+    has_digit = true;
+    uint64_t digit = (uint64_t)(c - '0');
+    if (!has_dot) {
+      int_part = int_part * 10U + digit;
+    } else {
+      if (frac_digits < 18) {
+        frac_part = frac_part * 10U + digit;
+        frac_digits++;
+      }
+    }
+  }
+
+  if (!has_digit) {
     return false;
   }
 
-  *out = days_from_civil(year, (unsigned)mon, (unsigned)day) * 86400LL + (long long)hh * 3600LL +
-         (long long)mm * 60LL + (long long)ss;
+  *out = (double)int_part + (double)frac_part * INV_POW10[frac_digits];
   return true;
 }
 
-static bool parse_timestamp_field_n(const char **p, const char *end, long long *out_epoch) {
-  const char *s = NULL;
-  size_t len = 0;
-  if (!parse_string_view_n(p, end, &s, &len)) {
+static bool to_epoch(const char *str, size_t start, size_t end, int64_t *out_epoch) {
+  if (str == NULL || out_epoch == NULL || start >= end) {
     return false;
   }
-  return parse_iso8601_utc_epoch_view(s, len, out_epoch);
-}
-
-static bool parse_known_merchants_span_n(const char **p, const char *end, const char **out_begin,
-                                         const char **out_end) {
-  if (!expect_char_n(p, end, '[')) {
+  if (end - start != 20) {
     return false;
   }
 
-  *out_begin = *p;
+  const size_t y0 = start;
+  const size_t m0 = start + 5;
+  const size_t d0 = start + 8;
+  const size_t h0 = start + 11;
+  const size_t n0 = start + 14;
+  const size_t s0 = start + 17;
+  const size_t z = start + 19;
 
-  while (true) {
-    const char *s = NULL;
-    size_t len = 0;
+  if (str[start + 4] != '-' || str[start + 7] != '-' || str[start + 10] != 'T' ||
+      str[start + 13] != ':' || str[start + 16] != ':' || str[z] != 'Z') {
+    return false;
+  }
 
-    *p = skip_ws_n(*p, end);
-    if (*p < end && **p == ']') {
-      *out_end = *p;
-      (*p)++;
-      return true;
-    }
-
-    if (!parse_string_view_n(p, end, &s, &len)) {
-      return false;
-    }
-    (void)s;
-    (void)len;
-
-    *p = skip_ws_n(*p, end);
-    if (*p < end && **p == ',') {
-      (*p)++;
+  for (size_t i = start; i < end; i++) {
+    if (i == start + 4 || i == start + 7 || i == start + 10 || i == start + 13 || i == start + 16 ||
+        i == z) {
       continue;
     }
-    if (*p < end && **p == ']') {
-      *out_end = *p;
-      (*p)++;
-      return true;
+    if (!is_ascii_digit(str[i])) {
+      return false;
     }
+  }
 
+  const int year = (str[y0] - '0') * 1000 + (str[y0 + 1] - '0') * 100 + (str[y0 + 2] - '0') * 10 +
+                   (str[y0 + 3] - '0');
+  const int month = (str[m0] - '0') * 10 + (str[m0 + 1] - '0');
+  const int day = (str[d0] - '0') * 10 + (str[d0 + 1] - '0');
+  const int hour = (str[h0] - '0') * 10 + (str[h0 + 1] - '0');
+  const int minute = (str[n0] - '0') * 10 + (str[n0 + 1] - '0');
+  const int second = (str[s0] - '0') * 10 + (str[s0 + 1] - '0');
+
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
     return false;
   }
+
+  *out_epoch = days_from_civil(year, (unsigned)month, (unsigned)day) * 86400 + hour * 3600 +
+               minute * 60 + second;
+  return true;
 }
 
-static bool known_merchants_contains(const char *begin, const char *end, const char *merchant_id,
-                                     size_t merchant_id_len) {
-  const char *p = begin;
-
-  if (!merchant_id || merchant_id_len == 0) {
+static bool to_known_merchants(const char *str, size_t start, size_t end,
+                               char out[TX2_MAX_KNOWN_MERCHANTS][TX2_MERCHANT_ID_BUF_LEN],
+                               uint8_t *out_len) {
+  if (str == NULL || out == NULL || out_len == NULL || start >= end) {
+    return false;
+  }
+  if (str[start] != '[' || str[end - 1] != ']') {
     return false;
   }
 
-  while (p < end) {
-    const char *s = NULL;
-    size_t len = 0;
+  uint8_t count = 0;
+  size_t item_start = 0;
+  enum {
+    ARRAY_EXPECT_ITEM_OR_END = 0,
+    ARRAY_IN_ITEM = 1,
+    ARRAY_EXPECT_COMMA_OR_END = 2,
+  } state = ARRAY_EXPECT_ITEM_OR_END;
 
-    p = skip_ws_n(p, end);
-    if (p >= end) {
-      break;
-    }
+  for (size_t i = start + 1; i < end - 1; i++) {
+    char c = str[i];
 
-    if (*p == ',') {
-      p++;
+    if (state == ARRAY_EXPECT_ITEM_OR_END) {
+      if (is_ascii_space(c)) {
+        continue;
+      }
+      if (c != '"') {
+        return false;
+      }
+      item_start = i + 1;
+      state = ARRAY_IN_ITEM;
       continue;
     }
 
-    if (!parse_string_view_n(&p, end, &s, &len)) {
+    if (state == ARRAY_IN_ITEM) {
+      if (c == '\\') {
+        return false;
+      }
+      if (c != '"') {
+        continue;
+      }
+
+      size_t item_len = i - item_start;
+      if (item_len == 0 || item_len > TX2_MERCHANT_ID_LEN) {
+        return false;
+      }
+      if (count >= TX2_MAX_KNOWN_MERCHANTS) {
+        return false;
+      }
+
+      memcpy(out[count], str + item_start, item_len);
+      out[count][item_len] = '\0';
+      count++;
+      state = ARRAY_EXPECT_COMMA_OR_END;
+      continue;
+    }
+
+    if (is_ascii_space(c)) {
+      continue;
+    }
+    if (c != ',') {
       return false;
     }
+    state = ARRAY_EXPECT_ITEM_OR_END;
+  }
 
-    if (len == merchant_id_len && memcmp(s, merchant_id, len) == 0) {
-      return true;
+  if (state == ARRAY_IN_ITEM) {
+    return false;
+  }
+  if (state == ARRAY_EXPECT_ITEM_OR_END && count > 0) {
+    // Disallow trailing comma: ["MERC-001",]
+    return false;
+  }
+
+  *out_len = count;
+  return true;
+}
+
+static bool to_string(const char *str, size_t start, size_t end, char *out, size_t out_cap) {
+  if (str == NULL || out == NULL || out_cap == 0 || start >= end) {
+    return false;
+  }
+
+  size_t len = end - start;
+  if (len >= out_cap) {
+    return false;
+  }
+
+  memcpy(out, str + start, len);
+  out[len] = '\0';
+  return true;
+}
+
+static bool to_uint8(const char *str, size_t start, size_t end, uint8_t *out) {
+  if (str == NULL || out == NULL || start >= end) {
+    return false;
+  }
+
+  unsigned value = 0;
+  for (size_t i = start; i < end; i++) {
+    if (!is_ascii_digit(str[i])) {
+      return false;
     }
-
-    p = skip_ws_n(p, end);
-    if (p < end && *p == ',') {
-      p++;
+    value = value * 10U + (unsigned)(str[i] - '0');
+    if (value > UINT8_MAX) {
+      return false;
     }
   }
 
-  return false;
+  *out = (uint8_t)value;
+  return true;
 }
 
 static void transaction_context_destroy(TransactionContext *self) {
@@ -344,238 +435,349 @@ static void transaction_context_destroy(TransactionContext *self) {
   memset(self, 0, sizeof(*self));
 }
 
-static bool transaction_context_parse_n(TransactionContext *self, const char *body,
-                                        size_t body_len) {
-  const char *p = NULL;
-  const char *end = NULL;
-  const char *id_view = NULL;
-  size_t id_len = 0;
-  const char *known_begin = NULL;
-  const char *known_end = NULL;
-  const char *merchant_id_view = NULL;
-  size_t merchant_id_len = 0;
-  const char *mcc_view = NULL;
-  size_t mcc_len = 0;
-  bool b = false;
+static void transaction_context_init(TransactionContext *ctx) {
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->merchant_mcc_risk = 0.5;
+  ctx->destroy = transaction_context_destroy;
+  ctx->to_vector = transaction_context_to_vector;
+}
 
+static bool transaction_context_parse(TransactionContext *self, const char *body, size_t body_len) {
   if (self == NULL || body == NULL) {
     return false;
   }
 
-  p = body;
-  end = body + body_len;
+  enum {
+    STATE_FIND_KEY = 0,
+    STATE_AFTER_KEY = 1,
+    STATE_FIND_VALUE = 2,
+    STATE_AFTER_VALUE = 3,
+  };
+  size_t i = 0;
+  int depth = 0;
+  int state = STATE_FIND_KEY;
+  int escaped = 0;
+  size_t current_key_start = 0;
+  size_t current_key_end = 0;
+  size_t current_key_child_start = 0;
+  size_t current_key_child_end = 0;
+  size_t value_start = 0;
+  size_t value_end = 0;
 
-  if (!expect_char_n(&p, end, '{')) {
-    return false;
-  }
+  while (i < body_len) {
+    char c = body[i];
 
-  if (!expect_key_n(&p, end, "\"id\"")) {
-    return false;
-  }
-  if (!parse_string_view_n(&p, end, &id_view, &id_len)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
+    if (is_ascii_space(c)) {
+      i++;
+      continue;
+    }
 
-  if (!expect_key_n(&p, end, "\"transaction\"")) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '{')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"amount\"")) {
-    return false;
-  }
-  if (!parse_double_n(&p, end, &self->transaction_amount)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"installments\"")) {
-    return false;
-  }
-  if (!parse_int_n(&p, end, &self->transaction_installments)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"requested_at\"")) {
-    return false;
-  }
-  if (!parse_timestamp_field_n(&p, end, &self->transaction_requested_at)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '}')) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
+    if (state == STATE_FIND_KEY) {
+      if (c == '{') {
+        depth++;
+        i++;
+        continue;
+      }
+      if (c == '}') {
+        if (depth <= 0) {
+          return false;
+        }
+        depth--;
+        i++;
+        if (depth == 0) {
+          break;
+        }
+        state = STATE_AFTER_VALUE;
+        continue;
+      }
+      if (c == '"') {
+        size_t key_start = i + 1;
+        i++;
+        escaped = 0;
+        while (i < body_len) {
+          c = body[i];
+          if (escaped) {
+            escaped = 0;
+          } else if (c == '\\') {
+            escaped = 1;
+          } else if (c == '"') {
+            break;
+          }
+          i++;
+        }
+        if (i >= body_len) {
+          return false;
+        }
+        if (depth == 1) {
+          current_key_start = key_start;
+          current_key_end = i;
+        } else if (depth == 2) {
+          current_key_child_start = key_start;
+          current_key_child_end = i;
+        }
+        i++;
+        state = STATE_AFTER_KEY;
+        continue;
+      }
 
-  if (!expect_key_n(&p, end, "\"customer\"")) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '{')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"avg_amount\"")) {
-    return false;
-  }
-  if (!parse_double_n(&p, end, &self->customer_avg_amount)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"tx_count_24h\"")) {
-    return false;
-  }
-  if (!parse_int_n(&p, end, &self->customer_tx_count_24h)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"known_merchants\"")) {
-    return false;
-  }
-  if (!parse_known_merchants_span_n(&p, end, &known_begin, &known_end)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '}')) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
+      i++;
+      continue;
+    }
 
-  if (!expect_key_n(&p, end, "\"merchant\"")) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '{')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"id\"")) {
-    return false;
-  }
-  if (!parse_string_view_n(&p, end, &merchant_id_view, &merchant_id_len)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"mcc\"")) {
-    return false;
-  }
-  if (!parse_string_view_n(&p, end, &mcc_view, &mcc_len)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"avg_amount\"")) {
-    return false;
-  }
-  if (!parse_double_n(&p, end, &self->merchant_avg_amount)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '}')) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
+    if (state == STATE_AFTER_KEY) {
+      if (c != ':') {
+        return false;
+      }
+      i++;
+      state = STATE_FIND_VALUE;
+      continue;
+    }
 
-  if (!expect_key_n(&p, end, "\"terminal\"")) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '{')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"is_online\"")) {
-    return false;
-  }
-  if (!parse_bool_n(&p, end, &b)) {
-    return false;
-  }
-  self->terminal_is_online = b ? 1 : 0;
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"card_present\"")) {
-    return false;
-  }
-  if (!parse_bool_n(&p, end, &b)) {
-    return false;
-  }
-  self->terminal_card_present = b ? 1 : 0;
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
-  if (!expect_key_n(&p, end, "\"km_from_home\"")) {
-    return false;
-  }
-  if (!parse_double_n(&p, end, &self->terminal_km_from_home)) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, '}')) {
-    return false;
-  }
-  if (!expect_char_n(&p, end, ',')) {
-    return false;
-  }
+    if (state == STATE_FIND_VALUE) {
+      if (c == '{') {
+        depth++;
+        i++;
+        state = STATE_FIND_KEY;
+        continue;
+      }
 
-  if (!expect_key_n(&p, end, "\"last_transaction\"")) {
-    return false;
-  }
-  p = skip_ws_n(p, end);
-  if ((size_t)(end - p) >= 4 && memcmp(p, "null", 4) == 0) {
-    self->has_last_transaction = false;
-    p += 4;
-  } else {
-    self->has_last_transaction = true;
-    if (!expect_char_n(&p, end, '{')) {
+      if (c == '[') {
+        int arr_depth = 1;
+        int in_string = 0;
+        value_start = i;
+        i++;
+        escaped = 0;
+        while (i < body_len && arr_depth > 0) {
+          c = body[i];
+          if (in_string) {
+            if (escaped) {
+              escaped = 0;
+            } else if (c == '\\') {
+              escaped = 1;
+            } else if (c == '"') {
+              in_string = 0;
+            }
+          } else {
+            if (c == '"') {
+              in_string = 1;
+            } else if (c == '[') {
+              arr_depth++;
+            } else if (c == ']') {
+              arr_depth--;
+            }
+          }
+          i++;
+        }
+        if (arr_depth != 0) {
+          return false;
+        }
+        value_end = i;
+      } else if (c == '"') {
+        value_start = i + 1;
+        i++;
+        escaped = 0;
+        while (i < body_len) {
+          c = body[i];
+          if (escaped) {
+            escaped = 0;
+          } else if (c == '\\') {
+            escaped = 1;
+          } else if (c == '"') {
+            break;
+          }
+          i++;
+        }
+        if (i >= body_len) {
+          return false;
+        }
+        value_end = i;
+        i++;
+      } else {
+        value_start = i;
+        while (i < body_len && body[i] != ',' && body[i] != '}' && !is_ascii_space(body[i])) {
+          i++;
+        }
+        value_end = i;
+      }
+
+      if (depth == 1) {
+        if ((current_key_end - current_key_start) == 2 &&
+            strncmp(body + current_key_start, "id", 2) == 0) {
+          if (value_end <= value_start ||
+              !to_string(body, value_start, value_end, self->id, TX2_ID_BUF_LEN)) {
+            return false;
+          }
+        }
+      } else if (depth == 2) {
+        ParentKey parent_key = parent_key_id(body, current_key_start, current_key_end);
+        ChildKey child_key = child_key_id(body, current_key_child_start, current_key_child_end);
+
+        switch (parent_key) {
+        case PARENT_KEY_TRANSACTION:
+          switch (child_key) {
+          case CHILD_KEY_AMOUNT:
+            if (value_end <= value_start ||
+                !to_double(body, value_start, value_end, &self->transaction_amount)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_INSTALLMENTS:
+            if (value_end <= value_start ||
+                !to_uint8(body, value_start, value_end, &self->transaction_installments)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_REQUESTED_AT:
+            if (value_end <= value_start ||
+                !to_epoch(body, value_start, value_end, &self->transaction_requested_at)) {
+              return false;
+            }
+            break;
+          default:
+            break;
+          }
+          break;
+
+        case PARENT_KEY_CUSTOMER:
+          switch (child_key) {
+          case CHILD_KEY_AVG_AMOUNT:
+            if (value_end <= value_start ||
+                !to_double(body, value_start, value_end, &self->customer_avg_amount)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_TX_COUNT_24H:
+            if (value_end <= value_start ||
+                !to_uint8(body, value_start, value_end, &self->customer_tx_count_24h)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_KNOWN_MERCHANTS:
+            if (value_end <= value_start ||
+                !to_known_merchants(body, value_start, value_end, self->customer_known_merchants,
+                                    &self->customer_known_merchants_len)) {
+              return false;
+            }
+            break;
+          default:
+            break;
+          }
+          break;
+
+        case PARENT_KEY_MERCHANT:
+          switch (child_key) {
+          case CHILD_KEY_ID:
+            if (value_end <= value_start ||
+                !to_string(body, value_start, value_end, self->merchant_id,
+                           TX2_MERCHANT_ID_BUF_LEN)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_MCC:
+            if (value_end <= value_start ||
+                !to_string(body, value_start, value_end, self->merchant_mcc, TX2_MCC_BUF_LEN)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_AVG_AMOUNT:
+            if (value_end <= value_start ||
+                !to_double(body, value_start, value_end, &self->merchant_avg_amount)) {
+              return false;
+            }
+            break;
+          default:
+            break;
+          }
+          break;
+
+        case PARENT_KEY_TERMINAL:
+          switch (child_key) {
+          case CHILD_KEY_IS_ONLINE:
+            if (value_end <= value_start ||
+                !to_bool(body, value_start, value_end, &self->terminal_is_online)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_CARD_PRESENT:
+            if (value_end <= value_start ||
+                !to_bool(body, value_start, value_end, &self->terminal_card_present)) {
+              return false;
+            }
+            break;
+          case CHILD_KEY_KM_FROM_HOME:
+            if (value_end <= value_start ||
+                !to_double(body, value_start, value_end, &self->terminal_km_from_home)) {
+              return false;
+            }
+            break;
+          default:
+            break;
+          }
+          break;
+
+        case PARENT_KEY_LAST_TRANSACTION:
+          switch (child_key) {
+          case CHILD_KEY_TIMESTAMP:
+            if (value_end <= value_start ||
+                !to_epoch(body, value_start, value_end, &self->last_transaction_timestamp)) {
+              return false;
+            }
+            self->has_last_transaction = 1;
+            break;
+          case CHILD_KEY_KM_FROM_CURRENT:
+            if (value_end <= value_start ||
+                !to_double(body, value_start, value_end, &self->last_transaction_km_from_current)) {
+              return false;
+            }
+            self->has_last_transaction = 1;
+            break;
+          default:
+            break;
+          }
+          break;
+
+        default:
+          break;
+        }
+      }
+
+      state = STATE_AFTER_VALUE;
+      continue;
+    }
+
+    if (state == STATE_AFTER_VALUE) {
+      if (c == ',') {
+        i++;
+        state = STATE_FIND_KEY;
+        continue;
+      }
+      if (c == '}') {
+        if (depth <= 0) {
+          return false;
+        }
+        depth--;
+        i++;
+        if (depth == 0) {
+          break;
+        }
+        state = STATE_AFTER_VALUE;
+        continue;
+      }
       return false;
     }
-    if (!expect_key_n(&p, end, "\"timestamp\"")) {
-      return false;
-    }
-    if (!parse_timestamp_field_n(&p, end, &self->last_transaction_timestamp)) {
-      return false;
-    }
-    if (!expect_char_n(&p, end, ',')) {
-      return false;
-    }
-    if (!expect_key_n(&p, end, "\"km_from_current\"")) {
-      return false;
-    }
-    if (!parse_double_n(&p, end, &self->last_transaction_km_from_current)) {
-      return false;
-    }
-    if (!expect_char_n(&p, end, '}')) {
-      return false;
-    }
   }
 
-  if (!expect_char_n(&p, end, '}')) {
-    return false;
+  while (i < body_len && is_ascii_space(body[i])) {
+    i++;
   }
 
-  p = skip_ws_n(p, end);
-  if (p != end) {
-    return false;
+  bool ok = depth == 0 && i == body_len;
+  if (ok) {
+    self->merchant_known = merchant_in_known_list(self);
+    self->merchant_mcc_risk = merchant_mcc_risk_or_default(self->merchant_mcc);
   }
 
-  self->id = (char *)id_view;
-  (void)id_len;
-  self->merchant_known =
-    known_merchants_contains(known_begin, known_end, merchant_id_view, merchant_id_len) ? 1 : 0;
-  self->merchant_mcc_risk = mcc_risk_or_default_view(mcc_view, mcc_len);
-  return true;
+  return ok;
 }
 
 static void transaction_context_to_vector(const TransactionContext *self, double out[14]) {
@@ -641,33 +843,19 @@ static void transaction_context_to_vector(const TransactionContext *self, double
   out[13] = merchant_avg_amount;
 }
 
-static void transaction_context_init(TransactionContext *ctx) {
-  memset(ctx, 0, sizeof(*ctx));
-  ctx->merchant_mcc_risk = 0.5;
-  ctx->destroy = transaction_context_destroy;
-  ctx->to_vector = transaction_context_to_vector;
+TransactionContext transaction_context_new(void) {
+  TransactionContext ctx;
+  transaction_context_init(&ctx);
+  return ctx;
 }
 
-TransactionContext transaction_context_from_body(const char *body) {
-  if (body == NULL) {
-    return transaction_context_new();
-  }
-  return transaction_context_from_body_n(body, strlen(body));
-}
-
-TransactionContext transaction_context_from_body_n(const char *body, size_t body_len) {
+TransactionContext transaction_context_from_body(const char *body, size_t body_len) {
   TransactionContext ctx = transaction_context_new();
-  if (!transaction_context_parse_n(&ctx, body, body_len)) {
+  if (!transaction_context_parse(&ctx, body, body_len)) {
     transaction_context_init(&ctx);
   } else {
     ctx.destroy = transaction_context_destroy;
     ctx.to_vector = transaction_context_to_vector;
   }
-  return ctx;
-}
-
-TransactionContext transaction_context_new(void) {
-  TransactionContext ctx;
-  transaction_context_init(&ctx);
   return ctx;
 }

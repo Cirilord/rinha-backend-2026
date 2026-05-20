@@ -76,8 +76,8 @@ static void warm_up(const XScoreIndexView *xscore) {
     "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_"
     "current\":18.8626479774}}";
 
-  TransactionContext ctx = transaction_context_from_body_n(warmup_body, sizeof(warmup_body) - 1);
-  if (ctx.id != NULL) {
+  TransactionContext ctx = transaction_context_from_body(warmup_body, sizeof(warmup_body) - 1);
+  if (ctx.id[0] != '\0') {
     double vector[14];
     volatile uint8_t warmup_sink = 0;
     ctx.to_vector(&ctx, vector);
@@ -201,8 +201,8 @@ int main(void) {
           continue;
         }
 
-        TransactionContext ctx = transaction_context_from_body_n(body, body_len);
-        if (ctx.id == NULL) {
+        TransactionContext ctx = transaction_context_from_body(body, body_len);
+        if (ctx.id[0] == '\0') {
           ctx.destroy(&ctx);
           (void)write(client_fd, RESPONSE_BAD_REQUEST.data, RESPONSE_BAD_REQUEST.len);
           close(client_fd);
