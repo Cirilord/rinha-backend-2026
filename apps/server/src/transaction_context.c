@@ -39,6 +39,7 @@ typedef enum {
   CHILD_KEY_KM_FROM_CURRENT,
 } ChildKey;
 
+static inline uint32_t pack4_ascii(const char *s);
 static void transaction_context_destroy(TransactionContext *self);
 static void transaction_context_init(TransactionContext *ctx);
 static bool transaction_context_parse(TransactionContext *self, const char *body, size_t body_len);
@@ -135,37 +136,31 @@ static double merchant_mcc_risk_or_default(const char *mcc) {
   if (mcc == NULL || mcc[0] == '\0') {
     return 0.5;
   }
-  if (strncmp(mcc, "5411", TX2_MCC_LEN) == 0) {
+
+  switch (pack4_ascii(mcc)) {
+  case ('5' << 24) | ('4' << 16) | ('1' << 8) | '1':
     return 0.15;
-  }
-  if (strncmp(mcc, "5812", TX2_MCC_LEN) == 0) {
+  case ('5' << 24) | ('8' << 16) | ('1' << 8) | '2':
     return 0.30;
-  }
-  if (strncmp(mcc, "5912", TX2_MCC_LEN) == 0) {
+  case ('5' << 24) | ('9' << 16) | ('1' << 8) | '2':
     return 0.20;
-  }
-  if (strncmp(mcc, "5944", TX2_MCC_LEN) == 0) {
+  case ('5' << 24) | ('9' << 16) | ('4' << 8) | '4':
     return 0.45;
-  }
-  if (strncmp(mcc, "7801", TX2_MCC_LEN) == 0) {
+  case ('7' << 24) | ('8' << 16) | ('0' << 8) | '1':
     return 0.80;
-  }
-  if (strncmp(mcc, "7802", TX2_MCC_LEN) == 0) {
+  case ('7' << 24) | ('8' << 16) | ('0' << 8) | '2':
     return 0.75;
-  }
-  if (strncmp(mcc, "7995", TX2_MCC_LEN) == 0) {
+  case ('7' << 24) | ('9' << 16) | ('9' << 8) | '5':
     return 0.85;
-  }
-  if (strncmp(mcc, "4511", TX2_MCC_LEN) == 0) {
+  case ('4' << 24) | ('5' << 16) | ('1' << 8) | '1':
     return 0.35;
-  }
-  if (strncmp(mcc, "5311", TX2_MCC_LEN) == 0) {
+  case ('5' << 24) | ('3' << 16) | ('1' << 8) | '1':
     return 0.25;
-  }
-  if (strncmp(mcc, "5999", TX2_MCC_LEN) == 0) {
+  case ('5' << 24) | ('9' << 16) | ('9' << 8) | '9':
     return 0.50;
+  default:
+    return 0.5;
   }
-  return 0.5;
 }
 
 static uint8_t merchant_in_known_list(const TransactionContext *self) {
@@ -174,11 +169,16 @@ static uint8_t merchant_in_known_list(const TransactionContext *self) {
   }
 
   for (uint8_t i = 0; i < self->customer_known_merchants_len; i++) {
-    if (strncmp(self->customer_known_merchants[i], self->merchant_id, TX2_MERCHANT_ID_LEN) == 0) {
+    if (memcmp(self->customer_known_merchants[i], self->merchant_id, TX2_MERCHANT_ID_LEN) == 0) {
       return 1;
     }
   }
   return 0;
+}
+
+static inline uint32_t pack4_ascii(const char *s) {
+  return ((uint32_t)(unsigned char)s[0] << 24) | ((uint32_t)(unsigned char)s[1] << 16) |
+         ((uint32_t)(unsigned char)s[2] << 8) | (uint32_t)(unsigned char)s[3];
 }
 
 static ParentKey parent_key_id(const char *body, size_t start, size_t end) {
@@ -207,11 +207,13 @@ static bool to_bool(const char *str, size_t start, size_t end, uint8_t *out) {
   }
 
   size_t len = end - start;
-  if (len == 4 && strncmp(str + start, "true", 4) == 0) {
+  if (len == 4 && str[start] == 't' && str[start + 1] == 'r' && str[start + 2] == 'u' &&
+      str[start + 3] == 'e') {
     *out = 1;
     return true;
   }
-  if (len == 5 && strncmp(str + start, "false", 5) == 0) {
+  if (len == 5 && str[start] == 'f' && str[start + 1] == 'a' && str[start + 2] == 'l' &&
+      str[start + 3] == 's' && str[start + 4] == 'e') {
     *out = 0;
     return true;
   }
