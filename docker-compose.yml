@@ -17,7 +17,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.47"
+          cpus: "0.44"
           memory: "150MB"
 
   api2:
@@ -38,7 +38,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.47"
+          cpus: "0.44"
           memory: "150MB"
 
   load-balancer:
@@ -64,7 +64,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.06"
+          cpus: "0.12"
           memory: "50MB"
 
 networks:
