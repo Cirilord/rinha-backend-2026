@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-7b2f6955e24231025b4d06f96eb46230a50fab07
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-e61c919ae7494fafb9e9c43ef9b96f7801d01866
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -19,7 +19,7 @@ services:
           memory: "150MB"
 
   api2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-7b2f6955e24231025b4d06f96eb46230a50fab07
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-e61c919ae7494fafb9e9c43ef9b96f7801d01866
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -38,13 +38,13 @@ services:
           memory: "150MB"
 
   load-balancer:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-7b2f6955e24231025b4d06f96eb46230a50fab07
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-e61c919ae7494fafb9e9c43ef9b96f7801d01866
     ports:
       - "9999:9999"
     environment:
       PORT: "9999"
       WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
-      THREADS: "2"
+      THREADS: "1"
     volumes:
       - shared-sockets:/shared
     ulimits:
