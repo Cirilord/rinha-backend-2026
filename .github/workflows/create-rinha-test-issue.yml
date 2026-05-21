@@ -1,0 +1,44 @@
+name: Create Rinha Test Issue
+
+on:
+  workflow_run:
+    workflows:
+      - Update Submission Branch
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  create-issue:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create issue on Rinha repository
+        uses: actions/github-script@v7
+        env:
+          RINHA_REPO_OWNER: ${{ vars.RINHA_REPO_OWNER }}
+          RINHA_REPO_NAME: ${{ vars.RINHA_REPO_NAME }}
+        with:
+          github-token: ${{ secrets.RINHA_REPO_TOKEN }}
+          script: |
+            const owner = process.env.RINHA_REPO_OWNER;
+            const repo = process.env.RINHA_REPO_NAME;
+
+            if (!owner || !repo) {
+              core.setFailed("Missing repository variables RINHA_REPO_OWNER and/or RINHA_REPO_NAME.");
+              return;
+            }
+
+            const title = "rinha/test cirilord-c";
+            const body = "rinha/test cirilord-c";
+
+            const issue = await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+            });
+
+            core.info(`Issue created: ${issue.data.html_url}`);
