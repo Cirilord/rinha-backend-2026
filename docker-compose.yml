@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-5e09a4385ab39129deb43b67c6b1d3d0e30fb296
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-88be28bd1821b1660dfc78ce86133719209f7c9a
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -19,7 +19,7 @@ services:
           memory: "100MB"
 
   api2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-5e09a4385ab39129deb43b67c6b1d3d0e30fb296
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-88be28bd1821b1660dfc78ce86133719209f7c9a
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -38,7 +38,7 @@ services:
           memory: "100MB"
 
   load-balancer:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-5e09a4385ab39129deb43b67c6b1d3d0e30fb296
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-88be28bd1821b1660dfc78ce86133719209f7c9a
     ports:
       - "9999:9999"
     environment:
