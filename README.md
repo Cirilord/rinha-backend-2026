@@ -30,6 +30,7 @@ This avoids extra TCP hops between LB and API.
 
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
+- **Modulo-free round-robin hot path** (`wrap` with branch instead of `%`) to avoid integer division in the accept/forward loop.
 - **Persistent control sockets** to APIs (reconnect only on failure).
 - **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` with C fallback on other targets.
 - **Non-blocking listener + accept drain loop**: accepts until `EAGAIN` per wakeup to reduce burst overhead.
@@ -139,8 +140,13 @@ Targets:
 - `make clean`
 
 Architecture-aware flags (`TARGETARCH`):
-- `amd64`: adds `-mavx2 -mfma -march=haswell`
-- `arm64`: no AVX2 flags
+- `server`:
+  - `amd64`: `-O3` globally + `-mavx2 -mfma -march=haswell`, plus `-fno-plt`
+  - `x-score.c`: compiled with `-O2` (same SIMD arch flags) to reduce hot-path code bloat from aggressive inlining, plus `-fno-plt`
+  - `arm64`: `-O3` globally and `x-score.c` with `-O2` (without AVX2/FMA flags), plus `-fno-plt`
+- `load-balancer`:
+  - `amd64`: `-O3` without AVX2/FMA flags to avoid AVX state-transition overhead (`vzeroupper`) in the LB hot path, plus `-fno-plt`
+  - `arm64`: `-O3` plus `-fno-plt`
 
 Examples:
 

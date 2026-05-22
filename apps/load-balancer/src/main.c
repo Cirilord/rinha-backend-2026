@@ -309,14 +309,20 @@ int main(void) {
 
       bool forwarded = false;
       for (int tries = 0; tries < worker_count; tries++) {
-        int idx = (rr + tries) % worker_count;
+        int idx = rr + tries;
+        if (idx >= worker_count) {
+          idx -= worker_count;
+        }
 
         if (ensure_worker_connected(&workers[idx]) < 0) {
           continue;
         }
 
         if (send_fd(workers[idx].control_fd, client_fd) == 0) {
-          rr = (idx + 1) % worker_count;
+          rr = idx + 1;
+          if (rr == worker_count) {
+            rr = 0;
+          }
           forwarded = true;
           break;
         }

@@ -3,7 +3,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Makefile ./Makefile
 COPY apps/server/src ./apps/server/src
-RUN make server TARGETARCH=${TARGETARCH} && mv server /build-server
+RUN make clean && make server TARGETARCH=${TARGETARCH} && mv server /build-server
 
 FROM debian:bookworm-slim
 WORKDIR /app

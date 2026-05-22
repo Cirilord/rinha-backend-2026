@@ -3,7 +3,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Makefile ./Makefile
 COPY apps/load-balancer/src ./apps/load-balancer/src
-RUN make load-balancer TARGETARCH=${TARGETARCH} && mv load-balancer /build-load-balancer
+RUN make clean && make load-balancer TARGETARCH=${TARGETARCH} && mv load-balancer /build-load-balancer
 
 FROM debian:bookworm-slim
 WORKDIR /app
