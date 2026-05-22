@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -29,6 +30,18 @@
 #define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
 #endif
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 #if defined(__x86_64__) && defined(__linux__)
 #define SEND_FD_IMPL_LABEL "asm syscall (x86_64/linux)"
 #elif defined(__aarch64__) && defined(__linux__)
@@ -42,12 +55,14 @@
 #define MAX_SOCKET_PATH 108
 #define MAX_ENV_LEN 1024
 #define BACKLOG 1024
+#define WORKER_RETRY_BACKOFF_NS (50ULL * 1000ULL * 1000ULL)
 
 static volatile sig_atomic_t keep_running = 1;
 
 typedef struct {
   char path[MAX_SOCKET_PATH];
   int control_fd;
+  unsigned long long retry_after_ns;
 } worker_t;
 
 static void on_signal(int signo) {
@@ -113,6 +128,7 @@ static int parse_worker_paths(worker_t workers[], int max_workers) {
       strncpy(workers[count].path, token, sizeof(workers[count].path) - 1);
       workers[count].path[sizeof(workers[count].path) - 1] = '\0';
       workers[count].control_fd = -1;
+      workers[count].retry_after_ns = 0;
       count++;
     }
 
@@ -123,7 +139,7 @@ static int parse_worker_paths(worker_t workers[], int max_workers) {
 }
 
 static int connect_worker(const char *socket_path) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return -1;
   }
@@ -141,17 +157,45 @@ static int connect_worker(const char *socket_path) {
   return fd;
 }
 
-static int ensure_worker_connected(worker_t *worker) {
+static unsigned long long monotonic_now_ns(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    return 0;
+  }
+
+  return ((unsigned long long)now.tv_sec * 1000000000ULL) + (unsigned long long)now.tv_nsec;
+}
+
+static void mark_worker_failed(worker_t *worker, unsigned long long now_ns) {
+  if (worker->control_fd >= 0) {
+    close(worker->control_fd);
+    worker->control_fd = -1;
+  }
+  worker->retry_after_ns = now_ns + WORKER_RETRY_BACKOFF_NS;
+}
+
+static void tune_client_socket(int fd) {
+  int one = 1;
+  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+static int ensure_worker_connected(worker_t *worker, unsigned long long now_ns) {
   if (worker->control_fd >= 0) {
     return 0;
   }
 
+  if (now_ns < worker->retry_after_ns) {
+    return -1;
+  }
+
   int fd = connect_worker(worker->path);
   if (fd < 0) {
+    worker->retry_after_ns = now_ns + WORKER_RETRY_BACKOFF_NS;
     return -1;
   }
 
   worker->control_fd = fd;
+  worker->retry_after_ns = 0;
   return 0;
 }
 
@@ -178,12 +222,14 @@ static int send_fd(int unix_sock, int fd_to_send) {
   cmsg->cmsg_type = SCM_RIGHTS;
   *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
+  const long send_flags = MSG_NOSIGNAL | MSG_DONTWAIT;
   ssize_t sent = -1;
+  for (;;) {
 #if defined(__x86_64__) && defined(__linux__)
   register long rax __asm__("rax") = SYS_sendmsg;
   register long rdi __asm__("rdi") = (long)unix_sock;
   register long rsi __asm__("rsi") = (long)&msg;
-  register long rdx __asm__("rdx") = 0;
+  register long rdx __asm__("rdx") = send_flags;
   __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx) : "rcx", "r11", "memory");
   if (rax < 0) {
     errno = (int)(-rax);
@@ -195,7 +241,7 @@ static int send_fd(int unix_sock, int fd_to_send) {
   register long x8 __asm__("x8") = SYS_sendmsg;
   register long x0 __asm__("x0") = (long)unix_sock;
   register long x1 __asm__("x1") = (long)&msg;
-  register long x2 __asm__("x2") = 0;
+  register long x2 __asm__("x2") = send_flags;
   __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "cc", "memory");
   if (x0 < 0) {
     errno = (int)(-x0);
@@ -204,13 +250,18 @@ static int send_fd(int unix_sock, int fd_to_send) {
     sent = (ssize_t)x0;
   }
 #else
-  sent = sendmsg(unix_sock, &msg, 0);
+  sent = sendmsg(unix_sock, &msg, (int)send_flags);
 #endif
-  if (sent < 0) {
+    if (sent == (ssize_t)sizeof(dummy)) {
+      return 0;
+    }
+
+    if (sent < 0 && errno == EINTR) {
+      continue;
+    }
+
     return -1;
   }
-
-  return 0;
 }
 
 static int create_tcp_listener(int port) {
@@ -251,6 +302,7 @@ static int create_tcp_listener(int port) {
 }
 
 int main(void) {
+  signal(SIGPIPE, SIG_IGN);
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
 
@@ -307,6 +359,9 @@ int main(void) {
         break;
       }
 
+      tune_client_socket(client_fd);
+
+      unsigned long long now_ns = monotonic_now_ns();
       bool forwarded = false;
       for (int tries = 0; tries < worker_count; tries++) {
         int idx = rr + tries;
@@ -314,7 +369,7 @@ int main(void) {
           idx -= worker_count;
         }
 
-        if (ensure_worker_connected(&workers[idx]) < 0) {
+        if (ensure_worker_connected(&workers[idx], now_ns) < 0) {
           continue;
         }
 
@@ -327,8 +382,7 @@ int main(void) {
           break;
         }
 
-        close(workers[idx].control_fd);
-        workers[idx].control_fd = -1;
+        mark_worker_failed(&workers[idx], now_ns);
       }
 
       if (!forwarded) {

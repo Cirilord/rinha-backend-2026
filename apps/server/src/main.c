@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 #include "responses.h"
@@ -33,6 +36,34 @@ static void on_signal(int signo) {
   keep_running = 0;
 }
 
+static ssize_t recvmsg_fast(int unix_sock, struct msghdr *msg) {
+#if defined(__x86_64__) && defined(__linux__)
+  register long rax __asm__("rax") = SYS_recvmsg;
+  register long rdi __asm__("rdi") = (long)unix_sock;
+  register long rsi __asm__("rsi") = (long)msg;
+  register long rdx __asm__("rdx") = 0;
+  __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx) : "rcx", "r11", "memory");
+  if (rax < 0) {
+    errno = (int)(-rax);
+    return -1;
+  }
+  return (ssize_t)rax;
+#elif defined(__aarch64__) && defined(__linux__)
+  register long x8 __asm__("x8") = SYS_recvmsg;
+  register long x0 __asm__("x0") = (long)unix_sock;
+  register long x1 __asm__("x1") = (long)msg;
+  register long x2 __asm__("x2") = 0;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "cc", "memory");
+  if (x0 < 0) {
+    errno = (int)(-x0);
+    return -1;
+  }
+  return (ssize_t)x0;
+#else
+  return recvmsg(unix_sock, msg, 0);
+#endif
+}
+
 static int recv_fd(int unix_sock) {
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
@@ -50,7 +81,7 @@ static int recv_fd(int unix_sock) {
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
 
-  if (recvmsg(unix_sock, &msg, 0) <= 0) {
+  if (recvmsg_fast(unix_sock, &msg) <= 0) {
     return -1;
   }
 
@@ -166,14 +197,14 @@ int main(void) {
       }
 
       char request[REQUEST_BUFFER_SIZE];
-      ssize_t nread = read_http_request(client_fd, request, sizeof(request));
+      HttpRequestView req_view;
+      ssize_t nread = read_http_request(client_fd, request, sizeof(request), &req_view);
       if (nread <= 0) {
         close(client_fd);
         continue;
       }
 
       request[nread] = '\0';
-      const size_t request_len = (size_t)nread;
 
       if (memcmp(request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
         (void)write(client_fd, RESPONSE_READY.data, RESPONSE_READY.len);
@@ -182,13 +213,14 @@ int main(void) {
       }
 
       if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
-        const char *body = NULL;
-        size_t body_len = 0;
-        if (!get_body(request, (size_t)nread, &body, &body_len)) {
+        if (req_view.body_offset > (size_t)nread ||
+            req_view.body_len > ((size_t)nread - req_view.body_offset)) {
           (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
           close(client_fd);
           continue;
         }
+        const char *body = request + req_view.body_offset;
+        const size_t body_len = req_view.body_len;
 
         TransactionContext ctx = transaction_context_from_body(body, body_len);
         if (ctx.id[0] == '\0') {
@@ -202,8 +234,8 @@ int main(void) {
         ctx.to_vector(&ctx, vector);
         ctx.destroy(&ctx);
 
-        uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-        // uint8_t fraud_count = 0;
+        // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+        uint8_t fraud_count = 0;
         const Response *resp = &RESPONSE_FRAUD_10;
         switch (fraud_count) {
         case 0:

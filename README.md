@@ -39,11 +39,12 @@ This avoids extra TCP hops between LB and API.
 
 ### `apps/server`
 - **poll-based control-channel multiplexing** (`MAX_CTRL_CONNS`) so one API process can handle multiple LB control connections.
+- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `recvmsg(SCM_RIGHTS)` with C fallback on other targets.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
   - `POST /fraud-score`
-  - fixed-format request-line matching with a single header-boundary scan
-- **Fast body extraction with known request length** (`get_body(..., request_len, ...)`) to avoid extra scans.
+  - fixed-format request-line matching
+  - single-pass header parsing that extracts `Content-Length` and body offset directly (no extra body scan)
 - **Warm-up phase** at startup to reduce first-request latency variance:
   - touches parser/vector path
   - touches x-score pages
@@ -271,9 +272,9 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `api1`: `0.47 CPU`, `150MB`
-- `api2`: `0.47 CPU`, `150MB`
-- `load-balancer`: `0.06 CPU`, `50MB`
+- `api1`: `0.44 CPU`, `150MB`
+- `api2`: `0.44 CPU`, `150MB`
+- `load-balancer`: `0.12 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
 
