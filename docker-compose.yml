@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-99bef2a35ff5277685e85aba724a55f544defeb8
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-5b5e6b3a39b3465ab515102ce7a9138c22699518
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -15,11 +15,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.47"
-          memory: "150MB"
+          cpus: "0.293"
+          memory: "100MB"
 
   api2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-99bef2a35ff5277685e85aba724a55f544defeb8
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-5b5e6b3a39b3465ab515102ce7a9138c22699518
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -34,16 +34,35 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.47"
-          memory: "150MB"
+          cpus: "0.293"
+          memory: "100MB"
+
+  api3:
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-5b5e6b3a39b3465ab515102ce7a9138c22699518
+    environment:
+      UNIX_SOCKET_PATH: "/shared/api3.sock"
+      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
+    volumes:
+      - shared-sockets:/shared
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.293"
+          memory: "100MB"
 
   load-balancer:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-99bef2a35ff5277685e85aba724a55f544defeb8
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-5b5e6b3a39b3465ab515102ce7a9138c22699518
     ports:
       - "9999:9999"
     environment:
       PORT: "9999"
-      WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
+      WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock,/shared/api3.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -53,12 +72,13 @@ services:
     depends_on:
       - api1
       - api2
+      - api3
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.06"
+          cpus: "0.120"
           memory: "50MB"
 
 networks:
