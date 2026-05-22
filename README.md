@@ -31,6 +31,7 @@ This avoids extra TCP hops between LB and API.
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
 - **Persistent control sockets** to APIs (reconnect only on failure).
+- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` with C fallback on other targets.
 - **Non-blocking listener + accept drain loop**: accepts until `EAGAIN` per wakeup to reduce burst overhead.
 - **Small hot path**: accept -> select upstream -> send FD -> close client FD in LB process.
 - **Minimal dependencies** (single C binary).

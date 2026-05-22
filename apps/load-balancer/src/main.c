@@ -13,10 +13,29 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef CMSG_SPACE
+#define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
+#endif
+
+#ifndef CMSG_LEN
+#define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
+#endif
+
+#if defined(__x86_64__) && defined(__linux__)
+#define SEND_FD_IMPL_LABEL "asm syscall (x86_64/linux)"
+#elif defined(__aarch64__) && defined(__linux__)
+#define SEND_FD_IMPL_LABEL "asm syscall (aarch64/linux)"
+#else
+#define SEND_FD_IMPL_LABEL "libc sendmsg fallback"
+#endif
 
 #define DEFAULT_PORT 9999
 #define MAX_WORKERS 16
@@ -159,7 +178,35 @@ static int send_fd(int unix_sock, int fd_to_send) {
   cmsg->cmsg_type = SCM_RIGHTS;
   *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
-  if (sendmsg(unix_sock, &msg, 0) < 0) {
+  ssize_t sent = -1;
+#if defined(__x86_64__) && defined(__linux__)
+  register long rax __asm__("rax") = SYS_sendmsg;
+  register long rdi __asm__("rdi") = (long)unix_sock;
+  register long rsi __asm__("rsi") = (long)&msg;
+  register long rdx __asm__("rdx") = 0;
+  __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx) : "rcx", "r11", "memory");
+  if (rax < 0) {
+    errno = (int)(-rax);
+    sent = -1;
+  } else {
+    sent = (ssize_t)rax;
+  }
+#elif defined(__aarch64__) && defined(__linux__)
+  register long x8 __asm__("x8") = SYS_sendmsg;
+  register long x0 __asm__("x0") = (long)unix_sock;
+  register long x1 __asm__("x1") = (long)&msg;
+  register long x2 __asm__("x2") = 0;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "cc", "memory");
+  if (x0 < 0) {
+    errno = (int)(-x0);
+    sent = -1;
+  } else {
+    sent = (ssize_t)x0;
+  }
+#else
+  sent = sendmsg(unix_sock, &msg, 0);
+#endif
+  if (sent < 0) {
     return -1;
   }
 
@@ -222,6 +269,7 @@ int main(void) {
   }
 
   log_msg("INFO", "listening on 0.0.0.0:%d", port);
+  log_msg("INFO", "send_fd implementation: %s", SEND_FD_IMPL_LABEL);
   for (int i = 0; i < worker_count; i++) {
     log_msg("INFO", "worker[%d] socket path: %s", i, workers[i].path);
   }
