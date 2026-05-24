@@ -47,6 +47,7 @@ static int accept_client(int server_fd);
 static int connect_worker_fd(const char *path);
 static int dispatch_client_fd(worker_pool_t *pool, int client_fd);
 static int drain_accept_queue(int server_fd, worker_pool_t *pool);
+static void enable_tcp_keepalive(int fd);
 static int initialize_worker_pool(worker_pool_t *pool, const char *const *paths, size_t count);
 #if defined(__linux__)
 static int run_server_loop_epoll(int server_fd, volatile sig_atomic_t *keep_running,
@@ -61,7 +62,13 @@ static void teardown_worker_pool(worker_pool_t *pool);
 
 static int accept_client(int server_fd) {
 #if defined(__linux__)
-  return accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  int client_fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  if (client_fd < 0) {
+    return -1;
+  }
+
+  enable_tcp_keepalive(client_fd);
+  return client_fd;
 #else
   int client_fd = accept(server_fd, NULL, NULL);
   if (client_fd < 0) {
@@ -73,6 +80,7 @@ static int accept_client(int server_fd) {
     return -1;
   }
 
+  enable_tcp_keepalive(client_fd);
   return client_fd;
 #endif
 }
@@ -159,6 +167,11 @@ static int drain_accept_queue(int server_fd, worker_pool_t *pool) {
 
     return -1;
   }
+}
+
+static void enable_tcp_keepalive(int fd) {
+  int value = 1;
+  (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value));
 }
 
 static int initialize_worker_pool(worker_pool_t *pool, const char *const *paths, size_t count) {

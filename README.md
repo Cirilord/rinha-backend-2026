@@ -18,6 +18,7 @@ High-performance C implementation for **Rinha de Backend 2026**, using:
     - Linux: `epoll`
     - macOS: `kqueue`
   - Parses `PORT` and `WORKER_SOCKETS` env vars
+  - Enables `SO_KEEPALIVE` on accepted client TCP sockets
   - Dispatches accepted client FDs to workers via Unix sockets + `SCM_RIGHTS` (round-robin)
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
@@ -290,11 +291,16 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `api1`: `0.44 CPU`, `150MB`
-- `api2`: `0.44 CPU`, `150MB`
-- `load-balancer`: `0.12 CPU`, `50MB`
+- `main2-1`: `0.42 CPU`, `150MB`
+- `main2-2`: `0.42 CPU`, `150MB`
+- `lb2`: `0.16 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
+
+CPU pinning (`cpuset`) currently configured:
+- `lb2`: `"0"`
+- `main2-1`: `"1"`
+- `main2-2`: `"2"`
 
 ## 9. Environment Variables
 
