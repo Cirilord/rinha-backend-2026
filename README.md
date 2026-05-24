@@ -13,10 +13,22 @@ High-performance C implementation for **Rinha de Backend 2026**, using:
   - Listens on `:9999`
   - Accepts TCP connections
   - Forwards accepted client FDs to API instances via `sendmsg(..., SCM_RIGHTS)`
+- `load-balancer2` (experimental)
+  - Event-loop backend by platform:
+    - Linux: `epoll`
+    - macOS: `kqueue`
+  - Parses `PORT` and `WORKER_SOCKETS` env vars
+  - Dispatches accepted client FDs to workers via Unix sockets + `SCM_RIGHTS` (round-robin)
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
   - Receive forwarded client FDs from the LB
   - Parse HTTP request and return scoring result
+- `main2-1`, `main2-2` (benchmark stack)
+  - Minimal FD-passing workers used to isolate LB overhead in load tests
+  - Event-loop backend by platform:
+    - Linux: `epoll` + `accept4`
+    - macOS: `kqueue` + `accept`
+  - Return a fixed JSON response (`{"approved":false}`)
 
 ### FD Passing Flow
 1. LB accepts TCP client.
@@ -47,9 +59,9 @@ This avoids extra TCP hops between LB and API.
   - single-pass header parsing that extracts `Content-Length` and body offset directly (no extra body scan)
 - **Warm-up phase** at startup to reduce first-request latency variance:
   - touches parser/vector path
-  - touches x-score pages
+  - touches detector index pages
 
-### Scoring (`apps/server/src/x-score.c`)
+### Scoring (`apps/server/src/detector.c`)
 - Uses quantized vectors and top-k nearest-neighbor style lookup.
 - Builds partition-key lookup tables once at index-open time to accelerate same-key candidate selection.
 - Includes **early pruning / early-exit**:
@@ -65,9 +77,9 @@ This avoids extra TCP hops between LB and API.
 - Query SIMD constants are pre-expanded once per request.
 - Distance accumulation uses chunked 32-bit partial sums widened to 64-bit.
 
-## 3. Vector Search Details (x-score)
+## 3. Vector Search Details (detector)
 
-This section describes the vector search strategy used in `apps/server/src/x-score.c`.
+This section describes the vector search strategy used in `apps/server/src/detector.c`.
 
 ### Concepts Used (Names)
 
@@ -143,8 +155,8 @@ Targets:
 Architecture-aware flags (`TARGETARCH`):
 - `server`:
   - `amd64`: `-O3` globally + `-mavx2 -mfma -march=haswell`, plus `-fno-plt`
-  - `x-score.c`: compiled with `-O2` (same SIMD arch flags) to reduce hot-path code bloat from aggressive inlining, plus `-fno-plt`
-  - `arm64`: `-O3` globally and `x-score.c` with `-O2` (without AVX2/FMA flags), plus `-fno-plt`
+  - `detector.c`: compiled with `-O2` (same SIMD arch flags) to reduce hot-path code bloat from aggressive inlining, plus `-fno-plt`
+  - `arm64`: `-O3` globally and `detector.c` with `-O2` (without AVX2/FMA flags), plus `-fno-plt`
 - `load-balancer`:
   - `amd64`: `-O3` without AVX2/FMA flags to avoid AVX state-transition overhead (`vzeroupper`) in the LB hot path, plus `-fno-plt`
   - `arm64`: `-O3` plus `-fno-plt`
@@ -231,6 +243,12 @@ python3 scripts/tune_partition_cutoffs.py \
 │   ├── load-balancer
 │   │   ├── Dockerfile
 │   │   └── src/main.c
+│   ├── load-balancer2
+│   │   ├── Dockerfile
+│   │   └── src/
+│   ├── server2
+│   │   ├── Dockerfile
+│   │   └── src/main.c
 │   └── server
 │       ├── Dockerfile
 │       └── src/
@@ -287,6 +305,10 @@ Total: **1.00 CPU / 350MB**.
 ### Load Balancer
 - `PORT` (default `9999`)
 - `WORKER_SOCKETS` (comma-separated Unix socket list)
+
+### Server2 (Benchmark Stub)
+- `UNIX_SOCKET_PATH` (required)
+- Runtime model: non-blocking event loop (`epoll` on Linux, `kqueue` on macOS) with FD passing (`SCM_RIGHTS`)
 
 ## 10. API Endpoints
 

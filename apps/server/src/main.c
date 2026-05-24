@@ -13,10 +13,10 @@
 #endif
 #include <unistd.h>
 
+#include "detector.h"
 #include "responses.h"
 #include "server.h"
 #include "transaction_context.h"
-#include "x-score.h"
 
 #ifndef CMSG_SPACE
 #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
@@ -95,7 +95,7 @@ static int recv_fd(int unix_sock) {
   return client_fd;
 }
 
-static void warm_up(const XScoreIndexView *xscore) {
+static void warm_up(const DetectorIndexView *detector) {
   static const char warmup_body[] =
     "{\"id\":\"tx-warmup\","
     "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
@@ -119,7 +119,7 @@ static void warm_up(const XScoreIndexView *xscore) {
     // Heat parser/vector path and touch x-score pages ahead of first real
     // requests.
     for (int i = 0; i < 32; i++) {
-      warmup_sink ^= x_score_predict_fraud_count(xscore, vector);
+      warmup_sink ^= detector_predict_fraud_count(detector, vector);
     }
     (void)warmup_sink;
   }
@@ -141,12 +141,12 @@ int main(void) {
     return 1;
   }
 
-  XScoreIndexView xscore;
-  if (!x_score_open(xscore_path, &xscore)) {
+  DetectorIndexView detector;
+  if (!detector_open(xscore_path, &detector)) {
     fprintf(stderr, "failed to load x-score index from resources/references.idx\n");
     return 1;
   }
-  warm_up(&xscore);
+  warm_up(&detector);
 
   int server_fd = create_unix_server(socket_path);
   if (server_fd < 0) {
@@ -234,7 +234,7 @@ int main(void) {
         ctx.to_vector(&ctx, vector);
         ctx.destroy(&ctx);
 
-        // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+        // uint8_t fraud_count = detector_predict_fraud_count(&detector, vector);
         uint8_t fraud_count = 0;
         const Response *resp = &RESPONSE_FRAUD_10;
         switch (fraud_count) {
@@ -272,6 +272,6 @@ int main(void) {
   }
   close(server_fd);
   unlink(socket_path);
-  x_score_close(&xscore);
+  detector_close(&detector);
   return 0;
 }

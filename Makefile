@@ -29,7 +29,7 @@ SERVER_COMMON_SRCS := apps/server/src/main.c \
                       apps/server/src/server.c \
                       apps/server/src/responses.c \
                       apps/server/src/transaction_context.c
-SERVER_XSCORE_SRC := apps/server/src/x-score.c
+SERVER_XSCORE_SRC := apps/server/src/detector.c
 SERVER_COMMON_OBJS := $(SERVER_COMMON_SRCS:.c=.o)
 SERVER_XSCORE_OBJ := $(SERVER_XSCORE_SRC:.c=.o)
 SERVER_OBJS := $(SERVER_COMMON_OBJS) $(SERVER_XSCORE_OBJ)
