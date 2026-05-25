@@ -1,6 +1,6 @@
 # rinha-backend
 
-High-performance C implementation for **Rinha de Backend 2026**, using:
+High-performance implementation for **Rinha de Backend 2026**, using:
 - a custom TCP load balancer
 - two API instances
 - Unix socket FD passing (`SCM_RIGHTS`) between LB and APIs
@@ -20,15 +20,19 @@ High-performance C implementation for **Rinha de Backend 2026**, using:
   - Parses `PORT` and `WORKER_SOCKETS` env vars
   - Enables `SO_KEEPALIVE` on accepted client TCP sockets
   - Dispatches accepted client FDs to workers via Unix sockets + `SCM_RIGHTS` (round-robin)
+- `load-balancer3` (experimental, Zig)
+  - Parses `PORT` and `WORKER_SOCKETS` env vars
+  - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
+  - Persistent worker control sockets with reconnect-on-failure
+  - Round-robin worker selection
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
   - Receive forwarded client FDs from the LB
   - Parse HTTP request and return scoring result
-- `main2-1`, `main2-2` (benchmark stack)
+- `server3-1`, `server3-2` (benchmark stack, Zig)
   - Minimal FD-passing workers used to isolate LB overhead in load tests
-  - Event-loop backend by platform:
-    - Linux: `epoll` + `accept4`
-    - macOS: `kqueue` + `accept`
+  - Linux `epoll` event loop for control sockets + client FDs
+  - Parses request headers/body boundary (`Content-Length`) before responding
   - Return a fixed JSON response (`{"approved":false}`)
 
 ### FD Passing Flow
@@ -247,9 +251,12 @@ python3 scripts/tune_partition_cutoffs.py \
 │   ├── load-balancer2
 │   │   ├── Dockerfile
 │   │   └── src/
-│   ├── server2
+│   ├── load-balancer3
 │   │   ├── Dockerfile
-│   │   └── src/main.c
+│   │   └── src/main.zig
+│   ├── server3
+│   │   ├── Dockerfile
+│   │   └── src/main.zig
 │   └── server
 │       ├── Dockerfile
 │       └── src/
@@ -291,16 +298,16 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `main2-1`: `0.42 CPU`, `150MB`
-- `main2-2`: `0.42 CPU`, `150MB`
-- `lb2`: `0.16 CPU`, `50MB`
+- `server3-1`: `0.42 CPU`, `150MB`
+- `server3-2`: `0.42 CPU`, `150MB`
+- `lb3`: `0.16 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
 
 CPU pinning (`cpuset`) currently configured:
-- `lb2`: `"0"`
-- `main2-1`: `"1"`
-- `main2-2`: `"2"`
+- `lb3`: `"0"`
+- `server3-1`: `"1"`
+- `server3-2`: `"2"`
 
 ## 9. Environment Variables
 
@@ -312,9 +319,9 @@ CPU pinning (`cpuset`) currently configured:
 - `PORT` (default `9999`)
 - `WORKER_SOCKETS` (comma-separated Unix socket list)
 
-### Server2 (Benchmark Stub)
+### Server3 (Benchmark Stub, Zig)
 - `UNIX_SOCKET_PATH` (required)
-- Runtime model: non-blocking event loop (`epoll` on Linux, `kqueue` on macOS) with FD passing (`SCM_RIGHTS`)
+- Runtime model: non-blocking Linux `epoll` event loop with FD passing (`SCM_RIGHTS`)
 
 ## 10. API Endpoints
 
@@ -371,7 +378,7 @@ curl -i http://localhost:9999/fraud-score \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://load-balancer:9999 \
+  -e BASE_URL=http://lb3:9999 \
   grafana/k6 run test/smoke.js
 ```
 
@@ -381,7 +388,7 @@ docker run --rm -i \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://load-balancer:9999 \
+  -e BASE_URL=http://lb3:9999 \
   grafana/k6 run test/test.js
 ```
 
@@ -396,8 +403,8 @@ This project enables AVX2 on `amd64` builds through the Makefile flags.
 For Docker buildx:
 
 ```bash
-docker buildx build --platform linux/amd64 -f apps/server/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/server3/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/load-balancer3/Dockerfile .
 ```
 
 ## 13. Notes
