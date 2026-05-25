@@ -25,6 +25,13 @@ High-performance implementation for **Rinha de Backend 2026**, using:
   - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
   - Persistent worker control sockets with reconnect-on-failure
   - Round-robin worker selection
+- `load-balancer4` (experimental, Rust)
+  - Rust implementation:
+    - worker/port env parsing
+    - round-robin and dispatch decisions
+  - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
+  - Persistent worker control sockets with reconnect-on-failure
+  - Round-robin worker selection
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
   - Receive forwarded client FDs from the LB
@@ -32,6 +39,13 @@ High-performance implementation for **Rinha de Backend 2026**, using:
 - `server3-1`, `server3-2` (benchmark stack, Zig)
   - Minimal FD-passing workers used to isolate LB overhead in load tests
   - Linux `epoll` event loop for control sockets + client FDs
+  - Parses request headers/body boundary (`Content-Length`) before responding
+  - Return a fixed JSON response (`{"approved":false}`)
+- `server4-1`, `server4-2` (benchmark stack, Rust)
+  - Rust implementation:
+    - control socket loop
+    - request completeness parser (`Content-Length` / headers-body boundary)
+  - Receives forwarded client FDs via `SCM_RIGHTS`
   - Parses request headers/body boundary (`Content-Length`) before responding
   - Return a fixed JSON response (`{"approved":false}`)
 
@@ -254,9 +268,15 @@ python3 scripts/tune_partition_cutoffs.py \
 │   ├── load-balancer3
 │   │   ├── Dockerfile
 │   │   └── src/main.zig
+│   ├── load-balancer4
+│   │   ├── Dockerfile
+│   │   └── src/main.rs
 │   ├── server3
 │   │   ├── Dockerfile
 │   │   └── src/main.zig
+│   ├── server4
+│   │   ├── Dockerfile
+│   │   └── src/main.rs
 │   └── server
 │       ├── Dockerfile
 │       └── src/
@@ -298,16 +318,16 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `server3-1`: `0.42 CPU`, `150MB`
-- `server3-2`: `0.42 CPU`, `150MB`
-- `lb3`: `0.16 CPU`, `50MB`
+- `server4-1`: `0.42 CPU`, `150MB`
+- `server4-2`: `0.42 CPU`, `150MB`
+- `lb4`: `0.16 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
 
 CPU pinning (`cpuset`) currently configured:
-- `lb3`: `"0"`
-- `server3-1`: `"1"`
-- `server3-2`: `"2"`
+- `lb4`: `"0"`
+- `server4-1`: `"1"`
+- `server4-2`: `"2"`
 
 ## 9. Environment Variables
 
@@ -319,9 +339,9 @@ CPU pinning (`cpuset`) currently configured:
 - `PORT` (default `9999`)
 - `WORKER_SOCKETS` (comma-separated Unix socket list)
 
-### Server3 (Benchmark Stub, Zig)
+### Server4 (Benchmark Stub, Rust)
 - `UNIX_SOCKET_PATH` (required)
-- Runtime model: non-blocking Linux `epoll` event loop with FD passing (`SCM_RIGHTS`)
+- Runtime model: Rust request/control flow with Unix socket FD passing (`SCM_RIGHTS`)
 
 ## 10. API Endpoints
 
@@ -378,7 +398,7 @@ curl -i http://localhost:9999/fraud-score \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb3:9999 \
+  -e BASE_URL=http://lb4:9999 \
   grafana/k6 run test/smoke.js
 ```
 
@@ -388,7 +408,7 @@ docker run --rm -i \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb3:9999 \
+  -e BASE_URL=http://lb4:9999 \
   grafana/k6 run test/test.js
 ```
 
@@ -403,8 +423,8 @@ This project enables AVX2 on `amd64` builds through the Makefile flags.
 For Docker buildx:
 
 ```bash
-docker buildx build --platform linux/amd64 -f apps/server3/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer3/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/server4/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/load-balancer4/Dockerfile .
 ```
 
 ## 13. Notes
