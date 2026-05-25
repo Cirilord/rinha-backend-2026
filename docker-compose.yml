@@ -1,6 +1,6 @@
 services:
   # api1:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-634bccca03c92882e7e93208bb884581723f6735
   #   environment:
   #     UNIX_SOCKET_PATH: "/shared/api1.sock"
   #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -19,7 +19,7 @@ services:
   #         memory: "150MB"
   #
   # api2:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-634bccca03c92882e7e93208bb884581723f6735
   #   environment:
   #     UNIX_SOCKET_PATH: "/shared/api2.sock"
   #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -38,7 +38,7 @@ services:
   #         memory: "150MB"
   #
   # load-balancer:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+  #   image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-634bccca03c92882e7e93208bb884581723f6735
   #   ports:
   #     - "9999:9999"
   #   environment:
@@ -62,7 +62,7 @@ services:
   #         memory: "50MB"
 
   main2-1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-634bccca03c92882e7e93208bb884581723f6735
     environment:
       UNIX_SOCKET_PATH: "/shared/main2-1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -81,7 +81,7 @@ services:
           memory: "150MB"
 
   main2-2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-634bccca03c92882e7e93208bb884581723f6735
     environment:
       UNIX_SOCKET_PATH: "/shared/main2-2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -99,13 +99,15 @@ services:
           cpus: "0.44"
           memory: "150MB"
 
-  lb2:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-0e3231f5b0eb9dc391f782892a54550d0d2c2f42
+  lb3:
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-634bccca03c92882e7e93208bb884581723f6735
     ports:
       - "9999:9999"
     environment:
-      PORT: "9999"
-      WORKER_SOCKETS: "/shared/main2-1.sock,/shared/main2-2.sock"
+      LB_MODE: "fdpass"
+      LB_PORT: "9999"
+      UPSTREAMS: "/shared/main2-1.sock,/shared/main2-2.sock"
+      LB_FAST2: "1"
     volumes:
       - shared-sockets:/shared
     ulimits:
