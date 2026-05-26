@@ -1,28 +1,24 @@
 const std = @import("std");
-
-const c = @cImport({
-    @cDefine("_GNU_SOURCE", "1");
-    @cInclude("arpa/inet.h");
-    @cInclude("netinet/in.h");
-    @cInclude("stdlib.h");
-    @cInclude("string.h");
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("unistd.h");
-});
+const posix = std.posix;
 
 const MAX_WORKERS = 32;
 const MAX_SOCKET_PATH = 108;
 const LISTEN_BACKLOG = 4096;
 
-const Worker = struct {
-    path: [MAX_SOCKET_PATH]u8 = [_]u8{0} ** MAX_SOCKET_PATH,
-    fd: c_int = -1,
+// Linux and POSIX define SCM_RIGHTS as 1.
+const SCM_RIGHTS: i32 = 1;
+
+const Cmsghdr = extern struct {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
 };
 
-var workers: [MAX_WORKERS]Worker = [_]Worker{.{}} ** MAX_WORKERS;
-var worker_count: usize = 0;
-var rr_next: usize = 0;
+const Worker = struct {
+    path: [MAX_SOCKET_PATH]u8 = [_]u8{0} ** MAX_SOCKET_PATH,
+    path_len: usize = 0,
+    fd: posix.socket_t = -1,
+};
 
 const LbError = error{
     InvalidPort,
@@ -30,107 +26,64 @@ const LbError = error{
     ListenFailed,
 };
 
-fn logErr(comptime fmt: []const u8, args: anytype) void {
-    std.io.getStdErr().writer().print(fmt, args) catch {};
+const FD_SIZE = @sizeOf(posix.fd_t);
+const CMSG_HDR_LEN = cmsgAlign(@sizeOf(Cmsghdr));
+const CMSG_LEN_FD = CMSG_HDR_LEN + FD_SIZE;
+const CMSG_SPACE_FD = CMSG_HDR_LEN + cmsgAlign(FD_SIZE);
+
+var workers: [MAX_WORKERS]Worker = [_]Worker{.{}} ** MAX_WORKERS;
+var worker_count: usize = 0;
+var rr_next: usize = 0;
+
+inline fn cmsgAlign(len: usize) usize {
+    const alignment = @sizeOf(usize);
+    const mask: usize = alignment - 1;
+    return (len + mask) & ~mask;
 }
 
-fn parsePort() LbError!u16 {
-    const port_env = c.getenv("PORT") orelse return LbError.InvalidPort;
-    const text = std.mem.span(port_env);
-    const parsed = std.fmt.parseInt(u32, text, 10) catch return LbError.InvalidPort;
-    if (parsed == 0 or parsed > 65_535) return LbError.InvalidPort;
-    return @intCast(parsed);
-}
+fn closeWorker(index: usize) void {
+    if (index >= worker_count) return;
 
-fn parseWorkerSockets() LbError!void {
-    const workers_env = c.getenv("WORKER_SOCKETS") orelse return LbError.InvalidWorkers;
-    const text = std.mem.span(workers_env);
-    var split = std.mem.splitScalar(u8, text, ',');
-    worker_count = 0;
-
-    while (split.next()) |raw| {
-        const token = std.mem.trim(u8, raw, " \t\r\n");
-        if (token.len == 0) continue;
-        if (token.len >= MAX_SOCKET_PATH) return LbError.InvalidWorkers;
-        if (worker_count >= MAX_WORKERS) return LbError.InvalidWorkers;
-
-        @memset(workers[worker_count].path[0..], 0);
-        std.mem.copyForwards(u8, workers[worker_count].path[0..token.len], token);
-        workers[worker_count].fd = -1;
-        worker_count += 1;
+    const worker = &workers[index];
+    if (worker.fd >= 0) {
+        posix.close(worker.fd);
+        worker.fd = -1;
     }
-
-    if (worker_count == 0) return LbError.InvalidWorkers;
-}
-
-fn setKeepAlive(fd: c_int) void {
-    var one: c_int = 1;
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, &one, @sizeOf(c_int));
 }
 
 fn connectWorker(index: usize) bool {
     if (index >= worker_count) return false;
-    const worker = &workers[index];
 
+    const worker = &workers[index];
     if (worker.fd >= 0) return true;
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
-    if (fd < 0) return false;
+    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch return false;
+    errdefer posix.close(fd);
 
-    var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
-    addr.sun_family = c.AF_UNIX;
-    _ = c.strncpy(@ptrCast(&addr.sun_path[0]), @ptrCast(&worker.path[0]), MAX_SOCKET_PATH - 1);
-
-    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
-        _ = c.close(fd);
-        return false;
-    }
+    const addr = std.net.Address.initUnix(worker.path[0..worker.path_len]) catch return false;
+    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
 
     worker.fd = fd;
     return true;
 }
 
-fn closeWorker(index: usize) void {
-    if (index >= worker_count) return;
-    const worker = &workers[index];
-    if (worker.fd >= 0) {
-        _ = c.close(worker.fd);
-        worker.fd = -1;
-    }
-}
-
-fn sendFd(control_fd: c_int, client_fd: c_int) bool {
-    var data: u8 = 0;
-    var iov = c.struct_iovec{
-        .iov_base = &data,
-        .iov_len = 1,
+fn createListener(port: u16) LbError!posix.socket_t {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch {
+        return LbError.ListenFailed;
     };
+    errdefer posix.close(fd);
 
-    var control: [64]u8 align(@alignOf(c.struct_cmsghdr)) = [_]u8{0} ** 64;
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
 
-    var msg: c.struct_msghdr = std.mem.zeroes(c.struct_msghdr);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = @ptrCast(&control[0]);
-    const fd_size: c_uint = @intCast(@sizeOf(c_int));
-    msg.msg_controllen = @as(c_uint, @intCast(c.CMSG_SPACE(fd_size)));
+    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+    posix.bind(fd, &addr.any, addr.getOsSockLen()) catch return LbError.ListenFailed;
+    posix.listen(fd, LISTEN_BACKLOG) catch return LbError.ListenFailed;
 
-    const cmsg = c.CMSG_FIRSTHDR(&msg);
-    if (cmsg == null) return false;
-    cmsg.*.cmsg_level = c.SOL_SOCKET;
-    cmsg.*.cmsg_type = c.SCM_RIGHTS;
-    cmsg.*.cmsg_len = @as(c_uint, @intCast(c.CMSG_LEN(fd_size)));
-
-    const payload_ptr = @as([*]u8, @ptrCast(c.CMSG_DATA(cmsg)));
-    const fd_bytes = std.mem.asBytes(&client_fd);
-    std.mem.copyForwards(u8, payload_ptr[0..@sizeOf(c_int)], fd_bytes);
-    msg.msg_controllen = cmsg.*.cmsg_len;
-
-    const sent = c.sendmsg(control_fd, &msg, c.MSG_NOSIGNAL);
-    return sent == 1;
+    return fd;
 }
 
-fn dispatchClient(client_fd: c_int) void {
+fn dispatchClient(client_fd: posix.socket_t) void {
     if (worker_count == 0) return;
 
     const start = rr_next;
@@ -151,42 +104,75 @@ fn dispatchClient(client_fd: c_int) void {
     }
 }
 
-fn createListener(port: u16) LbError!c_int {
-    const fd = c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
-    if (fd < 0) return LbError.ListenFailed;
-
-    var one: c_int = 1;
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-
-    var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = c.htons(port);
-    addr.sin_addr.s_addr = c.htonl(c.INADDR_ANY);
-
-    if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) {
-        _ = c.close(fd);
-        return LbError.ListenFailed;
-    }
-
-    if (c.listen(fd, LISTEN_BACKLOG) != 0) {
-        _ = c.close(fd);
-        return LbError.ListenFailed;
-    }
-
-    return fd;
+fn logErr(comptime fmt: []const u8, args: anytype) void {
+    std.io.getStdErr().writer().print(fmt, args) catch {};
 }
 
-fn acceptLoop(server_fd: c_int) noreturn {
-    while (true) {
-        const client_fd = c.accept4(server_fd, null, null, c.SOCK_CLOEXEC);
-        if (client_fd < 0) {
-            continue;
-        }
+fn parsePort() LbError!u16 {
+    const port_env = posix.getenv("PORT") orelse return LbError.InvalidPort;
+    const text = port_env;
 
-        setKeepAlive(client_fd);
-        dispatchClient(client_fd);
-        _ = c.close(client_fd);
+    const parsed = std.fmt.parseInt(u32, text, 10) catch return LbError.InvalidPort;
+    if (parsed == 0 or parsed > std.math.maxInt(u16)) return LbError.InvalidPort;
+
+    return @intCast(parsed);
+}
+
+fn parseWorkerSockets() LbError!void {
+    const workers_env = posix.getenv("WORKER_SOCKETS") orelse return LbError.InvalidWorkers;
+    const text = workers_env;
+
+    worker_count = 0;
+    var split = std.mem.splitScalar(u8, text, ',');
+    while (split.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t\r\n");
+        if (token.len == 0) continue;
+
+        if (worker_count >= MAX_WORKERS) return LbError.InvalidWorkers;
+        if (token.len >= MAX_SOCKET_PATH) return LbError.InvalidWorkers;
+
+        const worker = &workers[worker_count];
+        @memset(worker.path[0..], 0);
+        std.mem.copyForwards(u8, worker.path[0..token.len], token);
+        worker.path_len = token.len;
+        worker.fd = -1;
+
+        worker_count += 1;
     }
+
+    if (worker_count == 0) return LbError.InvalidWorkers;
+}
+
+fn sendFd(control_fd: posix.socket_t, client_fd: posix.fd_t) bool {
+    var data: [1]u8 = .{0};
+    const iov = [1]posix.iovec_const{.{ .base = data[0..].ptr, .len = data.len }};
+
+    var control: [CMSG_SPACE_FD]u8 align(@alignOf(Cmsghdr)) = [_]u8{0} ** CMSG_SPACE_FD;
+    const cmsg: *Cmsghdr = @ptrCast(@alignCast(&control[0]));
+    cmsg.cmsg_len = CMSG_LEN_FD;
+    cmsg.cmsg_level = posix.SOL.SOCKET;
+    cmsg.cmsg_type = SCM_RIGHTS;
+
+    const fd_bytes = std.mem.asBytes(&client_fd);
+    std.mem.copyForwards(u8, control[CMSG_HDR_LEN .. CMSG_HDR_LEN + FD_SIZE], fd_bytes);
+
+    const msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = &control,
+        .controllen = @intCast(CMSG_SPACE_FD),
+        .flags = 0,
+    };
+
+    const written = posix.sendmsg(control_fd, &msg, posix.MSG.NOSIGNAL) catch return false;
+    return written == 1;
+}
+
+fn setKeepAlive(fd: posix.socket_t) void {
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
 }
 
 pub fn main() u8 {
@@ -204,7 +190,20 @@ pub fn main() u8 {
         logErr("failed to create tcp server on port {d}\n", .{port});
         return 1;
     };
+    defer posix.close(server_fd);
 
-    logErr("load-balancer3 (zig) listening on :{d} with {d} workers\n", .{ port, worker_count });
-    acceptLoop(server_fd);
+    logErr("load-balancer3 (zig std) listening on :{d} with {d} workers\n", .{ port, worker_count });
+
+    while (true) {
+        const client_fd = posix.accept(server_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+            switch (err) {
+                error.ConnectionAborted, error.WouldBlock => continue,
+                else => continue,
+            }
+        };
+
+        setKeepAlive(client_fd);
+        dispatchClient(client_fd);
+        posix.close(client_fd);
+    }
 }

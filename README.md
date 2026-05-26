@@ -43,7 +43,8 @@ High-performance implementation for **Rinha de Backend 2026**, using:
   - Parse HTTP request and return scoring result
 - `server3-1`, `server3-2` (benchmark stack, Zig)
   - Minimal FD-passing workers used to isolate LB overhead in load tests
-  - Linux `epoll` event loop for control sockets + client FDs
+  - Unix control socket receiver (`recvmsg + SCM_RIGHTS`) compatible with `lb3`
+  - Persistent control-session loop (accept control connection, receive client FDs, respond)
   - Parses request headers/body boundary (`Content-Length`) before responding
   - Return a fixed JSON response (`{"approved":false}`)
 - `server5-1`, `server5-2` (benchmark stack, C++)

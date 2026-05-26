@@ -67,13 +67,13 @@ services:
   #         cpus: "0.12"
   #         memory: "50MB"
 
-  server7-1:
+  server3-1:
     build:
       context: .
-      dockerfile: ./apps/server7/Dockerfile
+      dockerfile: ./apps/server3/Dockerfile
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server7-1.sock"
+      UNIX_SOCKET_PATH: "/shared/server3-1.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -86,16 +86,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.41"
           memory: "150MB"
 
-  server7-2:
+  server3-2:
     build:
       context: .
-      dockerfile: ./apps/server7/Dockerfile
+      dockerfile: ./apps/server3/Dockerfile
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server7-2.sock"
+      UNIX_SOCKET_PATH: "/shared/server3-2.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -108,19 +108,19 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.41"
           memory: "150MB"
 
-  lb7:
+  lb3:
     build:
       context: .
-      dockerfile: ./apps/load-balancer7/Dockerfile
+      dockerfile: ./apps/load-balancer3/Dockerfile
     platform: linux/amd64
     ports:
       - "9999:9999"
     environment:
       PORT: "9999"
-      WORKER_SOCKETS: "/shared/server7-1.sock,/shared/server7-2.sock"
+      WORKER_SOCKETS: "/shared/server3-1.sock,/shared/server3-2.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -129,14 +129,14 @@ services:
         hard: 65535
     cpuset: "0"
     depends_on:
-      - server7-1
-      - server7-2
+      - server3-1
+      - server3-2
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.16"
+          cpus: "0.18"
           memory: "50MB"
 
 networks:
