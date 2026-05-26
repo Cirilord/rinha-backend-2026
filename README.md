@@ -32,6 +32,11 @@ High-performance implementation for **Rinha de Backend 2026**, using:
   - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
   - Persistent worker control sockets with reconnect-on-failure
   - Round-robin worker selection
+- `load-balancer6` (experimental, Odin)
+  - Parses `PORT` and `BACKENDS` env vars
+  - Accepts TCP clients and proxies requests to backend TCP servers
+  - Per-connection backend retry across configured targets
+  - Response relay from backend to client
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
   - Receive forwarded client FDs from the LB
@@ -48,6 +53,11 @@ High-performance implementation for **Rinha de Backend 2026**, using:
   - Receives forwarded client FDs via `SCM_RIGHTS`
   - Parses request headers/body boundary (`Content-Length`) before responding
   - Return a fixed JSON response (`{"approved":false}`)
+- `server6-1`, `server6-2` (benchmark stack, Odin)
+  - Odin implementation:
+    - TCP listener + request completeness parser (`Content-Length`)
+  - Responds with fixed JSON payload (`{"approved":false}`)
+  - Used with `load-balancer6` via TCP backends
 
 ### FD Passing Flow
 1. LB accepts TCP client.
@@ -56,6 +66,7 @@ High-performance implementation for **Rinha de Backend 2026**, using:
 4. API writes HTTP response to same FD and closes it.
 
 This avoids extra TCP hops between LB and API.
+`load-balancer6`/`server6` is a separate benchmark stack using TCP proxying between LB and workers.
 
 ## 2. Strategy Used in Each App
 
@@ -274,6 +285,9 @@ python3 scripts/tune_partition_cutoffs.py \
 │   ├── load-balancer5
 │   │   ├── Dockerfile
 │   │   └── src/main.cpp
+│   ├── load-balancer6
+│   │   ├── Dockerfile
+│   │   └── src/main.odin
 │   ├── server3
 │   │   ├── Dockerfile
 │   │   └── src/main.zig
@@ -283,6 +297,9 @@ python3 scripts/tune_partition_cutoffs.py \
 │   ├── server5
 │   │   ├── Dockerfile
 │   │   └── src/main.cpp
+│   ├── server6
+│   │   ├── Dockerfile
+│   │   └── src/main.odin
 │   └── server
 │       ├── Dockerfile
 │       └── src/
@@ -324,16 +341,16 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `server5-1`: `0.42 CPU`, `150MB`
-- `server5-2`: `0.42 CPU`, `150MB`
-- `lb5`: `0.16 CPU`, `50MB`
+- `server6-1`: `0.42 CPU`, `150MB`
+- `server6-2`: `0.42 CPU`, `150MB`
+- `lb6`: `0.16 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
 
 CPU pinning (`cpuset`) currently configured:
-- `lb5`: `"0"`
-- `server5-1`: `"1"`
-- `server5-2`: `"2"`
+- `lb6`: `"0"`
+- `server6-1`: `"1"`
+- `server6-2`: `"2"`
 
 ## 9. Environment Variables
 
@@ -345,9 +362,13 @@ CPU pinning (`cpuset`) currently configured:
 - `PORT` (default `9999`)
 - `WORKER_SOCKETS` (comma-separated Unix socket list)
 
-### Server5 (Benchmark Stub, C++)
-- `UNIX_SOCKET_PATH` (required)
-- Runtime model: C++ request/control flow with Unix socket FD passing (`SCM_RIGHTS`)
+### Load Balancer6 (Benchmark Stack, Odin)
+- `PORT` (default `9999`)
+- `BACKENDS` (required, comma-separated `host:port`, e.g. `server6-1:8081,server6-2:8082`)
+
+### Server6 (Benchmark Stub, Odin)
+- `PORT` (default `8081`/`8082` via compose)
+- Runtime model: direct TCP server used by `load-balancer6`
 
 ## 10. API Endpoints
 
@@ -404,7 +425,7 @@ curl -i http://localhost:9999/fraud-score \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb5:9999 \
+  -e BASE_URL=http://lb6:9999 \
   grafana/k6 run test/smoke.js
 ```
 
@@ -414,7 +435,7 @@ docker run --rm -i \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb5:9999 \
+  -e BASE_URL=http://lb6:9999 \
   grafana/k6 run test/test.js
 ```
 
@@ -429,8 +450,8 @@ This project enables AVX2 on `amd64` builds through the Makefile flags.
 For Docker buildx:
 
 ```bash
-docker buildx build --platform linux/amd64 -f apps/server5/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer5/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/server6/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/load-balancer6/Dockerfile .
 ```
 
 ## 13. Notes
