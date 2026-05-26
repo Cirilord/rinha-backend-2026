@@ -1,6 +1,6 @@
 services:
   # api1:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-afcd2ae94198a74262d435a37e2900957591e41d
   #   environment:
   #     UNIX_SOCKET_PATH: "/shared/api1.sock"
   #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -19,7 +19,7 @@ services:
   #         memory: "150MB"
   #
   # api2:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  #   image: ghcr.io/cirilord/rinha-backend-2026-api:sha-afcd2ae94198a74262d435a37e2900957591e41d
   #   environment:
   #     UNIX_SOCKET_PATH: "/shared/api2.sock"
   #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -38,7 +38,7 @@ services:
   #         memory: "150MB"
   #
   # load-balancer:
-  #   image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  #   image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-afcd2ae94198a74262d435a37e2900957591e41d
   #   ports:
   #     - "9999:9999"
   #   environment:
@@ -61,11 +61,11 @@ services:
   #         cpus: "0.12"
   #         memory: "50MB"
 
-  server7-1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  server3-1:
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-afcd2ae94198a74262d435a37e2900957591e41d
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server7-1.sock"
+      UNIX_SOCKET_PATH: "/shared/server3-1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
@@ -82,11 +82,11 @@ services:
           cpus: "0.42"
           memory: "150MB"
 
-  server7-2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  server3-2:
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-afcd2ae94198a74262d435a37e2900957591e41d
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server7-2.sock"
+      UNIX_SOCKET_PATH: "/shared/server3-2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
@@ -103,14 +103,14 @@ services:
           cpus: "0.42"
           memory: "150MB"
 
-  lb7:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-ac028d1c3bf3a4442903d475d8caf5260d152819
+  lb3:
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-afcd2ae94198a74262d435a37e2900957591e41d
     platform: linux/amd64
     ports:
       - "9999:9999"
     environment:
       PORT: "9999"
-      WORKER_SOCKETS: "/shared/server7-1.sock,/shared/server7-2.sock"
+      WORKER_SOCKETS: "/shared/server3-1.sock,/shared/server3-2.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -119,8 +119,8 @@ services:
         hard: 65535
     cpuset: "0"
     depends_on:
-      - server7-1
-      - server7-2
+      - server3-1
+      - server3-2
     networks:
       - rinha
     deploy:
