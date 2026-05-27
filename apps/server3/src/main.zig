@@ -1,9 +1,14 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const detector_mod = @import("x-score.zig");
+const responses = @import("responses.zig");
+const tx = @import("transaction_context.zig");
 
 const MAX_REQUEST_SIZE = 64 * 1024;
 const SCM_RIGHTS: i32 = 1;
+const REQ_GET_READY = "GET /ready ";
+const REQ_POST_FRAUD_SCORE = "POST /fraud-score ";
 
 const Cmsghdr = extern struct {
     cmsg_len: usize,
@@ -16,13 +21,10 @@ const CMSG_HDR_LEN = cmsgAlign(@sizeOf(Cmsghdr));
 const CMSG_LEN_FD = CMSG_HDR_LEN + FD_SIZE;
 const CMSG_SPACE_FD = CMSG_HDR_LEN + cmsgAlign(FD_SIZE);
 
-const RESPONSE_OK =
-    "HTTP/1.1 200 OK\r\n" ++
-    "Content-Type: application/json\r\n" ++
-    "Connection: close\r\n" ++
-    "Content-Length: 18\r\n" ++
-    "\r\n" ++
-    "{\"approved\":false}";
+const HttpRequestView = struct {
+    body_offset: usize = 0,
+    body_len: usize = 0,
+};
 
 const ReadState = struct {
     used: usize = 0,
@@ -32,6 +34,12 @@ const ReadState = struct {
     expected_total: usize = 0,
     headers_done: bool = false,
     content_length_seen: bool = false,
+};
+
+const ConsumeResult = enum(i8) {
+    fail = -1,
+    need_more = 0,
+    complete = 1,
 };
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
@@ -68,16 +76,17 @@ fn parseContentLength(line: []const u8) ?usize {
     return value;
 }
 
-fn consumeRead(state: *ReadState, buf: []const u8) i32 {
+fn consumeRead(state: *ReadState, view: *HttpRequestView, buf: []const u8) ConsumeResult {
     if (!state.headers_done) {
         while ((state.scan_pos + 1) < state.used) {
             if (buf[state.scan_pos] == '\r' and buf[state.scan_pos + 1] == '\n') {
                 const line_len = state.scan_pos - state.line_start;
                 if (line_len == 0) {
                     state.headers_done = true;
-                    const body_offset = state.scan_pos + 2;
-                    state.expected_total = body_offset + state.content_length;
-                    if (state.expected_total > buf.len) return -1;
+                    view.body_offset = state.scan_pos + 2;
+                    view.body_len = state.content_length;
+                    state.expected_total = view.body_offset + state.content_length;
+                    if (state.expected_total > buf.len) return .fail;
                     state.scan_pos += 2;
                     break;
                 }
@@ -99,18 +108,19 @@ fn consumeRead(state: *ReadState, buf: []const u8) i32 {
     }
 
     if (state.headers_done and state.used >= state.expected_total) {
-        return 1;
+        return .complete;
     }
 
     if (state.used + 1 >= buf.len) {
-        return -1;
+        return .fail;
     }
 
-    return 0;
+    return .need_more;
 }
 
-fn readFullRequest(client_fd: posix.socket_t, buffer: *[MAX_REQUEST_SIZE]u8) ?[]const u8 {
+fn readFullRequest(client_fd: posix.socket_t, buffer: *[MAX_REQUEST_SIZE]u8, out_view: *HttpRequestView) ?[]const u8 {
     var state: ReadState = .{};
+    out_view.* = .{};
 
     while (true) {
         const n = posix.recv(client_fd, buffer[state.used .. buffer.len - 1], 0) catch return null;
@@ -119,9 +129,9 @@ fn readFullRequest(client_fd: posix.socket_t, buffer: *[MAX_REQUEST_SIZE]u8) ?[]
         state.used += n;
         buffer[state.used] = 0;
 
-        const step = consumeRead(&state, buffer[0..]);
-        if (step < 0) return null;
-        if (step > 0) {
+        const step = consumeRead(&state, out_view, buffer[0..]);
+        if (step == .fail) return null;
+        if (step == .complete) {
             return buffer[0..state.expected_total];
         }
     }
@@ -194,24 +204,70 @@ fn recvPassedFd(control_fd: posix.socket_t) ?posix.fd_t {
     return client_fd;
 }
 
-fn serveControlConnection(control_fd: posix.socket_t) void {
+fn warmUp(detector: *const detector_mod.Detector) void {
+    const warmup_body =
+        "{\"id\":\"tx-warmup\"," ++
+        "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":\"2026-03-11T20:23:35Z\"}," ++
+        "\"customer\":{\"avg_amount\":769.76,\"tx_count_24h\":3,\"known_merchants\":[\"MERC-009\",\"MERC-001\",\"MERC-001\"]}," ++
+        "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"5912\",\"avg_amount\":298.95}," ++
+        "\"terminal\":{\"is_online\":false,\"card_present\":true,\"km_from_home\":13.7090520965}," ++
+        "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_current\":18.8626479774}}";
+
+    const ctx = tx.TransactionContext.fromBody(warmup_body) orelse return;
+    var vector: [14]f64 = undefined;
+    ctx.toVector(&vector);
+
+    var warmup_sink: u8 = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        warmup_sink ^= detector.predictFraudCount(&vector);
+    }
+    std.mem.doNotOptimizeAway(warmup_sink);
+}
+
+fn serveControlConnection(control_fd: posix.socket_t, detector: *const detector_mod.Detector) void {
     defer posix.close(control_fd);
 
     while (true) {
         const client_fd = recvPassedFd(control_fd) orelse break;
-        handleClient(client_fd);
+        handleClient(client_fd, detector);
     }
 }
 
-fn handleClient(client_fd: posix.socket_t) void {
+fn handleClient(client_fd: posix.socket_t, detector: *const detector_mod.Detector) void {
     defer posix.close(client_fd);
 
     var request_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-    if (readFullRequest(client_fd, &request_buf) == null) {
+    var req_view: HttpRequestView = .{};
+    const request = readFullRequest(client_fd, &request_buf, &req_view) orelse return;
+
+    if (std.mem.startsWith(u8, request, REQ_GET_READY)) {
+        _ = sendAll(client_fd, responses.response_ready.data);
         return;
     }
 
-    _ = sendAll(client_fd, RESPONSE_OK);
+    if (std.mem.startsWith(u8, request, REQ_POST_FRAUD_SCORE)) {
+        if (req_view.body_offset > request.len or req_view.body_len > (request.len - req_view.body_offset)) {
+            _ = sendAll(client_fd, responses.response_not_found.data);
+            return;
+        }
+
+        const body = request[req_view.body_offset .. req_view.body_offset + req_view.body_len];
+        const ctx = tx.TransactionContext.fromBody(body) orelse {
+            _ = sendAll(client_fd, responses.response_bad_request.data);
+            return;
+        };
+
+        var vector: [14]f64 = undefined;
+        ctx.toVector(&vector);
+
+        const fraud_count = detector.predictFraudCount(&vector);
+        const resp = responses.fraudResponseByCount(fraud_count);
+        _ = sendAll(client_fd, resp.data);
+        return;
+    }
+
+    _ = sendAll(client_fd, responses.response_not_found.data);
 }
 
 pub fn main() u8 {
@@ -224,6 +280,22 @@ pub fn main() u8 {
         logErr("UNIX_SOCKET_PATH is required and cannot be empty\n", .{});
         return 1;
     }
+
+    const xscore_path_z = posix.getenv("X_SCORE_INDEX_PATH") orelse {
+        logErr("X_SCORE_INDEX_PATH is required and cannot be empty\n", .{});
+        return 1;
+    };
+    if (xscore_path_z.len == 0) {
+        logErr("X_SCORE_INDEX_PATH is required and cannot be empty\n", .{});
+        return 1;
+    }
+
+    var detector = detector_mod.Detector.open(std.heap.c_allocator, xscore_path_z) catch {
+        logErr("failed to load x-score index from {s}\n", .{xscore_path_z});
+        return 1;
+    };
+    defer detector.close();
+    warmUp(&detector);
 
     posix.unlink(path_z) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -247,6 +319,6 @@ pub fn main() u8 {
             }
         };
 
-        serveControlConnection(control_fd);
+        serveControlConnection(control_fd, &detector);
     }
 }

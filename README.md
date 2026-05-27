@@ -42,11 +42,14 @@ High-performance implementation for **Rinha de Backend 2026**, using:
   - Receive forwarded client FDs from the LB
   - Parse HTTP request and return scoring result
 - `server3-1`, `server3-2` (benchmark stack, Zig)
-  - Minimal FD-passing workers used to isolate LB overhead in load tests
   - Unix control socket receiver (`recvmsg + SCM_RIGHTS`) compatible with `lb3`
   - Persistent control-session loop (accept control connection, receive client FDs, respond)
-  - Parses request headers/body boundary (`Content-Length`) before responding
-  - Return a fixed JSON response (`{"approved":false}`)
+  - Parses request headers/body boundary (`Content-Length`)
+  - Implements full fraud-score flow in Zig:
+    - `transaction_context` parse and vectorization
+    - `detector` load/predict from `references.idx` with partition pruning and branch-and-bound
+    - SIMD block distance accumulation (portable Zig vectors with scalar fallback)
+    - static HTTP responses equivalent to C server (`/ready`, `/fraud-score`, errors)
 - `server5-1`, `server5-2` (benchmark stack, C++)
   - C++ implementation:
     - control socket loop
@@ -291,7 +294,11 @@ python3 scripts/tune_partition_cutoffs.py \
 │   │   └── src/main.odin
 │   ├── server3
 │   │   ├── Dockerfile
-│   │   └── src/main.zig
+│   │   └── src/
+│   │       ├── main.zig
+│   │       ├── x-score.zig
+│   │       ├── responses.zig
+│   │       └── transaction_context.zig
 │   ├── server4
 │   │   ├── Dockerfile
 │   │   └── src/main.rs

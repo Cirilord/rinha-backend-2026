@@ -79,7 +79,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.41"
           memory: "150MB"
 
   server3-2:
@@ -100,7 +100,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.41"
           memory: "150MB"
 
   lb3:
@@ -126,7 +126,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.16"
+          cpus: "0.18"
           memory: "50MB"
 
 networks:
