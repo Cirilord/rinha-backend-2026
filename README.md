@@ -6,6 +6,10 @@ High-performance implementation for **Rinha de Backend 2026**, using:
 - Unix socket FD passing (`SCM_RIGHTS`) between LB and APIs
 - a prebuilt binary index for fraud scoring
 
+Current default stack in `docker-compose.yml` and `docker-compose.submission.yml`:
+- `apps/load-balancer2`
+- `apps/server2`
+
 ## 1. Architecture
 
 ### Services
@@ -349,16 +353,16 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `server6-1`: `0.42 CPU`, `150MB`
-- `server6-2`: `0.42 CPU`, `150MB`
-- `lb6`: `0.16 CPU`, `50MB`
+- `api1`: `0.44 CPU`, `150MB`
+- `api2`: `0.44 CPU`, `150MB`
+- `load-balancer`: `0.12 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
 
 CPU pinning (`cpuset`) currently configured:
-- `lb6`: `"0"`
-- `server6-1`: `"1"`
-- `server6-2`: `"2"`
+- `load-balancer`: `"0"`
+- `api1`: `"1"`
+- `api2`: `"2"`
 
 ## 9. Environment Variables
 
@@ -433,7 +437,7 @@ curl -i http://localhost:9999/fraud-score \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb6:9999 \
+  -e BASE_URL=http://load-balancer:9999 \
   grafana/k6 run test/smoke.js
 ```
 
@@ -443,7 +447,7 @@ docker run --rm -i \
 docker run --rm -i \
   --network rinha-backend_rinha \
   -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://lb6:9999 \
+  -e BASE_URL=http://load-balancer:9999 \
   grafana/k6 run test/test.js
 ```
 
@@ -458,8 +462,8 @@ This project enables AVX2 on `amd64` builds through the Makefile flags.
 For Docker buildx:
 
 ```bash
-docker buildx build --platform linux/amd64 -f apps/server6/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer6/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/server2/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/load-balancer2/Dockerfile .
 ```
 
 ## 13. Notes

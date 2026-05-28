@@ -1,80 +1,11 @@
 services:
-  # api1:
-  #   build:
-  #     context: .
-  #     dockerfile: ./apps/server/Dockerfile
-  #   environment:
-  #     UNIX_SOCKET_PATH: "/shared/api1.sock"
-  #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
-  #   volumes:
-  #     - shared-sockets:/shared
-  #   ulimits:
-  #     nofile:
-  #       soft: 65535
-  #       hard: 65535
-  #   networks:
-  #     - rinha
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: "0.44"
-  #         memory: "150MB"
-  #
-  # api2:
-  #   build:
-  #     context: .
-  #     dockerfile: ./apps/server/Dockerfile
-  #   environment:
-  #     UNIX_SOCKET_PATH: "/shared/api2.sock"
-  #     X_SCORE_INDEX_PATH: "/app/resources/references.idx"
-  #   volumes:
-  #     - shared-sockets:/shared
-  #   ulimits:
-  #     nofile:
-  #       soft: 65535
-  #       hard: 65535
-  #   networks:
-  #     - rinha
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: "0.44"
-  #         memory: "150MB"
-  #
-  # load-balancer:
-  #   build:
-  #     context: .
-  #     dockerfile: ./apps/load-balancer/Dockerfile
-  #   ports:
-  #     - "9999:9999"
-  #   environment:
-  #     PORT: "9999"
-  #     WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
-  #   volumes:
-  #     - shared-sockets:/shared
-  #   ulimits:
-  #     nofile:
-  #       soft: 65535
-  #       hard: 65535
-  #   depends_on:
-  #     - api1
-  #     - api2
-  #   networks:
-  #     - rinha
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: "0.12"
-  #         memory: "50MB"
-
-  server3-1:
+  api1:
     build:
       context: .
-      dockerfile: ./apps/server3/Dockerfile
+      dockerfile: ./apps/server2/Dockerfile
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server3-1.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
+      UNIX_SOCKET_PATH: "/shared/api1.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -90,14 +21,13 @@ services:
           cpus: "0.41"
           memory: "150MB"
 
-  server3-2:
+  api2:
     build:
       context: .
-      dockerfile: ./apps/server3/Dockerfile
+      dockerfile: ./apps/server2/Dockerfile
     platform: linux/amd64
     environment:
-      UNIX_SOCKET_PATH: "/shared/server3-2.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
+      UNIX_SOCKET_PATH: "/shared/api2.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -113,16 +43,16 @@ services:
           cpus: "0.41"
           memory: "150MB"
 
-  lb3:
+  load-balancer:
     build:
       context: .
-      dockerfile: ./apps/load-balancer3/Dockerfile
+      dockerfile: ./apps/load-balancer2/Dockerfile
     platform: linux/amd64
     ports:
       - "9999:9999"
     environment:
       PORT: "9999"
-      WORKER_SOCKETS: "/shared/server3-1.sock,/shared/server3-2.sock"
+      WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -131,8 +61,8 @@ services:
         hard: 65535
     cpuset: "0"
     depends_on:
-      - server3-1
-      - server3-2
+      - api1
+      - api2
     networks:
       - rinha
     deploy:
