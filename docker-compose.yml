@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-abf0d55163b35794850c701a16ebebaa5c89f21d
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
@@ -21,7 +21,7 @@ services:
           memory: "144MB"
 
   api2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-abf0d55163b35794850c701a16ebebaa5c89f21d
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
@@ -42,7 +42,7 @@ services:
           memory: "144MB"
 
   load-balancer:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-abf0d55163b35794850c701a16ebebaa5c89f21d
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
     platform: linux/amd64
     ports:
       - "9999:9999"
@@ -70,6 +70,8 @@ services:
   warmup:
     image: curlimages/curl:8.8.0
     platform: linux/amd64
+    profiles:
+      - warmup
     entrypoint: ["/bin/sh", "/warmup.sh"]
     environment:
       BASE_URL: "http://load-balancer:9999"
