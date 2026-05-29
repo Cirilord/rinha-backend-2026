@@ -1,10 +1,9 @@
 services:
   api1:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-16f59107f6c2edd990dfaf7dede2a07a72a89838
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -17,15 +16,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "144MB"
+          cpus: "0.41"
+          memory: "150MB"
 
   api2:
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-16f59107f6c2edd990dfaf7dede2a07a72a89838
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -38,11 +36,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "144MB"
+          cpus: "0.41"
+          memory: "150MB"
 
   load-balancer:
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-2910da7a085e8c06c418bc0d55eb76a0f6992cd1
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-16f59107f6c2edd990dfaf7dede2a07a72a89838
     platform: linux/amd64
     ports:
       - "9999:9999"
@@ -66,30 +64,6 @@ services:
         limits:
           cpus: "0.18"
           memory: "50MB"
-
-  warmup:
-    image: curlimages/curl:8.8.0
-    platform: linux/amd64
-    profiles:
-      - warmup
-    entrypoint: ["/bin/sh", "/warmup.sh"]
-    environment:
-      BASE_URL: "http://load-balancer:9999"
-      READY_RETRIES: "240"
-      READY_SLEEP: "0.25"
-      WARMUP_ROUNDS: "48"
-    volumes:
-      - ./scripts/warmup.sh:/warmup.sh:ro
-    depends_on:
-      - load-balancer
-    networks:
-      - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.02"
-          memory: "12MB"
-    restart: "no"
 
 networks:
   rinha:
