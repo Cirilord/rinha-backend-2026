@@ -3,7 +3,6 @@ services:
     build:
       context: .
       dockerfile: ./apps/server/Dockerfile
-    platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -26,7 +25,6 @@ services:
     build:
       context: .
       dockerfile: ./apps/server/Dockerfile
-    platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
@@ -49,7 +47,6 @@ services:
     build:
       context: .
       dockerfile: ./apps/load-balancer/Dockerfile
-    platform: linux/amd64
     ports:
       - "9999:9999"
     environment:
