@@ -43,7 +43,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/server2/Dockerfile
+          file: apps/server/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
@@ -54,7 +54,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/load-balancer2/Dockerfile
+          file: apps/load-balancer/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |

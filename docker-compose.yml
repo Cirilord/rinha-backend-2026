@@ -2,10 +2,11 @@ services:
   api1:
     build:
       context: .
-      dockerfile: ./apps/server2/Dockerfile
+      dockerfile: ./apps/server/Dockerfile
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api1.sock"
+      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -24,10 +25,11 @@ services:
   api2:
     build:
       context: .
-      dockerfile: ./apps/server2/Dockerfile
+      dockerfile: ./apps/server/Dockerfile
     platform: linux/amd64
     environment:
       UNIX_SOCKET_PATH: "/shared/api2.sock"
+      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
     ulimits:
@@ -46,7 +48,7 @@ services:
   load-balancer:
     build:
       context: .
-      dockerfile: ./apps/load-balancer2/Dockerfile
+      dockerfile: ./apps/load-balancer/Dockerfile
     platform: linux/amd64
     ports:
       - "9999:9999"

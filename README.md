@@ -7,8 +7,8 @@ High-performance implementation for **Rinha de Backend 2026**, using:
 - a prebuilt binary index for fraud scoring
 
 Current default stack in `docker-compose.yml` and `docker-compose.submission.yml`:
-- `apps/load-balancer2`
-- `apps/server2`
+- `apps/load-balancer`
+- `apps/server`
 
 ## 1. Architecture
 
@@ -462,8 +462,8 @@ This project enables AVX2 on `amd64` builds through the Makefile flags.
 For Docker buildx:
 
 ```bash
-docker buildx build --platform linux/amd64 -f apps/server2/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer2/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/server/Dockerfile .
+docker buildx build --platform linux/amd64 -f apps/load-balancer/Dockerfile .
 ```
 
 ## 13. Notes
