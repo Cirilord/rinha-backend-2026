@@ -1,69 +1,22 @@
 # rinha-backend
 
-High-performance implementation for **Rinha de Backend 2026**, using:
+High-performance C implementation for **Rinha de Backend 2026**, using:
 - a custom TCP load balancer
 - two API instances
 - Unix socket FD passing (`SCM_RIGHTS`) between LB and APIs
 - a prebuilt binary index for fraud scoring
 
-Current default stack in `docker-compose.yml` and `docker-compose.submission.yml`:
-- `apps/load-balancer`
-- `apps/server`
-
 ## 1. Architecture
 
 ### Services
 - `load-balancer`
-  - Event-loop backend by platform:
-    - Linux: `epoll`
-    - macOS: `kqueue`
-  - Parses `PORT` and `WORKER_SOCKETS` env vars
-  - Enables `SO_KEEPALIVE` on accepted client TCP sockets
-  - Dispatches accepted client FDs to workers via Unix sockets + `SCM_RIGHTS` (round-robin)
-- `load-balancer2` (experimental)
-  - Reference/parallel implementation used for iteration
-- `load-balancer3` (experimental, Zig)
-  - Parses `PORT` and `WORKER_SOCKETS` env vars
-  - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
-  - Persistent worker control sockets with reconnect-on-failure
-  - Round-robin worker selection
-- `load-balancer5` (experimental, C++)
-  - C++ implementation:
-    - worker/port env parsing
-    - round-robin and dispatch decisions
-  - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
-  - Persistent worker control sockets with reconnect-on-failure
-  - Round-robin worker selection
-- `load-balancer6` (experimental, Odin)
-  - Parses `PORT` and `BACKENDS` env vars
-  - Accepts TCP clients and proxies requests to backend TCP servers
-  - Per-connection backend retry across configured targets
-  - Response relay from backend to client
+  - Listens on `:9999`
+  - Accepts TCP connections
+  - Forwards accepted client FDs to API instances via `sendmsg(..., SCM_RIGHTS)`
 - `api1`, `api2`
   - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
   - Receive forwarded client FDs from the LB
   - Parse HTTP request and return scoring result
-- `server3-1`, `server3-2` (benchmark stack, Zig)
-  - Unix control socket receiver (`recvmsg + SCM_RIGHTS`) compatible with `lb3`
-  - Persistent control-session loop (accept control connection, receive client FDs, respond)
-  - Parses request headers/body boundary (`Content-Length`)
-  - Implements full fraud-score flow in Zig:
-    - `transaction_context` parse and vectorization
-    - `detector` load/predict from `references.idx` with partition pruning and branch-and-bound
-    - SIMD block distance accumulation (portable Zig vectors with scalar fallback)
-    - static HTTP responses equivalent to C server (`/ready`, `/fraud-score`, errors)
-- `server5-1`, `server5-2` (benchmark stack, C++)
-  - C++ implementation:
-    - control socket loop
-    - request completeness parser (`Content-Length` / headers-body boundary)
-  - Receives forwarded client FDs via `SCM_RIGHTS`
-  - Parses request headers/body boundary (`Content-Length`) before responding
-  - Return a fixed JSON response (`{"approved":false}`)
-- `server6-1`, `server6-2` (benchmark stack, Odin)
-  - Odin implementation:
-    - TCP listener + request completeness parser (`Content-Length`)
-  - Responds with fixed JSON payload (`{"approved":false}`)
-  - Used with `load-balancer6` via TCP backends
 
 ### FD Passing Flow
 1. LB accepts TCP client.
@@ -72,36 +25,29 @@ Current default stack in `docker-compose.yml` and `docker-compose.submission.yml
 4. API writes HTTP response to same FD and closes it.
 
 This avoids extra TCP hops between LB and API.
-`load-balancer6`/`server6` is a separate benchmark stack using TCP proxying between LB and workers.
 
 ## 2. Strategy Used in Each App
 
 ### `apps/load-balancer`
-- **Modular C implementation** (`main.c`, `envs.c`, `server.c`).
-- **Environment parsing** for `PORT` and `WORKER_SOCKETS` (strict validation).
-- **Cross-platform event loop**:
-  - Linux: `epoll`
-  - macOS: `kqueue`
-- **FD passing via Unix sockets** (`sendmsg + SCM_RIGHTS`) with round-robin worker selection.
-- **Persistent worker control sockets** with reconnect-on-failure.
-- **Non-blocking accept drain** per wakeup for burst handling.
-- **SO_KEEPALIVE** enabled on accepted client sockets.
+- **Round-robin dispatch** across API Unix sockets.
+- **Persistent control sockets** to APIs (reconnect only on failure).
+- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` with C fallback on other targets.
+- **Non-blocking listener + accept drain loop**: accepts until `EAGAIN` per wakeup to reduce burst overhead.
+- **Small hot path**: accept -> select upstream -> send FD -> close client FD in LB process.
+- **Minimal dependencies** (single C binary).
 
 ### `apps/server`
-- **epoll-based control-channel multiplexing** (`MAX_CTRL_CONNS`) so one API process can handle multiple LB control connections.
-- **non-blocking control sockets** for FD passing intake (`recvmsg + SCM_RIGHTS` drain loop).
-- **client FD normalization**: clears `O_NONBLOCK` on forwarded client FDs before request parsing to avoid premature `EAGAIN`/EOF drops.
-- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `recvmsg(SCM_RIGHTS)` with C fallback on other targets.
+- **poll-based control-channel multiplexing** (`MAX_CTRL_CONNS`) so one API process can handle multiple LB control connections.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
   - `POST /fraud-score`
-  - fixed-format request-line matching
-  - single-pass header parsing that extracts `Content-Length` and body offset directly (no extra body scan)
+  - fixed-format request-line matching with a single header-boundary scan
+- **Fast body extraction with known request length** (`get_body(..., request_len, ...)`) to avoid extra scans.
 - **Warm-up phase** at startup to reduce first-request latency variance:
   - touches parser/vector path
-  - touches detector index pages
+  - touches x-score pages
 
-### Scoring (`apps/server/src/detector.c`)
+### Scoring (`apps/server/src/x-score.c`)
 - Uses quantized vectors and top-k nearest-neighbor style lookup.
 - Builds partition-key lookup tables once at index-open time to accelerate same-key candidate selection.
 - Includes **early pruning / early-exit**:
@@ -117,9 +63,9 @@ This avoids extra TCP hops between LB and API.
 - Query SIMD constants are pre-expanded once per request.
 - Distance accumulation uses chunked 32-bit partial sums widened to 64-bit.
 
-## 3. Vector Search Details (detector)
+## 3. Vector Search Details (x-score)
 
-This section describes the vector search strategy used in `apps/server/src/detector.c`.
+This section describes the vector search strategy used in `apps/server/src/x-score.c`.
 
 ### Concepts Used (Names)
 
@@ -193,13 +139,8 @@ Targets:
 - `make clean`
 
 Architecture-aware flags (`TARGETARCH`):
-- `server`:
-  - `amd64`: `-O3` globally + `-mavx2 -mfma -march=haswell`, plus `-fno-plt`
-  - `detector.c`: compiled with `-O2` (same SIMD arch flags) to reduce hot-path code bloat from aggressive inlining, plus `-fno-plt`
-  - `arm64`: `-O3` globally and `detector.c` with `-O2` (without AVX2/FMA flags), plus `-fno-plt`
-- `load-balancer`:
-  - `amd64`: `-O3` without AVX2/FMA flags to avoid AVX state-transition overhead (`vzeroupper`) in the LB hot path, plus `-fno-plt`
-  - `arm64`: `-O3` plus `-fno-plt`
+- `amd64`: adds `-mavx2 -mfma -march=haswell`
+- `arm64`: no AVX2 flags
 
 Examples:
 
@@ -282,38 +223,7 @@ python3 scripts/tune_partition_cutoffs.py \
 ├── apps
 │   ├── load-balancer
 │   │   ├── Dockerfile
-│   │   └── src/
-│   ├── load-balancer2
-│   │   ├── Dockerfile
-│   │   └── src/
-│   ├── load-balancer3
-│   │   ├── Dockerfile
-│   │   └── src/main.zig
-│   ├── load-balancer4
-│   │   ├── Dockerfile
-│   │   └── src/main.rs
-│   ├── load-balancer5
-│   │   ├── Dockerfile
-│   │   └── src/main.cpp
-│   ├── load-balancer6
-│   │   ├── Dockerfile
-│   │   └── src/main.odin
-│   ├── server3
-│   │   ├── Dockerfile
-│   │   └── src/
-│   │       ├── main.zig
-│   │       ├── x-score.zig
-│   │       ├── responses.zig
-│   │       └── transaction_context.zig
-│   ├── server4
-│   │   ├── Dockerfile
-│   │   └── src/main.rs
-│   ├── server5
-│   │   ├── Dockerfile
-│   │   └── src/main.cpp
-│   ├── server6
-│   │   ├── Dockerfile
-│   │   └── src/main.odin
+│   │   └── src/main.c
 │   └── server
 │       ├── Dockerfile
 │       └── src/
@@ -355,16 +265,11 @@ docker compose logs -f
 ## 8. Resource Limits (Rinha Budget)
 
 Configured in `docker-compose.yml`:
-- `api1`: `0.44 CPU`, `150MB`
-- `api2`: `0.44 CPU`, `150MB`
-- `load-balancer`: `0.12 CPU`, `50MB`
+- `api1`: `0.47 CPU`, `150MB`
+- `api2`: `0.47 CPU`, `150MB`
+- `load-balancer`: `0.06 CPU`, `50MB`
 
 Total: **1.00 CPU / 350MB**.
-
-CPU pinning (`cpuset`) currently configured:
-- `load-balancer`: `"0"`
-- `api1`: `"1"`
-- `api2`: `"2"`
 
 ## 9. Environment Variables
 
@@ -373,16 +278,8 @@ CPU pinning (`cpuset`) currently configured:
 - `X_SCORE_INDEX_PATH` (required)
 
 ### Load Balancer
-- `PORT` (required by binary; provided in compose as `9999`)
-- `WORKER_SOCKETS` (required, comma-separated Unix socket list)
-
-### Load Balancer6 (Benchmark Stack, Odin)
 - `PORT` (default `9999`)
-- `BACKENDS` (required, comma-separated `host:port`, e.g. `server6-1:8081,server6-2:8082`)
-
-### Server6 (Benchmark Stub, Odin)
-- `PORT` (default `8081`/`8082` via compose)
-- Runtime model: direct TCP server used by `load-balancer6`
+- `WORKER_SOCKETS` (comma-separated Unix socket list)
 
 ## 10. API Endpoints
 

@@ -12,13 +12,12 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-    cpuset: "1"
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.41"
+          cpus: "0.40"
           memory: "150MB"
 
   api2:
@@ -34,13 +33,12 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-    cpuset: "2"
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.41"
+          cpus: "0.40"
           memory: "150MB"
 
   load-balancer:
@@ -58,7 +56,6 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-    cpuset: "0"
     depends_on:
       - api1
       - api2
@@ -67,7 +64,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.18"
+          cpus: "0.20"
           memory: "50MB"
 
 networks:
@@ -80,4 +77,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: size=4m,mode=0777
+      o: size=10m

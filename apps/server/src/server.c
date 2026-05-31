@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -35,115 +36,133 @@ int create_unix_server(const char *path) {
   return fd;
 }
 
-static bool parse_content_length(const char *line, size_t line_len, size_t *out_content_len) {
-  static const char key[] = "Content-Length:";
-  const size_t key_len = sizeof(key) - 1;
+static const char *find_headers_end(const char *buf) { return strstr(buf, "\r\n\r\n"); }
 
-  if (line_len < key_len) {
-    return false;
-  }
-
-  for (size_t i = 0; i < key_len; i++) {
-    if (line[i] != key[i]) {
-      return false;
+static size_t parse_content_length(const char *buf) {
+  const char *p = strstr(buf, "\r\nContent-Length:");
+  if (p == NULL) {
+    if (strncmp(buf, "Content-Length:", 15) == 0) {
+      p = buf - 2;
+    } else {
+      return 0;
     }
   }
-
-  size_t i = key_len;
-  while (i < line_len && (line[i] == ' ' || line[i] == '\t')) {
-    i++;
+  p += 17;
+  while (*p == ' ') {
+    p++;
   }
-  if (i == line_len) {
-    return false;
-  }
-
-  size_t value = 0;
-  bool has_digits = false;
-  for (; i < line_len; i++) {
-    const unsigned char c = (unsigned char)line[i];
-    if (c < '0' || c > '9') {
-      return false;
-    }
-    has_digits = true;
-    const size_t digit = (size_t)(c - '0');
-    if (value > ((size_t)-1 - digit) / 10) {
-      return false;
-    }
-    value = (value * 10) + digit;
-  }
-
-  if (!has_digits) {
-    return false;
-  }
-
-  *out_content_len = value;
-  return true;
+  return (size_t)strtoul(p, NULL, 10);
 }
 
-ssize_t read_http_request(int fd, char *buf, size_t cap, HttpRequestView *out_view) {
-  if (cap == 0 || out_view == NULL) {
+ssize_t read_http_request(int fd, char *buf, size_t cap) {
+  size_t used = 0;
+  bool headers_done = false;
+  size_t expected_total = 0;
+
+  if (cap == 0) {
     return -1;
   }
-
-  out_view->body_offset = 0;
-  out_view->body_len = 0;
-
-  size_t used = 0;
-  size_t scan_pos = 0;
-  size_t line_start = 0;
-  size_t content_length = 0;
-  size_t expected_total = 0;
-  bool headers_done = false;
-  bool content_length_seen = false;
 
   while (used + 1 < cap) {
     ssize_t n = read(fd, buf + used, cap - used - 1);
     if (n <= 0) {
       return (used > 0) ? (ssize_t)used : -1;
     }
-
     used += (size_t)n;
     buf[used] = '\0';
 
     if (!headers_done) {
-      while ((scan_pos + 1) < used) {
-        if (buf[scan_pos] == '\r' && buf[scan_pos + 1] == '\n') {
-          const size_t line_len = scan_pos - line_start;
-
-          if (line_len == 0) {
-            headers_done = true;
-            out_view->body_offset = scan_pos + 2;
-            out_view->body_len = content_length;
-            expected_total = out_view->body_offset + content_length;
-            if (expected_total + 1 > cap) {
-              return -1;
-            }
-            scan_pos += 2;
-            break;
-          }
-
-          if (!content_length_seen) {
-            size_t parsed = 0;
-            if (parse_content_length(buf + line_start, line_len, &parsed)) {
-              content_length = parsed;
-              content_length_seen = true;
-            }
-          }
-
-          scan_pos += 2;
-          line_start = scan_pos;
-          continue;
-        }
-
-        scan_pos++;
+      const char *headers_end = find_headers_end(buf);
+      if (headers_end == NULL) {
+        continue;
       }
-    }
-
-    if (headers_done && used >= expected_total) {
+      headers_done = true;
+      {
+        size_t headers_len = (size_t)(headers_end - buf) + 4;
+        size_t content_len = parse_content_length(buf);
+        expected_total = headers_len + content_len;
+        if (used >= expected_total) {
+          return (ssize_t)used;
+        }
+      }
+    } else if (used >= expected_total) {
       return (ssize_t)used;
     }
   }
 
   buf[cap - 1] = '\0';
   return (ssize_t)(cap - 1);
+}
+
+bool get_body(const char *request, size_t request_len, const char **out_body, size_t *out_len) {
+  const char *body_start = NULL;
+  const char *headers_end = NULL;
+
+  if (request == NULL || out_body == NULL || out_len == NULL) {
+    return false;
+  }
+
+  headers_end = strstr(request, "\r\n\r\n");
+  if (headers_end == NULL) {
+    return false;
+  }
+
+  body_start = headers_end + 4;
+  if ((size_t)(body_start - request) > request_len) {
+    return false;
+  }
+
+  *out_body = body_start;
+  *out_len = request_len - (size_t)(body_start - request);
+  return true;
+}
+
+bool get_method(const char *request, char *out, size_t out_size) {
+  if (request == NULL || out == NULL || out_size == 0) {
+    return false;
+  }
+
+  const char *method_end = strchr(request, ' ');
+  if (method_end == NULL) {
+    return false;
+  }
+
+  size_t method_len = (size_t)(method_end - request);
+  if (method_len == 0 || method_len + 1 > out_size) {
+    return false;
+  }
+
+  memcpy(out, request, method_len);
+  out[method_len] = '\0';
+  return true;
+}
+
+bool get_pathname(const char *request, char *out, size_t out_size) {
+  if (request == NULL || out == NULL || out_size == 0) {
+    return false;
+  }
+
+  const char *first_space = strchr(request, ' ');
+  if (first_space == NULL) {
+    return false;
+  }
+
+  const char *path_start = first_space + 1;
+  if (*path_start == '\0') {
+    return false;
+  }
+
+  const char *path_end = strchr(path_start, ' ');
+  if (path_end == NULL) {
+    return false;
+  }
+
+  size_t path_len = (size_t)(path_end - path_start);
+  if (path_len == 0 || path_len + 1 > out_size) {
+    return false;
+  }
+
+  memcpy(out, path_start, path_len);
+  out[path_len] = '\0';
+  return true;
 }
