@@ -14,16 +14,14 @@ Current default stack in `docker-compose.yml` and `docker-compose.submission.yml
 
 ### Services
 - `load-balancer`
-  - Listens on `:9999`
-  - Accepts TCP connections
-  - Forwards accepted client FDs to API instances via `sendmsg(..., SCM_RIGHTS)`
-- `load-balancer2` (experimental)
   - Event-loop backend by platform:
     - Linux: `epoll`
     - macOS: `kqueue`
   - Parses `PORT` and `WORKER_SOCKETS` env vars
   - Enables `SO_KEEPALIVE` on accepted client TCP sockets
   - Dispatches accepted client FDs to workers via Unix sockets + `SCM_RIGHTS` (round-robin)
+- `load-balancer2` (experimental)
+  - Reference/parallel implementation used for iteration
 - `load-balancer3` (experimental, Zig)
   - Parses `PORT` and `WORKER_SOCKETS` env vars
   - Accepts TCP clients and dispatches accepted FDs via `SCM_RIGHTS`
@@ -79,16 +77,20 @@ This avoids extra TCP hops between LB and API.
 ## 2. Strategy Used in Each App
 
 ### `apps/load-balancer`
-- **Round-robin dispatch** across API Unix sockets.
-- **Modulo-free round-robin hot path** (`wrap` with branch instead of `%`) to avoid integer division in the accept/forward loop.
-- **Persistent control sockets** to APIs (reconnect only on failure).
-- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` with C fallback on other targets.
-- **Non-blocking listener + accept drain loop**: accepts until `EAGAIN` per wakeup to reduce burst overhead.
-- **Small hot path**: accept -> select upstream -> send FD -> close client FD in LB process.
-- **Minimal dependencies** (single C binary).
+- **Modular C implementation** (`main.c`, `envs.c`, `server.c`).
+- **Environment parsing** for `PORT` and `WORKER_SOCKETS` (strict validation).
+- **Cross-platform event loop**:
+  - Linux: `epoll`
+  - macOS: `kqueue`
+- **FD passing via Unix sockets** (`sendmsg + SCM_RIGHTS`) with round-robin worker selection.
+- **Persistent worker control sockets** with reconnect-on-failure.
+- **Non-blocking accept drain** per wakeup for burst handling.
+- **SO_KEEPALIVE** enabled on accepted client sockets.
 
 ### `apps/server`
-- **poll-based control-channel multiplexing** (`MAX_CTRL_CONNS`) so one API process can handle multiple LB control connections.
+- **epoll-based control-channel multiplexing** (`MAX_CTRL_CONNS`) so one API process can handle multiple LB control connections.
+- **non-blocking control sockets** for FD passing intake (`recvmsg + SCM_RIGHTS` drain loop).
+- **client FD normalization**: clears `O_NONBLOCK` on forwarded client FDs before request parsing to avoid premature `EAGAIN`/EOF drops.
 - **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `recvmsg(SCM_RIGHTS)` with C fallback on other targets.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
@@ -280,7 +282,7 @@ python3 scripts/tune_partition_cutoffs.py \
 ├── apps
 │   ├── load-balancer
 │   │   ├── Dockerfile
-│   │   └── src/main.c
+│   │   └── src/
 │   ├── load-balancer2
 │   │   ├── Dockerfile
 │   │   └── src/
@@ -371,8 +373,8 @@ CPU pinning (`cpuset`) currently configured:
 - `X_SCORE_INDEX_PATH` (required)
 
 ### Load Balancer
-- `PORT` (default `9999`)
-- `WORKER_SOCKETS` (comma-separated Unix socket list)
+- `PORT` (required by binary; provided in compose as `9999`)
+- `WORKER_SOCKETS` (required, comma-separated Unix socket list)
 
 ### Load Balancer6 (Benchmark Stack, Odin)
 - `PORT` (default `9999`)

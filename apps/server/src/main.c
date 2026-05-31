@@ -1,7 +1,10 @@
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
-#include <poll.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -9,7 +12,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #if defined(__linux__)
+#include <sys/epoll.h>
 #include <sys/syscall.h>
+#else
+#error "apps/server requires Linux (epoll)"
 #endif
 #include <unistd.h>
 
@@ -27,13 +33,67 @@
 #endif
 
 static volatile sig_atomic_t keep_running = 1;
-enum { REQUEST_BUFFER_SIZE = 8192, MAX_CTRL_CONNS = 32 };
+enum { REQUEST_BUFFER_SIZE = 8192, MAX_CTRL_CONNS = 32, MAX_EVENTS = 128, WAIT_TIMEOUT_MS = 250 };
 static const char REQ_GET_READY[] = "GET /ready ";
 static const char REQ_POST_FRAUD_SCORE[] = "POST /fraud-score ";
+
+static int find_ctrl_fd(const int ctrl_fds[MAX_CTRL_CONNS], int ctrl_count, int fd) {
+  for (int i = 0; i < ctrl_count; i++) {
+    if (ctrl_fds[i] == fd) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void remove_ctrl_fd(int ctrl_fds[MAX_CTRL_CONNS], int *ctrl_count, int index) {
+  if (ctrl_count == NULL || index < 0 || index >= *ctrl_count) {
+    return;
+  }
+
+  int last = *ctrl_count - 1;
+  ctrl_fds[index] = ctrl_fds[last];
+  *ctrl_count = last;
+}
 
 static void on_signal(int signo) {
   (void)signo;
   keep_running = 0;
+}
+
+static int set_blocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+
+  if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int set_nonblocking_cloexec(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    return -1;
+  }
+
+  flags = fcntl(fd, F_GETFD, 0);
+  if (flags < 0) {
+    return -1;
+  }
+
+  if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+    return -1;
+  }
+
+  return 0;
 }
 
 static ssize_t recvmsg_fast(int unix_sock, struct msghdr *msg) {
@@ -64,7 +124,12 @@ static ssize_t recvmsg_fast(int unix_sock, struct msghdr *msg) {
 #endif
 }
 
-static int recv_fd(int unix_sock) {
+static int recv_fd_nonblocking(int unix_sock, int *out_client_fd) {
+  if (out_client_fd == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
 
@@ -81,18 +146,113 @@ static int recv_fd(int unix_sock) {
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
 
-  if (recvmsg_fast(unix_sock, &msg) <= 0) {
+  ssize_t got = recvmsg_fast(unix_sock, &msg);
+  if (got > 0) {
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+      errno = EBADMSG;
+      return -1;
+    }
+
+    int client_fd = -1;
+    memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(int));
+    *out_client_fd = client_fd;
+    return 1;
+  }
+
+  if (got == 0) {
     return -1;
   }
 
-  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-    return -1;
+  if (errno == EINTR) {
+    return 0;
   }
 
-  int client_fd = -1;
-  memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(int));
-  return client_fd;
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    return 0;
+  }
+
+  return -1;
+}
+
+static void handle_client_request(int client_fd, const DetectorIndexView *detector) {
+  (void)detector;
+
+  if (set_blocking(client_fd) < 0) {
+    close(client_fd);
+    return;
+  }
+
+  char request[REQUEST_BUFFER_SIZE];
+  HttpRequestView req_view;
+  ssize_t nread = read_http_request(client_fd, request, sizeof(request), &req_view);
+  if (nread <= 0) {
+    close(client_fd);
+    return;
+  }
+
+  request[nread] = '\0';
+
+  if (memcmp(request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
+    (void)write(client_fd, RESPONSE_READY.data, RESPONSE_READY.len);
+    close(client_fd);
+    return;
+  }
+
+  if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
+    if (req_view.body_offset > (size_t)nread ||
+        req_view.body_len > ((size_t)nread - req_view.body_offset)) {
+      (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
+      close(client_fd);
+      return;
+    }
+
+    const char *body = request + req_view.body_offset;
+    const size_t body_len = req_view.body_len;
+
+    TransactionContext ctx = transaction_context_from_body(body, body_len);
+    if (ctx.id[0] == '\0') {
+      ctx.destroy(&ctx);
+      (void)write(client_fd, RESPONSE_BAD_REQUEST.data, RESPONSE_BAD_REQUEST.len);
+      close(client_fd);
+      return;
+    }
+
+    double vector[14];
+    ctx.to_vector(&ctx, vector);
+    ctx.destroy(&ctx);
+
+    uint8_t fraud_count = detector_predict_fraud_count(detector, vector);
+    // uint8_t fraud_count = 0;
+    const Response *resp = &RESPONSE_FRAUD_10;
+    switch (fraud_count) {
+    case 0:
+      resp = &RESPONSE_FRAUD_00;
+      break;
+    case 1:
+      resp = &RESPONSE_FRAUD_02;
+      break;
+    case 2:
+      resp = &RESPONSE_FRAUD_04;
+      break;
+    case 3:
+      resp = &RESPONSE_FRAUD_06;
+      break;
+    case 4:
+      resp = &RESPONSE_FRAUD_08;
+      break;
+    default:
+      resp = &RESPONSE_FRAUD_10;
+      break;
+    }
+
+    (void)write(client_fd, resp->data, resp->len);
+    close(client_fd);
+    return;
+  }
+
+  (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
+  close(client_fd);
 }
 
 static void warm_up(const DetectorIndexView *detector) {
@@ -128,6 +288,7 @@ static void warm_up(const DetectorIndexView *detector) {
 int main(void) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
+  signal(SIGPIPE, SIG_IGN);
 
   const char *socket_path = getenv("UNIX_SOCKET_PATH");
   if (socket_path == NULL || *socket_path == '\0') {
@@ -153,17 +314,43 @@ int main(void) {
     fprintf(stderr, "failed to bind unix socket '%s': %s\n", socket_path, strerror(errno));
     return 1;
   }
+  if (set_nonblocking_cloexec(server_fd) < 0) {
+    fprintf(stderr, "failed to configure unix socket '%s' as non-blocking: %s\n", socket_path,
+            strerror(errno));
+    close(server_fd);
+    detector_close(&detector);
+    return 1;
+  }
 
   fprintf(stderr, "listening for fd passing at %s\n", socket_path);
 
-  struct pollfd pfds[1 + MAX_CTRL_CONNS];
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0) {
+    fprintf(stderr, "failed to create epoll: %s\n", strerror(errno));
+    close(server_fd);
+    detector_close(&detector);
+    return 1;
+  }
+
+  struct epoll_event listener_event;
+  memset(&listener_event, 0, sizeof(listener_event));
+  listener_event.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  listener_event.data.fd = server_fd;
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &listener_event) < 0) {
+    fprintf(stderr, "failed to register unix listener on epoll: %s\n", strerror(errno));
+    close(epoll_fd);
+    close(server_fd);
+    detector_close(&detector);
+    return 1;
+  }
+
+  struct epoll_event events[MAX_EVENTS];
+  int ctrl_fds[MAX_CTRL_CONNS];
   int ctrl_count = 0;
-  memset(pfds, 0, sizeof(pfds));
-  pfds[0].fd = server_fd;
-  pfds[0].events = POLLIN;
+  memset(ctrl_fds, 0, sizeof(ctrl_fds));
 
   while (keep_running) {
-    int ready = poll(pfds, 1 + ctrl_count, -1);
+    int ready = epoll_wait(epoll_fd, events, MAX_EVENTS, WAIT_TIMEOUT_MS);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
@@ -171,105 +358,94 @@ int main(void) {
       break;
     }
 
-    if ((pfds[0].revents & POLLIN) != 0 && ctrl_count < MAX_CTRL_CONNS) {
-      int ctrl_fd = accept(server_fd, NULL, NULL);
-      if (ctrl_fd >= 0) {
-        pfds[1 + ctrl_count].fd = ctrl_fd;
-        pfds[1 + ctrl_count].events = POLLIN;
-        pfds[1 + ctrl_count].revents = 0;
-        ctrl_count++;
-      }
-    }
+    for (int i = 0; i < ready; i++) {
+      int fd = events[i].data.fd;
+      uint32_t ev = events[i].events;
 
-    for (int i = 0; i < ctrl_count; i++) {
-      struct pollfd *p = &pfds[1 + i];
-      if ((p->revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+      if (fd == server_fd) {
+        if ((ev & (EPOLLERR | EPOLLHUP)) != 0) {
+          keep_running = 0;
+          break;
+        }
+
+        while (keep_running) {
+          int ctrl_fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+          if (ctrl_fd >= 0) {
+            if (ctrl_count >= MAX_CTRL_CONNS) {
+              close(ctrl_fd);
+              continue;
+            }
+
+            struct epoll_event ctrl_event;
+            memset(&ctrl_event, 0, sizeof(ctrl_event));
+            ctrl_event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+            ctrl_event.data.fd = ctrl_fd;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ctrl_event) < 0) {
+              close(ctrl_fd);
+              continue;
+            }
+
+            ctrl_fds[ctrl_count] = ctrl_fd;
+            ctrl_count++;
+            continue;
+          }
+
+          if (errno == EINTR) {
+            continue;
+          }
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+          }
+          keep_running = 0;
+          break;
+        }
         continue;
       }
 
-      int client_fd = recv_fd(p->fd);
-      if (client_fd < 0) {
-        close(p->fd);
-        pfds[1 + i] = pfds[ctrl_count];
-        ctrl_count--;
-        i--;
+      int ctrl_index = find_ctrl_fd(ctrl_fds, ctrl_count, fd);
+      if (ctrl_index < 0) {
         continue;
       }
 
-      char request[REQUEST_BUFFER_SIZE];
-      HttpRequestView req_view;
-      ssize_t nread = read_http_request(client_fd, request, sizeof(request), &req_view);
-      if (nread <= 0) {
-        close(client_fd);
+      if ((ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
+        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        remove_ctrl_fd(ctrl_fds, &ctrl_count, ctrl_index);
         continue;
       }
 
-      request[nread] = '\0';
+      if ((ev & EPOLLIN) != 0) {
+        for (;;) {
+          int client_fd = -1;
+          int recv_status = recv_fd_nonblocking(fd, &client_fd);
+          if (recv_status < 0) {
+            (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            remove_ctrl_fd(ctrl_fds, &ctrl_count, ctrl_index);
+            break;
+          }
+          if (recv_status == 0) {
+            break;
+          }
 
-      if (memcmp(request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
-        (void)write(client_fd, RESPONSE_READY.data, RESPONSE_READY.len);
-        close(client_fd);
-        continue;
-      }
-
-      if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
-        if (req_view.body_offset > (size_t)nread ||
-            req_view.body_len > ((size_t)nread - req_view.body_offset)) {
-          (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
-          close(client_fd);
+          handle_client_request(client_fd, &detector);
+          if (!keep_running) {
+            break;
+          }
+        }
+        if (!keep_running) {
           continue;
         }
-        const char *body = request + req_view.body_offset;
-        const size_t body_len = req_view.body_len;
-
-        TransactionContext ctx = transaction_context_from_body(body, body_len);
-        if (ctx.id[0] == '\0') {
-          ctx.destroy(&ctx);
-          (void)write(client_fd, RESPONSE_BAD_REQUEST.data, RESPONSE_BAD_REQUEST.len);
-          close(client_fd);
-          continue;
-        }
-
-        double vector[14];
-        ctx.to_vector(&ctx, vector);
-        ctx.destroy(&ctx);
-
-        // uint8_t fraud_count = detector_predict_fraud_count(&detector, vector);
-        uint8_t fraud_count = 0;
-        const Response *resp = &RESPONSE_FRAUD_10;
-        switch (fraud_count) {
-        case 0:
-          resp = &RESPONSE_FRAUD_00;
-          break;
-        case 1:
-          resp = &RESPONSE_FRAUD_02;
-          break;
-        case 2:
-          resp = &RESPONSE_FRAUD_04;
-          break;
-        case 3:
-          resp = &RESPONSE_FRAUD_06;
-          break;
-        case 4:
-          resp = &RESPONSE_FRAUD_08;
-          break;
-        default:
-          resp = &RESPONSE_FRAUD_10;
-          break;
-        }
-        (void)write(client_fd, resp->data, resp->len);
-        close(client_fd);
-        continue;
       }
-
-      (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
-      close(client_fd);
     }
   }
 
   for (int i = 0; i < ctrl_count; i++) {
-    close(pfds[1 + i].fd);
+    if (ctrl_fds[i] >= 0) {
+      close(ctrl_fds[i]);
+    }
   }
+  close(epoll_fd);
   close(server_fd);
   unlink(socket_path);
   detector_close(&detector);

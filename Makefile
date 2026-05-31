@@ -34,7 +34,9 @@ SERVER_COMMON_OBJS := $(SERVER_COMMON_SRCS:.c=.o)
 SERVER_XSCORE_OBJ := $(SERVER_XSCORE_SRC:.c=.o)
 SERVER_OBJS := $(SERVER_COMMON_OBJS) $(SERVER_XSCORE_OBJ)
 
-LB_SRCS := apps/load-balancer/src/main.c
+LB_SRCS := apps/load-balancer/src/main.c \
+           apps/load-balancer/src/envs.c \
+           apps/load-balancer/src/server.c
 LB_OBJS := $(LB_SRCS:.c=.o)
 
 .PHONY: server load-balancer clean
