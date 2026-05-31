@@ -19,10 +19,10 @@
 #endif
 #include <unistd.h>
 
-#include "detector.h"
 #include "responses.h"
 #include "server.h"
 #include "transaction_context.h"
+#include "x-score.h"
 
 #ifndef CMSG_SPACE
 #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
@@ -175,9 +175,7 @@ static int recv_fd_nonblocking(int unix_sock, int *out_client_fd) {
   return -1;
 }
 
-static void handle_client_request(int client_fd, const DetectorIndexView *detector) {
-  (void)detector;
-
+static void handle_client_request(int client_fd, const XScoreIndexView *xscore) {
   if (set_blocking(client_fd) < 0) {
     close(client_fd);
     return;
@@ -222,7 +220,7 @@ static void handle_client_request(int client_fd, const DetectorIndexView *detect
     ctx.to_vector(&ctx, vector);
     ctx.destroy(&ctx);
 
-    uint8_t fraud_count = detector_predict_fraud_count(detector, vector);
+    uint8_t fraud_count = x_score_predict_fraud_count(xscore, vector);
     // uint8_t fraud_count = 0;
     const Response *resp = &RESPONSE_FRAUD_10;
     switch (fraud_count) {
@@ -255,7 +253,7 @@ static void handle_client_request(int client_fd, const DetectorIndexView *detect
   close(client_fd);
 }
 
-static void warm_up(const DetectorIndexView *detector) {
+static void warm_up(const XScoreIndexView *xscore) {
   static const char warmup_body[] =
     "{\"id\":\"tx-warmup\","
     "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
@@ -279,7 +277,7 @@ static void warm_up(const DetectorIndexView *detector) {
     // Heat parser/vector path and touch x-score pages ahead of first real
     // requests.
     for (int i = 0; i < 32; i++) {
-      warmup_sink ^= detector_predict_fraud_count(detector, vector);
+      warmup_sink ^= x_score_predict_fraud_count(xscore, vector);
     }
     (void)warmup_sink;
   }
@@ -302,12 +300,12 @@ int main(void) {
     return 1;
   }
 
-  DetectorIndexView detector;
-  if (!detector_open(xscore_path, &detector)) {
+  XScoreIndexView xscore;
+  if (!x_score_open(xscore_path, &xscore)) {
     fprintf(stderr, "failed to load x-score index from resources/references.idx\n");
     return 1;
   }
-  warm_up(&detector);
+  warm_up(&xscore);
 
   int server_fd = create_unix_server(socket_path);
   if (server_fd < 0) {
@@ -318,7 +316,7 @@ int main(void) {
     fprintf(stderr, "failed to configure unix socket '%s' as non-blocking: %s\n", socket_path,
             strerror(errno));
     close(server_fd);
-    detector_close(&detector);
+    x_score_close(&xscore);
     return 1;
   }
 
@@ -328,7 +326,7 @@ int main(void) {
   if (epoll_fd < 0) {
     fprintf(stderr, "failed to create epoll: %s\n", strerror(errno));
     close(server_fd);
-    detector_close(&detector);
+    x_score_close(&xscore);
     return 1;
   }
 
@@ -340,7 +338,7 @@ int main(void) {
     fprintf(stderr, "failed to register unix listener on epoll: %s\n", strerror(errno));
     close(epoll_fd);
     close(server_fd);
-    detector_close(&detector);
+    x_score_close(&xscore);
     return 1;
   }
 
@@ -428,7 +426,7 @@ int main(void) {
             break;
           }
 
-          handle_client_request(client_fd, &detector);
+          handle_client_request(client_fd, &xscore);
           if (!keep_running) {
             break;
           }
@@ -448,6 +446,6 @@ int main(void) {
   close(epoll_fd);
   close(server_fd);
   unlink(socket_path);
-  detector_close(&detector);
+  x_score_close(&xscore);
   return 0;
 }
