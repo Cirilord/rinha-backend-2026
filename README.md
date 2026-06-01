@@ -107,7 +107,7 @@ The `scan_block` hot path is architecture-specific:
 - `__ARM_NEON__` for `arm64`
 - scalar fallback otherwise
 
-`nprobe` is configurable at runtime via `X_SCORE_NPROBE` (default `12`).
+`nprobe` is configurable at runtime via `X_SCORE_NPROBE` (default `16`).
 
 ## 4. Build System (Makefile)
 
@@ -251,7 +251,7 @@ Total: **1.00 CPU / 350MB**.
 ### API
 - `UNIX_SOCKET_PATH` (required)
 - `X_SCORE_INDEX_PATH` (required)
-- `X_SCORE_NPROBE` (optional, default `12`)
+- `X_SCORE_NPROBE` (optional, default `16`)
 
 ### Load Balancer
 - `PORT` (default `9999`)

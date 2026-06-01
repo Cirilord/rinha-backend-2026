@@ -10,7 +10,7 @@
 #define X_SCORE_TOPK 5
 #define X_SCORE_SCALE 10000
 #define X_SCORE_MAGIC "RNSPIVF1"
-#define X_SCORE_DEFAULT_NPROBE 10
+#define X_SCORE_DEFAULT_NPROBE 16
 
 typedef struct {
   char magic[8];
