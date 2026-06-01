@@ -21,7 +21,7 @@
 #include "responses.h"
 #include "server.h"
 #include "transaction_context.h"
-#include "x-score.h"
+#include "xgboost_model.h"
 
 #ifndef CMSG_LEN
 #define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
@@ -78,7 +78,7 @@ static int recv_fd(int unix_sock) {
   return client_fd;
 }
 
-static void warm_up(const XScoreIndexView *xscore) {
+static void warm_up(void) {
   static const char warmup_body[] =
     "{\"id\":\"tx-warmup\","
     "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
@@ -99,10 +99,10 @@ static void warm_up(const XScoreIndexView *xscore) {
     ctx.to_vector(&ctx, vector);
     ctx.destroy(&ctx);
 
-    // Heat parser/vector path and touch x-score pages ahead of first real
-    // requests.
+    // Heat parser/vector path and xgboost prediction path ahead of first
+    // real requests.
     for (int i = 0; i < 32; i++) {
-      warmup_sink ^= x_score_predict_fraud_count(xscore, vector);
+      warmup_sink ^= xgboost_predict_fraud_count(vector);
     }
     (void)warmup_sink;
   }
@@ -118,18 +118,7 @@ int main(void) {
     return 1;
   }
 
-  const char *xscore_path = getenv("X_SCORE_INDEX_PATH");
-  if (xscore_path == NULL || *xscore_path == '\0') {
-    fprintf(stderr, "X_SCORE_INDEX_PATH is required and cannot be empty\n");
-    return 1;
-  }
-
-  XScoreIndexView xscore;
-  if (!x_score_open(xscore_path, &xscore)) {
-    fprintf(stderr, "failed to load x-score index from resources/references.idx\n");
-    return 1;
-  }
-  warm_up(&xscore);
+  warm_up();
 
   int server_fd = create_unix_server(socket_path);
   if (server_fd < 0) {
@@ -150,7 +139,6 @@ int main(void) {
   if (epoll_fd < 0) {
     close(server_fd);
     unlink(socket_path);
-    x_score_close(&xscore);
     return 1;
   }
 
@@ -162,7 +150,6 @@ int main(void) {
     close(epoll_fd);
     close(server_fd);
     unlink(socket_path);
-    x_score_close(&xscore);
     return 1;
   }
 
@@ -264,8 +251,7 @@ int main(void) {
         ctx.to_vector(&ctx, vector);
         ctx.destroy(&ctx);
 
-        uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-        // uint8_t fraud_count = 0;
+        uint8_t fraud_count = xgboost_predict_fraud_count(vector);
         const Response *resp = &RESPONSE_FRAUD_10;
         switch (fraud_count) {
         case 0:
@@ -303,6 +289,5 @@ int main(void) {
   close(epoll_fd);
   close(server_fd);
   unlink(socket_path);
-  x_score_close(&xscore);
   return 0;
 }
