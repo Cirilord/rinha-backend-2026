@@ -8,7 +8,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +23,6 @@
 #endif
 #include <sys/types.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
 #ifndef CMSG_SPACE
@@ -51,73 +49,6 @@ typedef struct {
 static void on_signal(int signo) {
   (void)signo;
   keep_running = 0;
-}
-
-static void log_msg(const char *level, const char *fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-
-  time_t now = time(NULL);
-  struct tm tm_now;
-  localtime_r(&now, &tm_now);
-
-  char ts[32];
-  strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
-
-  fprintf(stderr, "[%s] [%s] ", ts, level);
-  vfprintf(stderr, fmt, args);
-  fprintf(stderr, "\n");
-
-  va_end(args);
-}
-
-static int parse_port(void) {
-  const char *env = getenv("PORT");
-  if (env == NULL || *env == '\0') {
-    return DEFAULT_PORT;
-  }
-
-  char *end = NULL;
-  long p = strtol(env, &end, 10);
-  if (*end != '\0' || p < 1 || p > 65535) {
-    log_msg("WARN", "invalid PORT='%s', fallback to %d", env, DEFAULT_PORT);
-    return DEFAULT_PORT;
-  }
-
-  return (int)p;
-}
-
-static int parse_worker_paths(worker_t workers[], int max_workers) {
-  const char *env = getenv("WORKER_SOCKETS");
-  if (env == NULL || *env == '\0') {
-    env = "/shared/backend-1.sock,/shared/backend-2.sock";
-  }
-
-  char buffer[MAX_ENV_LEN];
-  strncpy(buffer, env, sizeof(buffer) - 1);
-  buffer[sizeof(buffer) - 1] = '\0';
-
-  int count = 0;
-  char *token = strtok(buffer, ",");
-  while (token != NULL && count < max_workers) {
-    while (*token == ' ') {
-      token++;
-    }
-
-    size_t len = strnlen(token, MAX_SOCKET_PATH);
-    if (len == 0 || len >= MAX_SOCKET_PATH) {
-      log_msg("WARN", "skipping invalid worker socket path: '%s'", token);
-    } else {
-      strncpy(workers[count].path, token, sizeof(workers[count].path) - 1);
-      workers[count].path[sizeof(workers[count].path) - 1] = '\0';
-      workers[count].control_fd = -1;
-      count++;
-    }
-
-    token = strtok(NULL, ",");
-  }
-
-  return count;
 }
 
 static int connect_worker(const char *socket_path) {
@@ -251,29 +182,64 @@ int main(void) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
 
-  worker_t workers[MAX_WORKERS];
-  int worker_count = parse_worker_paths(workers, MAX_WORKERS);
-  if (worker_count <= 0) {
-    log_msg("ERROR", "no valid workers found in WORKER_SOCKETS");
+  const char *port_str = getenv("PORT");
+  if (port_str == NULL || *port_str == '\0') {
+    fprintf(stderr, "ERROR: PORT is required and cannot be empty\n");
+    return 1;
+  }
+  char *end = NULL;
+  int port = (int)strtol(port_str, &end, 10);
+  if (*end != '\0' || port < 1 || port > 65535) {
+    fprintf(stderr, "ERROR: invalid PORT='%s'\n", port_str);
     return 1;
   }
 
-  int port = parse_port();
+  const char *worker_sockets = getenv("WORKER_SOCKETS");
+  if (worker_sockets == NULL || *worker_sockets == '\0') {
+    fprintf(stderr, "ERROR: WORKER_SOCKETS is required and cannot be empty\n");
+    return 1;
+  }
+
+  worker_t workers[MAX_WORKERS];
+  char buffer[MAX_ENV_LEN];
+  strncpy(buffer, worker_sockets, sizeof(buffer) - 1);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  int worker_count = 0;
+  char *token = strtok(buffer, ",");
+  while (token != NULL && worker_count < MAX_WORKERS) {
+    while (*token == ' ') {
+      token++;
+    }
+
+    size_t len = strnlen(token, MAX_SOCKET_PATH);
+    if (len == 0 || len >= MAX_SOCKET_PATH) {
+      fprintf(stderr, "WARN: skipping invalid worker socket path: '%s'\n", token);
+    } else {
+      strncpy(workers[worker_count].path, token, sizeof(workers[worker_count].path) - 1);
+      workers[worker_count].path[sizeof(workers[worker_count].path) - 1] = '\0';
+      workers[worker_count].control_fd = -1;
+      worker_count++;
+    }
+
+    token = strtok(NULL, ",");
+  }
+
   int listener = create_tcp_listener(port);
   if (listener < 0) {
-    log_msg("ERROR", "failed to create TCP listener on port %d: %s", port, strerror(errno));
+    fprintf(stderr, "ERROR: failed to create TCP listener on port %d: %s\n", port, strerror(errno));
     return 1;
   }
 
-  log_msg("INFO", "listening on 0.0.0.0:%d", port);
+  fprintf(stderr, "INFO: listening on 0.0.0.0:%d\n", port);
   for (int i = 0; i < worker_count; i++) {
-    log_msg("INFO", "worker[%d] socket path: %s", i, workers[i].path);
+    fprintf(stderr, "INFO: worker[%d] socket path: %s\n", i, workers[i].path);
   }
 
   int rr = 0;
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
-    log_msg("ERROR", "failed to create epoll instance: %s", strerror(errno));
+    fprintf(stderr, "ERROR: failed to create epoll instance: %s\n", strerror(errno));
     close(listener);
     return 1;
   }
@@ -284,7 +250,7 @@ int main(void) {
   listener_ev.data.fd = listener;
 
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener, &listener_ev) < 0) {
-    log_msg("ERROR", "failed to register listener on epoll: %s", strerror(errno));
+    fprintf(stderr, "ERROR: failed to register listener on epoll: %s\n", strerror(errno));
     close(epoll_fd);
     close(listener);
     return 1;
@@ -297,7 +263,7 @@ int main(void) {
       if (errno == EINTR) {
         continue;
       }
-      log_msg("WARN", "epoll_wait failed: %s", strerror(errno));
+      fprintf(stderr, "WARN: epoll_wait failed: %s\n", strerror(errno));
       break;
     }
 
@@ -315,7 +281,7 @@ int main(void) {
         if (errno == EINTR) {
           continue;
         }
-        log_msg("WARN", "accept failed: %s", strerror(errno));
+        fprintf(stderr, "WARN: accept failed: %s\n", strerror(errno));
         break;
       }
 
@@ -357,6 +323,6 @@ int main(void) {
     }
   }
 
-  log_msg("INFO", "shutdown complete");
+  fprintf(stderr, "INFO: shutdown complete\n");
   return 0;
 }
