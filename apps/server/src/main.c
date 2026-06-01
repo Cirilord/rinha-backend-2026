@@ -264,8 +264,8 @@ int main(void) {
         ctx.to_vector(&ctx, vector);
         ctx.destroy(&ctx);
 
-        // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-        uint8_t fraud_count = 0;
+        uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+        // uint8_t fraud_count = 0;
         const Response *resp = &RESPONSE_FRAUD_10;
         switch (fraud_count) {
         case 0:

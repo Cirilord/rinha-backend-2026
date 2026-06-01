@@ -15,6 +15,12 @@ Layout (little-endian):
 - node directory (72 bytes each)
 - vectors in AoSoA blocks (LANES=8): for each block -> dims -> lanes -> i16
 - labels in block order: for each block -> lanes -> u8
+- optional metadata tail:
+  - meta header: magic(8) + version(u32) + partition_count(u32) +
+                 super_bucket_count(u32=2) + groups_per_super(u32=8)
+  - super offsets: 3 * u32
+  - per-super group offsets: 2 * (8 + 1) * u32
+  - partition indices ordered by super/group: partition_count * u32
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ DIMS = 14
 LANES = 8
 SCALE = 10000
 MAGIC = b"RNSPCST1"
+META_MAGIC = b"RNSPMETA"
+META_VERSION = 1
 
 # Second-level split bits (inside each primary partition key)
 SUBINDEX_SPLITS: tuple[tuple[int, int], ...] = (
@@ -119,6 +127,57 @@ def compute_subindex_key(qvec: list[int]) -> int:
         if qvec[dim] > cutoff:
             key |= 1 << bit
     return key
+
+
+def partition_super_bucket(key: int) -> int:
+    return (key >> 2) & 1
+
+
+def partition_group_bucket(key: int) -> int:
+    mcc_bucket = (key >> 4) & 0b11
+    is_online = (key >> 1) & 0b1
+    return (mcc_bucket << 1) | is_online
+
+
+def build_super_group_metadata(partition_entries: list[tuple[int, int, int, list[int], list[int], int]]) -> tuple[list[int], list[list[int]], list[int]]:
+    partition_count = len(partition_entries)
+    groups_per_super = 8
+    super_buckets = 2
+    total_groups = groups_per_super * super_buckets
+
+    counts = [0] * total_groups
+    for key, *_ in partition_entries:
+        sup = partition_super_bucket(key)
+        grp = partition_group_bucket(key)
+        counts[sup * groups_per_super + grp] += 1
+
+    super_offsets = [0, sum(counts[:groups_per_super]), partition_count]
+
+    group_offsets = [[0] * (groups_per_super + 1) for _ in range(super_buckets)]
+    group_offsets[0][0] = super_offsets[0]
+    for g in range(groups_per_super):
+        group_offsets[0][g + 1] = group_offsets[0][g] + counts[g]
+
+    group_offsets[1][0] = super_offsets[1]
+    for g in range(groups_per_super):
+        idx = groups_per_super + g
+        group_offsets[1][g + 1] = group_offsets[1][g] + counts[idx]
+
+    cursor = [0] * total_groups
+    for g in range(groups_per_super):
+        cursor[g] = group_offsets[0][g]
+        cursor[groups_per_super + g] = group_offsets[1][g]
+
+    partition_indices = [0] * partition_count
+    for idx, (key, *_rest) in enumerate(partition_entries):
+        sup = partition_super_bucket(key)
+        grp = partition_group_bucket(key)
+        global_group = sup * groups_per_super + grp
+        out_pos = cursor[global_group]
+        partition_indices[out_pos] = idx
+        cursor[global_group] += 1
+
+    return super_offsets, group_offsets, partition_indices
 
 
 def update_minmax(minv: list[int], maxv: list[int], qvec: list[int]) -> None:
@@ -352,6 +411,23 @@ def main() -> None:
 
     out.extend(vectors_blob.tobytes())
     out.extend(labels_blob)
+
+    super_offsets, group_offsets, partition_indices = build_super_group_metadata(partition_entries)
+    out.extend(
+        struct.pack(
+            "<8sIIII",
+            META_MAGIC,
+            META_VERSION,
+            partition_count,
+            2,
+            8,
+        )
+    )
+    out.extend(struct.pack("<III", *super_offsets))
+    out.extend(struct.pack("<" + "I" * 9, *group_offsets[0]))
+    out.extend(struct.pack("<" + "I" * 9, *group_offsets[1]))
+    if partition_count > 0:
+        out.extend(struct.pack("<" + "I" * partition_count, *partition_indices))
 
     OUTPUT_IDX_PATH.write_bytes(out)
 

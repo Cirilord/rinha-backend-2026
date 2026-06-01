@@ -10,6 +10,9 @@
 #define X_SCORE_TOPK 5
 #define X_SCORE_SCALE 10000
 #define X_SCORE_MAGIC "RNSPCST1"
+#define X_SCORE_SUPER_BUCKETS 2
+#define X_SCORE_GROUPS_PER_SUPER 8
+#define X_SCORE_TOTAL_GROUPS (X_SCORE_SUPER_BUCKETS * X_SCORE_GROUPS_PER_SUPER)
 
 typedef struct {
   char magic[8];
@@ -63,6 +66,9 @@ typedef struct {
   uint32_t *key_partition_indices;
   uint32_t key_partition_offsets[257];
   int32_t key_partition_direct[256];
+  uint32_t *super_group_partition_indices;
+  uint32_t super_partition_offsets[X_SCORE_SUPER_BUCKETS + 1];
+  uint32_t super_group_offsets[X_SCORE_SUPER_BUCKETS][X_SCORE_GROUPS_PER_SUPER + 1];
   uint32_t *partition_start_blocks;
   uint32_t *partition_lens;
   uint32_t *partition_group_offsets;
@@ -70,6 +76,7 @@ typedef struct {
   uint32_t total_groups;
   uint32_t max_groups_per_partition;
   uint8_t direct_leaf_mode;
+  uint8_t super_group_mode;
   uint32_t count;
   uint32_t partition_count;
   uint32_t node_count;

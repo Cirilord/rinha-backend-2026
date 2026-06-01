@@ -43,9 +43,163 @@ typedef struct {
 #define X_SCORE_GROUP_BLOCKS 16U
 #endif
 
+#define X_SCORE_META_MAGIC "RNSPMETA"
+#define X_SCORE_META_VERSION 1u
+
 static const unsigned long long x_score_early_distance_limit =
   ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL) *
   ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL);
+
+static inline uint32_t partition_super_bucket_from_key(uint32_t key) { return (key >> 2) & 1u; }
+
+static inline uint32_t partition_group_bucket_from_key(uint32_t key) {
+  uint32_t mcc = (key >> 4) & 3u;
+  uint32_t online = (key >> 1) & 1u;
+  return (mcc << 1) | online;
+}
+
+static bool parse_super_group_meta(const uint8_t *meta, size_t meta_len, uint32_t partition_count,
+                                   uint32_t super_offsets[X_SCORE_SUPER_BUCKETS + 1],
+                                   uint32_t group_offsets[X_SCORE_SUPER_BUCKETS]
+                                                         [X_SCORE_GROUPS_PER_SUPER + 1],
+                                   uint32_t **out_partition_indices) {
+  if (!meta || !out_partition_indices || partition_count == 0) {
+    return false;
+  }
+
+  const size_t head_bytes = 8 + 4 * sizeof(uint32_t);
+  if (meta_len < head_bytes) {
+    return false;
+  }
+
+  if (memcmp(meta, X_SCORE_META_MAGIC, 8) != 0) {
+    return false;
+  }
+
+  uint32_t version = 0;
+  uint32_t meta_partition_count = 0;
+  uint32_t super_bucket_count = 0;
+  uint32_t groups_per_super = 0;
+
+  memcpy(&version, meta + 8, sizeof(uint32_t));
+  memcpy(&meta_partition_count, meta + 12, sizeof(uint32_t));
+  memcpy(&super_bucket_count, meta + 16, sizeof(uint32_t));
+  memcpy(&groups_per_super, meta + 20, sizeof(uint32_t));
+
+  if (version != X_SCORE_META_VERSION || meta_partition_count != partition_count ||
+      super_bucket_count != X_SCORE_SUPER_BUCKETS || groups_per_super != X_SCORE_GROUPS_PER_SUPER) {
+    return false;
+  }
+
+  const size_t offsets_bytes = (X_SCORE_SUPER_BUCKETS + 1u) * sizeof(uint32_t);
+  const size_t groups_bytes =
+    (size_t)X_SCORE_SUPER_BUCKETS * (X_SCORE_GROUPS_PER_SUPER + 1u) * sizeof(uint32_t);
+  const size_t indices_bytes = (size_t)partition_count * sizeof(uint32_t);
+  const size_t need = head_bytes + offsets_bytes + groups_bytes + indices_bytes;
+  if (meta_len < need) {
+    return false;
+  }
+
+  const uint8_t *p = meta + head_bytes;
+  memcpy(super_offsets, p, offsets_bytes);
+  p += offsets_bytes;
+  memcpy(group_offsets, p, groups_bytes);
+  p += groups_bytes;
+
+  if (super_offsets[0] != 0 || super_offsets[X_SCORE_SUPER_BUCKETS] != partition_count) {
+    return false;
+  }
+
+  uint32_t *indices = (uint32_t *)malloc(indices_bytes);
+  if (indices == NULL) {
+    return false;
+  }
+  memcpy(indices, p, indices_bytes);
+  for (uint32_t i = 0; i < partition_count; i++) {
+    if (indices[i] >= partition_count) {
+      free(indices);
+      return false;
+    }
+  }
+
+  *out_partition_indices = indices;
+  return true;
+}
+
+static bool build_super_group_index(const XScorePartitionEntry *partitions, uint32_t partition_count,
+                                    uint32_t super_offsets[X_SCORE_SUPER_BUCKETS + 1],
+                                    uint32_t group_offsets[X_SCORE_SUPER_BUCKETS]
+                                                          [X_SCORE_GROUPS_PER_SUPER + 1],
+                                    uint32_t **out_partition_indices) {
+  if (!partitions || !out_partition_indices) {
+    return false;
+  }
+
+  if (partition_count == 0) {
+    for (uint32_t s = 0; s <= X_SCORE_SUPER_BUCKETS; s++) {
+      super_offsets[s] = 0;
+    }
+    for (uint32_t s = 0; s < X_SCORE_SUPER_BUCKETS; s++) {
+      for (uint32_t g = 0; g <= X_SCORE_GROUPS_PER_SUPER; g++) {
+        group_offsets[s][g] = 0;
+      }
+    }
+    *out_partition_indices = NULL;
+    return true;
+  }
+
+  uint32_t *indices = (uint32_t *)malloc((size_t)partition_count * sizeof(uint32_t));
+  if (indices == NULL) {
+    return false;
+  }
+
+  uint32_t counts[X_SCORE_TOTAL_GROUPS];
+  memset(counts, 0, sizeof(counts));
+
+  for (uint32_t i = 0; i < partition_count; i++) {
+    uint32_t key = partitions[i].key & 255u;
+    uint32_t super = partition_super_bucket_from_key(key);
+    uint32_t group = partition_group_bucket_from_key(key);
+    uint32_t global_group = super * X_SCORE_GROUPS_PER_SUPER + group;
+    counts[global_group]++;
+  }
+
+  super_offsets[0] = 0;
+  uint32_t cp0_total = 0;
+  for (uint32_t g = 0; g < X_SCORE_GROUPS_PER_SUPER; g++) {
+    cp0_total += counts[g];
+  }
+  super_offsets[1] = cp0_total;
+  super_offsets[2] = partition_count;
+
+  group_offsets[0][0] = super_offsets[0];
+  for (uint32_t g = 0; g < X_SCORE_GROUPS_PER_SUPER; g++) {
+    group_offsets[0][g + 1] = group_offsets[0][g] + counts[g];
+  }
+
+  group_offsets[1][0] = super_offsets[1];
+  for (uint32_t g = 0; g < X_SCORE_GROUPS_PER_SUPER; g++) {
+    uint32_t idx = X_SCORE_GROUPS_PER_SUPER + g;
+    group_offsets[1][g + 1] = group_offsets[1][g] + counts[idx];
+  }
+
+  uint32_t cursor[X_SCORE_TOTAL_GROUPS];
+  for (uint32_t g = 0; g < X_SCORE_GROUPS_PER_SUPER; g++) {
+    cursor[g] = group_offsets[0][g];
+    cursor[X_SCORE_GROUPS_PER_SUPER + g] = group_offsets[1][g];
+  }
+
+  for (uint32_t i = 0; i < partition_count; i++) {
+    uint32_t key = partitions[i].key & 255u;
+    uint32_t super = partition_super_bucket_from_key(key);
+    uint32_t group = partition_group_bucket_from_key(key);
+    uint32_t global_group = super * X_SCORE_GROUPS_PER_SUPER + group;
+    indices[cursor[global_group]++] = i;
+  }
+
+  *out_partition_indices = indices;
+  return true;
+}
 
 static inline void insert_partition_candidate_sorted(PartitionCandidate entries[256],
                                                      uint32_t *entry_len,
@@ -505,6 +659,145 @@ static inline void search_exact(const XScoreIndexView *view, const XScoreQueryCo
   }
 }
 
+static inline uint32_t group_mcc_component(uint32_t group) { return (group >> 1) & 3u; }
+
+static inline uint32_t group_online_component(uint32_t group) { return group & 1u; }
+
+static inline void build_group_visit_order(uint32_t qgroup, uint32_t out_order[X_SCORE_GROUPS_PER_SUPER]) {
+  uint32_t tmp[X_SCORE_GROUPS_PER_SUPER];
+  for (uint32_t g = 0; g < X_SCORE_GROUPS_PER_SUPER; g++) {
+    tmp[g] = g;
+  }
+
+  uint32_t q_mcc = group_mcc_component(qgroup);
+  uint32_t q_online = group_online_component(qgroup);
+
+  for (uint32_t i = 1; i < X_SCORE_GROUPS_PER_SUPER; i++) {
+    uint32_t current = tmp[i];
+    uint32_t current_mcc = group_mcc_component(current);
+    uint32_t current_online = group_online_component(current);
+    uint32_t current_dist = (current_mcc > q_mcc) ? (current_mcc - q_mcc) : (q_mcc - current_mcc);
+    current_dist = current_dist * 2u + ((current_online == q_online) ? 0u : 1u);
+    uint32_t j = i;
+    while (j > 0) {
+      uint32_t prev = tmp[j - 1];
+      uint32_t prev_mcc = group_mcc_component(prev);
+      uint32_t prev_online = group_online_component(prev);
+      uint32_t prev_dist = (prev_mcc > q_mcc) ? (prev_mcc - q_mcc) : (q_mcc - prev_mcc);
+      prev_dist = prev_dist * 2u + ((prev_online == q_online) ? 0u : 1u);
+      if (prev_dist <= current_dist) {
+        break;
+      }
+      tmp[j] = prev;
+      j--;
+    }
+    tmp[j] = current;
+  }
+
+  for (uint32_t i = 0; i < X_SCORE_GROUPS_PER_SUPER; i++) {
+    out_order[i] = tmp[i];
+  }
+}
+
+static inline bool scan_partition_candidate_direct(const XScoreIndexView *view, uint32_t partition_index,
+                                                   const XScoreQueryContext *ctx,
+                                                   unsigned long long top_dist[X_SCORE_TOPK],
+                                                   uint8_t top_label[X_SCORE_TOPK]) {
+  return scan_partition_grouped(view, partition_index, ctx, top_dist, top_label);
+}
+
+static inline bool scan_partition_candidate_tree(const XScoreIndexView *view, uint32_t partition_index,
+                                                 unsigned long long bound,
+                                                 const XScoreQueryContext *ctx,
+                                                 unsigned long long top_dist[X_SCORE_TOPK],
+                                                 uint8_t top_label[X_SCORE_TOPK]) {
+  const XScorePartitionEntry *p = &view->partitions[partition_index];
+  if (p->root < 0) {
+    return false;
+  }
+  return search_node_iterative(view, (uint32_t)p->root, bound, ctx, top_dist, top_label);
+}
+
+static inline bool search_partition_subset(const XScoreIndexView *view, const uint32_t *indices,
+                                           uint32_t count, const XScoreQueryContext *ctx,
+                                           unsigned long long top_dist[X_SCORE_TOPK],
+                                           uint8_t top_label[X_SCORE_TOPK], bool direct_leaf) {
+  if (!indices || count == 0) {
+    return false;
+  }
+
+  PartitionCandidate entries[256];
+  uint32_t entry_len = 0;
+  unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t pidx = indices[i];
+    if (pidx >= view->partition_count) {
+      continue;
+    }
+    const XScorePartitionEntry *p = &view->partitions[pidx];
+    if (!direct_leaf && p->root < 0) {
+      continue;
+    }
+    unsigned long long bound = lower_bound_partition_sq_cutoff(ctx->q, p, cutoff);
+    if (bound < cutoff) {
+      insert_partition_candidate_sorted(entries, &entry_len, bound, pidx);
+    }
+  }
+
+  for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
+    if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
+      break;
+    }
+
+    if (direct_leaf) {
+      if (scan_partition_candidate_direct(view, entries[i].index, ctx, top_dist, top_label)) {
+        return true;
+      }
+    } else if (scan_partition_candidate_tree(view, entries[i].index, entries[i].bound, ctx, top_dist,
+                                             top_label)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static inline bool search_with_super_groups(const XScoreIndexView *view, uint32_t qkey,
+                                            const XScoreQueryContext *ctx,
+                                            unsigned long long top_dist[X_SCORE_TOPK],
+                                            uint8_t top_label[X_SCORE_TOPK], bool direct_leaf) {
+  if (!view->super_group_mode || !view->super_group_partition_indices) {
+    return false;
+  }
+
+  uint32_t qsuper = partition_super_bucket_from_key(qkey);
+  uint32_t qgroup = partition_group_bucket_from_key(qkey);
+  uint32_t group_order[X_SCORE_GROUPS_PER_SUPER];
+  build_group_visit_order(qgroup, group_order);
+
+  uint32_t supers[2] = {qsuper, qsuper ^ 1u};
+
+  for (uint32_t sidx = 0; sidx < 2 && !early_done(top_dist); sidx++) {
+    uint32_t super = supers[sidx];
+    for (uint32_t gidx = 0; gidx < X_SCORE_GROUPS_PER_SUPER && !early_done(top_dist); gidx++) {
+      uint32_t group = group_order[gidx];
+      uint32_t begin = view->super_group_offsets[super][group];
+      uint32_t end = view->super_group_offsets[super][group + 1];
+      if (end <= begin) {
+        continue;
+      }
+      const uint32_t *subset = view->super_group_partition_indices + begin;
+      uint32_t subset_count = end - begin;
+      if (search_partition_subset(view, subset, subset_count, ctx, top_dist, top_label, direct_leaf)) {
+        return true;
+      }
+    }
+  }
+
+  return true;
+}
+
 bool x_score_open(const char *path, XScoreIndexView *out_view) {
   if (!path || !out_view) {
     return false;
@@ -633,6 +926,34 @@ bool x_score_open(const char *path, XScoreIndexView *out_view) {
     }
   }
 
+  uint32_t *super_group_partition_indices = NULL;
+  uint32_t super_partition_offsets[X_SCORE_SUPER_BUCKETS + 1];
+  uint32_t super_group_offsets[X_SCORE_SUPER_BUCKETS][X_SCORE_GROUPS_PER_SUPER + 1];
+  memset(super_partition_offsets, 0, sizeof(super_partition_offsets));
+  memset(super_group_offsets, 0, sizeof(super_group_offsets));
+  bool super_group_mode = false;
+
+  if (partition_count > 0) {
+    if (labels_end < size) {
+      const uint8_t *meta = raw + labels_end;
+      size_t meta_len = size - labels_end;
+      super_group_mode =
+        parse_super_group_meta(meta, meta_len, partition_count, super_partition_offsets,
+                               super_group_offsets, &super_group_partition_indices);
+    }
+
+    if (!super_group_mode) {
+      super_group_mode =
+        build_super_group_index(partitions, partition_count, super_partition_offsets,
+                                super_group_offsets, &super_group_partition_indices);
+      if (!super_group_mode) {
+        free(key_partition_indices);
+        munmap(raw, size);
+        return false;
+      }
+    }
+  }
+
   out_view->raw = raw;
   out_view->size = size;
   out_view->mapped = 1;
@@ -642,6 +963,10 @@ bool x_score_open(const char *path, XScoreIndexView *out_view) {
   out_view->vectors_q16 = vectors_q16;
   out_view->labels = labels;
   out_view->key_partition_indices = key_partition_indices;
+  out_view->super_group_partition_indices = super_group_partition_indices;
+  memcpy(out_view->super_partition_offsets, super_partition_offsets, sizeof(super_partition_offsets));
+  memcpy(out_view->super_group_offsets, super_group_offsets, sizeof(super_group_offsets));
+  out_view->super_group_mode = super_group_mode ? 1 : 0;
   out_view->count = count;
   out_view->partition_count = partition_count;
   out_view->node_count = node_count;
@@ -776,6 +1101,7 @@ void x_score_close(XScoreIndexView *view) {
   free(view->partition_group_offsets);
   free(view->partition_lens);
   free(view->partition_start_blocks);
+  free(view->super_group_partition_indices);
   free(view->key_partition_indices);
 
   if (view->mapped && view->raw && view->size > 0) {
@@ -811,84 +1137,15 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
   } else if (view->direct_leaf_mode && view->partition_start_blocks && view->partition_lens &&
              view->partition_group_offsets && view->groups) {
     uint32_t qkey = compute_partition_key(qctx.q) & 255u;
-    int32_t direct = view->key_partition_direct[qkey];
-
-    if (direct >= 0) {
-      (void)scan_partition_grouped(view, (uint32_t)direct, &qctx, top_dist, top_label);
-    } else {
-      uint32_t begin = view->key_partition_offsets[qkey];
-      uint32_t end = view->key_partition_offsets[qkey + 1];
-      for (uint32_t pos = begin; pos < end && !early_done(top_dist); pos++) {
-        uint32_t pidx = view->key_partition_indices[pos];
-        (void)scan_partition_grouped(view, pidx, &qctx, top_dist, top_label);
-      }
-    }
-
-    PartitionCandidate entries[256];
-    uint32_t entry_len = 0;
-    unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
-
-    for (uint32_t i = 0; i < view->partition_count && !early_done(top_dist); i++) {
-      const XScorePartitionEntry *p = &view->partitions[i];
-      if ((p->key & 255u) == qkey) {
-        continue;
-      }
-      unsigned long long bound = lower_bound_partition_sq_cutoff(qctx.q, p, cutoff);
-      if (bound < cutoff) {
-        insert_partition_candidate_sorted(entries, &entry_len, bound, i);
-      }
-    }
-
-    for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
-      if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
-        break;
-      }
-      (void)scan_partition_grouped(view, entries[i].index, &qctx, top_dist, top_label);
+    if (!search_with_super_groups(view, qkey, &qctx, top_dist, top_label, true)) {
+      (void)search_partition_subset(view, view->key_partition_indices, view->partition_count, &qctx,
+                                    top_dist, top_label, true);
     }
   } else if (view->nodes) {
     uint32_t qkey = compute_partition_key(qctx.q) & 255u;
-    int32_t direct = view->key_partition_direct[qkey];
-
-    if (direct >= 0) {
-      const XScorePartitionEntry *p = &view->partitions[(uint32_t)direct];
-      if (p->root >= 0) {
-        (void)search_node_iterative(view, (uint32_t)p->root, 0, &qctx, top_dist, top_label);
-      }
-    } else {
-      uint32_t begin = view->key_partition_offsets[qkey];
-      uint32_t end = view->key_partition_offsets[qkey + 1];
-      for (uint32_t pos = begin; pos < end && !early_done(top_dist); pos++) {
-        uint32_t pidx = view->key_partition_indices[pos];
-        const XScorePartitionEntry *p = &view->partitions[pidx];
-        if (p->root < 0) {
-          continue;
-        }
-        (void)search_node_iterative(view, (uint32_t)p->root, 0, &qctx, top_dist, top_label);
-      }
-    }
-
-    PartitionCandidate entries[256];
-    uint32_t entry_len = 0;
-    unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
-
-    for (uint32_t i = 0; i < view->partition_count && !early_done(top_dist); i++) {
-      const XScorePartitionEntry *p = &view->partitions[i];
-      if ((p->key & 255u) == qkey) {
-        continue;
-      }
-      unsigned long long bound = lower_bound_partition_sq_cutoff(qctx.q, p, cutoff);
-      if (bound < cutoff && p->root >= 0) {
-        insert_partition_candidate_sorted(entries, &entry_len, bound, i);
-      }
-    }
-
-    for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
-      if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
-        break;
-      }
-      const XScorePartitionEntry *p = &view->partitions[entries[i].index];
-      (void)search_node_iterative(view, (uint32_t)p->root, entries[i].bound, &qctx, top_dist,
-                                  top_label);
+    if (!search_with_super_groups(view, qkey, &qctx, top_dist, top_label, false)) {
+      (void)search_partition_subset(view, view->key_partition_indices, view->partition_count, &qctx,
+                                    top_dist, top_label, false);
     }
   } else {
     search_exact(view, &qctx, top_dist, top_label);

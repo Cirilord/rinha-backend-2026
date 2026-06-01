@@ -54,9 +54,11 @@ This avoids extra TCP hops between LB and API.
 ### Scoring (`apps/server/src/x-score.c`)
 - Uses quantized vectors and top-k nearest-neighbor style lookup.
 - Builds partition-key lookup tables once at index-open time to accelerate same-key candidate selection.
+- Builds super-bucket/group lookup tables (`card_present` first, then `mcc`+`is_online`) for search ordering.
 - Includes **early pruning / early-exit**:
   - partition bound pruning
-  - same-key partition first
+  - same-card_present super-bucket first
+  - same-group first (`card_present` + `mcc` + `is_online`)
   - node branch-and-bound when partitions have internal subindex nodes
   - direct leaf-scan fast path when index roots are leaf nodes
   - leaf scan early stop when top-k threshold is good enough
@@ -99,6 +101,7 @@ This section describes the vector search strategy used in `apps/server/src/x-sco
 - Node directory: tree nodes with child pointers and bounding boxes.
 - Vector storage: AoSoA blocks (`LANES=8`) for SIMD-friendly scans.
 - Labels: packed per block lane (fraud/legit).
+- Metadata tail (v2): super-bucket/group offsets plus partition order for prioritized traversal.
 
 ### Partition Key Strategy
 
@@ -113,11 +116,14 @@ This puts likely neighbors close in partition space and reduces search work.
 
 1. Quantize query vector (`double -> int16 q16`).
 2. Initialize top-k (`K=5`) with max distances.
-3. Search matching partition key first.
-4. Evaluate remaining partitions by lower-bound distance (sorted candidates).
-5. Traverse subindex nodes with branch-and-bound (or direct leaf scan when partition root is a leaf).
-6. Scan selected leaf blocks (AoSoA + SIMD) and update top-k.
-7. Count fraud labels in top-k and return fraud count.
+3. Compute partition key and derive `(card_present, mcc_bucket, is_online)` group.
+4. Visit partitions in this order:
+   - same super-bucket (`card_present`) + nearest groups first
+   - opposite super-bucket next
+5. Inside each group, evaluate partitions by lower-bound distance (sorted candidates).
+6. Traverse subindex nodes with branch-and-bound (or direct leaf scan when partition root is a leaf).
+7. Scan selected leaf blocks (AoSoA + SIMD) and update top-k.
+8. Count fraud labels in top-k and return fraud count.
 
 ### SIMD and Hot Path
 
@@ -186,7 +192,7 @@ Builds the binary scoring index used at runtime.
 
 - Input: `resources/references.json.gz`
 - Output: `resources/references.idx`
-- Format: custom little-endian structure with header, partitions, nodes, vectors, labels.
+- Format: custom little-endian structure with header, partitions, nodes, vectors, labels, and metadata tail.
 - Builds a second-level subindex inside each partition (small binary tree over sub-buckets),
   enabling branch-and-bound pruning before leaf vector scan.
 - Current default split profile emphasizes `day_of_week` (three thresholds) plus
