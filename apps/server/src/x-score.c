@@ -23,15 +23,23 @@ typedef struct {
 } ProbeCandidate;
 
 typedef struct {
+  uint32_t index;
+  unsigned long long lb;
+} RepairCandidate;
+
+typedef struct {
   int16_t q[X_SCORE_DIMS];
 #if defined(__AVX2__)
   __m256i q32[X_SCORE_DIMS];
+  __m256i qpair[X_SCORE_DIMS / 2];
 #elif defined(__ARM_NEON__)
   int16x8_t q16x8[X_SCORE_DIMS];
 #endif
 } XScoreQueryContext;
 
 #define X_SCORE_MAX_NPROBE 256U
+#define X_SCORE_DIM_PAIRS (X_SCORE_DIMS / 2)
+#define X_SCORE_REPAIR_CANDIDATE_CAP 1024U
 
 static int16_t quantize_value(double value) {
   if (value <= -1.0) {
@@ -52,6 +60,58 @@ static int16_t quantize_value(double value) {
   return (int16_t)scaled;
 }
 
+#if defined(__AVX2__)
+static inline __m256i make_qpair(const int16_t q[X_SCORE_DIMS], int pair_idx) {
+  uint32_t lo = (uint32_t)(uint16_t)q[pair_idx * 2];
+  uint32_t hi = (uint32_t)(uint16_t)q[pair_idx * 2 + 1];
+  return _mm256_set1_epi32((int32_t)(lo | (hi << 16)));
+}
+#endif
+
+static inline bool is_borderline_query(const int16_t q[X_SCORE_DIMS]) {
+  bool safe_mcc = (q[12] == 1500 || q[12] == 3000 || q[12] == 2000 || q[12] == 2500);
+  bool obvious_legit = (q[0] <= 500 && q[2] <= 500 && q[1] <= 2500 && q[8] <= 2500 && q[7] <= 500 &&
+                        safe_mcc && q[11] == 0);
+  if (obvious_legit) {
+    return false;
+  }
+
+  bool risky_mcc = (q[12] == 8500 || q[12] == 8000 || q[12] == 7500);
+  bool obvious_fraud =
+    (q[0] >= 5000 && q[1] >= 4167 && q[8] >= 3000 && q[7] >= 1500 && risky_mcc && q[11] == 10000);
+
+  if (obvious_fraud) {
+    return false;
+  }
+
+  return true;
+}
+
+static uint32_t parse_env_u32(const char *name, uint32_t default_value, bool allow_zero) {
+  const char *env = getenv(name);
+  if (env == NULL || *env == '\0') {
+    return default_value;
+  }
+
+  errno = 0;
+  char *end = NULL;
+  unsigned long parsed = strtoul(env, &end, 10);
+  if (errno != 0 || end == env || *end != '\0') {
+    return default_value;
+  }
+
+  if (parsed > (unsigned long)UINT32_MAX) {
+    return default_value;
+  }
+
+  uint32_t out = (uint32_t)parsed;
+  if (out == 0 && !allow_zero) {
+    return default_value;
+  }
+
+  return out;
+}
+
 static inline void prepare_query_context(const double query[X_SCORE_DIMS], XScoreQueryContext *ctx) {
   for (int d = 0; d < X_SCORE_DIMS; d++) {
     int16_t qd = quantize_value(query[d]);
@@ -62,6 +122,12 @@ static inline void prepare_query_context(const double query[X_SCORE_DIMS], XScor
     ctx->q16x8[d] = vdupq_n_s16(qd);
 #endif
   }
+
+#if defined(__AVX2__)
+  for (int p = 0; p < X_SCORE_DIM_PAIRS; p++) {
+    ctx->qpair[p] = make_qpair(ctx->q, p);
+  }
+#endif
 }
 
 static inline void insert_best(unsigned long long dist, uint8_t label,
@@ -281,6 +347,200 @@ static inline void insert_probe(ProbeCandidate *probes, uint32_t *probe_len, uin
   }
 }
 
+static inline uint32_t count_top_labels(const unsigned long long top_dist[X_SCORE_TOPK],
+                                        const uint8_t top_label[X_SCORE_TOPK]) {
+  uint32_t count = 0;
+  for (int i = 0; i < X_SCORE_TOPK; i++) {
+    if (top_dist[i] == ULLONG_MAX) {
+      continue;
+    }
+    count += (uint32_t)top_label[i];
+  }
+  return count;
+}
+
+static inline bool probe_contains(const ProbeCandidate *probes, uint32_t probe_len, uint32_t index) {
+  for (uint32_t i = 0; i < probe_len; i++) {
+    if (probes[i].index == index) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline void insert_repair_candidate_sorted(RepairCandidate *cands, uint32_t *cand_len,
+                                                  uint32_t cap, unsigned long long lb,
+                                                  uint32_t index) {
+  if (cap == 0) {
+    return;
+  }
+
+  if (*cand_len == cap && lb >= cands[cap - 1].lb) {
+    return;
+  }
+
+  uint32_t pos = (*cand_len < cap) ? *cand_len : (cap - 1);
+  while (pos > 0 && cands[pos - 1].lb > lb) {
+    cands[pos] = cands[pos - 1];
+    pos--;
+  }
+  cands[pos].lb = lb;
+  cands[pos].index = index;
+
+  if (*cand_len < cap) {
+    (*cand_len)++;
+  }
+}
+
+static uint32_t parse_nprobe(uint32_t centroid_count) {
+  uint32_t nprobe = parse_env_u32("X_SCORE_NPROBE", X_SCORE_DEFAULT_NPROBE, false);
+
+  if (nprobe > centroid_count) {
+    nprobe = centroid_count;
+  }
+  if (nprobe == 0) {
+    nprobe = 1;
+  }
+  if (nprobe > X_SCORE_MAX_NPROBE) {
+    nprobe = X_SCORE_MAX_NPROBE;
+  }
+
+  return nprobe;
+}
+
+static uint32_t parse_nprobe_borderline(uint32_t centroid_count) {
+  uint32_t nprobe =
+    parse_env_u32("X_SCORE_NPROBE_BORDERLINE", X_SCORE_DEFAULT_NPROBE_BORDERLINE, true);
+
+  if (nprobe == 0) {
+    return 0;
+  }
+
+  if (nprobe > centroid_count) {
+    nprobe = centroid_count;
+  }
+  if (nprobe > X_SCORE_MAX_NPROBE) {
+    nprobe = X_SCORE_MAX_NPROBE;
+  }
+
+  return nprobe;
+}
+
+static void parse_repair_window(uint32_t *out_min, uint32_t *out_max) {
+  uint32_t minv = parse_env_u32("X_SCORE_REPAIR_MIN", X_SCORE_DEFAULT_REPAIR_MIN, true);
+  uint32_t maxv = parse_env_u32("X_SCORE_REPAIR_MAX", X_SCORE_DEFAULT_REPAIR_MAX, true);
+
+  if (minv == 0 || maxv == 0) {
+    *out_min = 0;
+    *out_max = 0;
+    return;
+  }
+
+  if (minv > X_SCORE_TOPK) {
+    minv = X_SCORE_TOPK;
+  }
+  if (maxv > X_SCORE_TOPK) {
+    maxv = X_SCORE_TOPK;
+  }
+
+  if (minv > maxv) {
+    uint32_t tmp = minv;
+    minv = maxv;
+    maxv = tmp;
+  }
+
+  *out_min = minv;
+  *out_max = maxv;
+}
+
+static bool build_centroid_pair_soa(XScoreIndexView *view) {
+  view->centroid_pair_soa = NULL;
+  view->centroid_groups = 0;
+
+#if !defined(__AVX2__)
+  (void)view;
+  return true;
+#else
+  if (view->centroid_count == 0 || view->centroids_q16 == NULL) {
+    return false;
+  }
+
+  uint32_t groups = (view->centroid_count + X_SCORE_LANES - 1U) / X_SCORE_LANES;
+  size_t elem_count = (size_t)groups * X_SCORE_DIM_PAIRS * (X_SCORE_LANES * 2U);
+  if (elem_count == 0 || elem_count > (SIZE_MAX / sizeof(int16_t))) {
+    return false;
+  }
+
+  int16_t *soa = (int16_t *)malloc(elem_count * sizeof(int16_t));
+  if (soa == NULL) {
+    return false;
+  }
+
+  memset(soa, 0, elem_count * sizeof(int16_t));
+
+  for (uint32_t g = 0; g < groups; g++) {
+    for (int p = 0; p < X_SCORE_DIM_PAIRS; p++) {
+      int16_t *dst = soa + ((size_t)g * X_SCORE_DIM_PAIRS + (size_t)p) * (X_SCORE_LANES * 2U);
+      for (uint32_t lane = 0; lane < X_SCORE_LANES; lane++) {
+        uint32_t cidx = g * X_SCORE_LANES + lane;
+        if (cidx >= view->centroid_count) {
+          continue;
+        }
+
+        const int16_t *src = view->centroids_q16 + (size_t)cidx * X_SCORE_DIMS;
+        dst[(size_t)lane * 2U] = src[p * 2];
+        dst[(size_t)lane * 2U + 1U] = src[p * 2 + 1U];
+      }
+    }
+  }
+
+  view->centroid_pair_soa = soa;
+  view->centroid_groups = groups;
+  return true;
+#endif
+}
+
+static void find_top_centroids(const XScoreIndexView *view, const XScoreQueryContext *ctx,
+                               ProbeCandidate *probes, uint32_t *probe_len, uint32_t probe_cap) {
+  *probe_len = 0;
+
+#if defined(__AVX2__)
+  if (view->centroid_pair_soa != NULL && view->centroid_groups > 0) {
+    for (uint32_t g = 0; g < view->centroid_groups; g++) {
+      const int16_t *src = view->centroid_pair_soa +
+                           (size_t)g * X_SCORE_DIM_PAIRS * (X_SCORE_LANES * 2U);
+      __m256i acc = _mm256_setzero_si256();
+
+      for (int p = 0; p < X_SCORE_DIM_PAIRS; p++) {
+        __m256i vc = _mm256_loadu_si256((const __m256i *)(const void *)(src + p * 16));
+        __m256i diff = _mm256_sub_epi16(ctx->qpair[p], vc);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff, diff));
+      }
+
+      int32_t dists[8];
+      _mm256_storeu_si256((__m256i *)(void *)dists, acc);
+
+      uint32_t base = g * X_SCORE_LANES;
+      uint32_t lim = view->centroid_count - base;
+      if (lim > X_SCORE_LANES) {
+        lim = X_SCORE_LANES;
+      }
+
+      for (uint32_t lane = 0; lane < lim; lane++) {
+        insert_probe(probes, probe_len, probe_cap, (unsigned long long)(uint32_t)dists[lane], base + lane);
+      }
+    }
+    return;
+  }
+#endif
+
+  for (uint32_t cidx = 0; cidx < view->centroid_count; cidx++) {
+    const int16_t *centroid = view->centroids_q16 + (size_t)cidx * X_SCORE_DIMS;
+    unsigned long long dist = centroid_distance_sq(ctx->q, centroid);
+    insert_probe(probes, probe_len, probe_cap, dist, cidx);
+  }
+}
+
 static inline void scan_list(const XScoreIndexView *view, const XScoreListEntry *list,
                              const XScoreQueryContext *ctx, unsigned long long top_dist[X_SCORE_TOPK],
                              uint8_t top_label[X_SCORE_TOPK]) {
@@ -296,6 +556,79 @@ static inline void scan_list(const XScoreIndexView *view, const XScoreListEntry 
   uint32_t start_block = (uint32_t)list->start_block;
   uint32_t remaining = total_len;
 
+#if defined(__AVX2__)
+  for (uint32_t b = 0; b < total_blocks; b++) {
+    uint32_t block_idx = start_block + b;
+    const int16_t *block = vectors + (size_t)block_idx * X_SCORE_DIMS * X_SCORE_LANES;
+#if defined(__GNUC__)
+    if (b + 2 < total_blocks) {
+      const int16_t *next = vectors + (size_t)(start_block + b + 2) * X_SCORE_DIMS * X_SCORE_LANES;
+      __builtin_prefetch(next, 0, 1);
+    }
+#endif
+
+    int32_t max_top_i32 = (top_dist[X_SCORE_TOPK - 1] > (unsigned long long)INT32_MAX)
+                            ? INT32_MAX
+                            : (int32_t)top_dist[X_SCORE_TOPK - 1];
+    __m256i vmax = _mm256_set1_epi32(max_top_i32);
+
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+
+#define X_SCORE_SPAIR(pair_idx, acc)                                                                 \
+  do {                                                                                                \
+    __m256i vc = _mm256_loadu_si256((const __m256i *)(const void *)(block + (pair_idx) * 16));      \
+    __m256i diff = _mm256_sub_epi16(ctx->qpair[(pair_idx)], vc);                                     \
+    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff, diff));                                      \
+  } while (0)
+
+    X_SCORE_SPAIR(0, acc0);
+    X_SCORE_SPAIR(1, acc1);
+    X_SCORE_SPAIR(2, acc0);
+
+    __m256i partial = _mm256_add_epi32(acc0, acc1);
+    if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(vmax, partial)) == 0) {
+      uint32_t lane_count = (remaining >= X_SCORE_LANES) ? X_SCORE_LANES : remaining;
+      remaining -= lane_count;
+      continue;
+    }
+
+    X_SCORE_SPAIR(3, acc1);
+    X_SCORE_SPAIR(4, acc0);
+
+    partial = _mm256_add_epi32(acc0, acc1);
+    if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(vmax, partial)) == 0) {
+      uint32_t lane_count = (remaining >= X_SCORE_LANES) ? X_SCORE_LANES : remaining;
+      remaining -= lane_count;
+      continue;
+    }
+
+    X_SCORE_SPAIR(5, acc1);
+    X_SCORE_SPAIR(6, acc0);
+
+#undef X_SCORE_SPAIR
+
+    int32_t dists32[8];
+    _mm256_storeu_si256((__m256i *)(void *)dists32, _mm256_add_epi32(acc0, acc1));
+
+    uint32_t lane_count = (remaining >= X_SCORE_LANES) ? X_SCORE_LANES : remaining;
+    remaining -= lane_count;
+
+    size_t label_base = (size_t)block_idx * X_SCORE_LANES;
+    unsigned long long worst = top_dist[X_SCORE_TOPK - 1];
+    for (uint32_t lane = 0; lane < lane_count; lane++) {
+      unsigned long long d = (unsigned long long)(uint32_t)dists32[lane];
+      if (d < worst) {
+        insert_best(d, labels[label_base + lane], top_dist, top_label);
+        worst = top_dist[X_SCORE_TOPK - 1];
+      }
+    }
+
+    if (top_dist[X_SCORE_TOPK - 1] == 0) {
+      break;
+    }
+  }
+#else
   unsigned long long dists[X_SCORE_LANES];
   for (uint32_t b = 0; b < total_blocks; b++) {
     uint32_t block_idx = start_block + b;
@@ -326,30 +659,57 @@ static inline void scan_list(const XScoreIndexView *view, const XScoreListEntry 
       break;
     }
   }
+#endif
 }
 
-static uint32_t parse_nprobe(uint32_t centroid_count) {
-  uint32_t nprobe = X_SCORE_DEFAULT_NPROBE;
-  const char *env = getenv("X_SCORE_NPROBE");
-  if (env != NULL && *env != '\0') {
-    errno = 0;
-    char *end = NULL;
-    unsigned long parsed = strtoul(env, &end, 10);
-    if (errno == 0 && end != env && *end == '\0' && parsed > 0) {
-      nprobe = (uint32_t)parsed;
-    }
+static void repair_lists_if_ambiguous(const XScoreIndexView *view, const XScoreQueryContext *ctx,
+                                      const ProbeCandidate *probes, uint32_t probe_len,
+                                      unsigned long long top_dist[X_SCORE_TOPK],
+                                      uint8_t top_label[X_SCORE_TOPK]) {
+  if (view->repair_min == 0 || view->repair_max == 0 || view->repair_min > view->repair_max) {
+    return;
   }
 
-  if (nprobe > centroid_count) {
-    nprobe = centroid_count;
+  uint32_t fraud_count = count_top_labels(top_dist, top_label);
+  if (fraud_count < view->repair_min || fraud_count > view->repair_max) {
+    return;
   }
-  if (nprobe == 0) {
-    nprobe = 1;
+
+  RepairCandidate cands[X_SCORE_REPAIR_CANDIDATE_CAP];
+  uint32_t cand_len = 0;
+  unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
+
+  for (uint32_t cidx = 0; cidx < view->centroid_count; cidx++) {
+    if (probe_contains(probes, probe_len, cidx)) {
+      continue;
+    }
+
+    const XScoreListEntry *list = &view->lists[cidx];
+    if (list->len <= 0) {
+      continue;
+    }
+
+    unsigned long long lb = lower_bound_list_sq_cutoff(ctx->q, list, cutoff);
+    if (lb >= cutoff) {
+      continue;
+    }
+
+    insert_repair_candidate_sorted(cands, &cand_len, X_SCORE_REPAIR_CANDIDATE_CAP, lb, cidx);
   }
-  if (nprobe > X_SCORE_MAX_NPROBE) {
-    nprobe = X_SCORE_MAX_NPROBE;
+
+  for (uint32_t i = 0; i < cand_len; i++) {
+    if (cands[i].lb >= top_dist[X_SCORE_TOPK - 1]) {
+      break;
+    }
+
+    const XScoreListEntry *list = &view->lists[cands[i].index];
+    scan_list(view, list, ctx, top_dist, top_label);
+
+    fraud_count = count_top_labels(top_dist, top_label);
+    if (fraud_count < view->repair_min || fraud_count > view->repair_max) {
+      break;
+    }
   }
-  return nprobe;
 }
 
 bool x_score_open(const char *path, XScoreIndexView *out_view) {
@@ -478,6 +838,13 @@ bool x_score_open(const char *path, XScoreIndexView *out_view) {
   out_view->centroid_count = centroid_count;
   out_view->block_count = block_count;
   out_view->nprobe = parse_nprobe(centroid_count);
+  out_view->nprobe_borderline = parse_nprobe_borderline(centroid_count);
+  parse_repair_window(&out_view->repair_min, &out_view->repair_max);
+
+  if (!build_centroid_pair_soa(out_view)) {
+    x_score_close(out_view);
+    return false;
+  }
 
 #ifdef MADV_HUGEPAGE
   (void)madvise((void *)vectors_q16, vectors_bytes, MADV_HUGEPAGE);
@@ -505,6 +872,8 @@ void x_score_close(XScoreIndexView *view) {
     return;
   }
 
+  free(view->centroid_pair_soa);
+
   if (view->mapped && view->raw && view->size > 0) {
     munmap(view->raw, view->size);
   }
@@ -513,8 +882,6 @@ void x_score_close(XScoreIndexView *view) {
 }
 
 uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double query[X_SCORE_DIMS]) {
-  uint8_t fraud_count = 0;
-
   if (!view || !query || !view->header || !view->centroids_q16 || !view->lists || !view->vectors_q16 ||
       !view->labels) {
     return 0;
@@ -535,6 +902,10 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
   }
 
   uint32_t nprobe = view->nprobe;
+  if (view->nprobe_borderline > 0 && is_borderline_query(qctx.q)) {
+    nprobe = view->nprobe_borderline;
+  }
+
   if (nprobe == 0) {
     nprobe = 1;
   }
@@ -547,12 +918,7 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
 
   ProbeCandidate probes[X_SCORE_MAX_NPROBE];
   uint32_t probe_len = 0;
-
-  for (uint32_t cidx = 0; cidx < view->centroid_count; cidx++) {
-    const int16_t *centroid = view->centroids_q16 + (size_t)cidx * X_SCORE_DIMS;
-    unsigned long long dist = centroid_distance_sq(qctx.q, centroid);
-    insert_probe(probes, &probe_len, nprobe, dist, cidx);
-  }
+  find_top_centroids(view, &qctx, probes, &probe_len, nprobe);
 
   for (uint32_t i = 0; i < probe_len; i++) {
     const XScoreListEntry *list = &view->lists[probes[i].index];
@@ -568,16 +934,13 @@ uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double qu
     scan_list(view, list, &qctx, top_dist, top_label);
   }
 
-  for (int i = 0; i < X_SCORE_TOPK; i++) {
-    if (top_dist[i] == ULLONG_MAX) {
-      continue;
-    }
-    if (top_label[i] == 1) {
-      fraud_count++;
-    }
-  }
+  repair_lists_if_ambiguous(view, &qctx, probes, probe_len, top_dist, top_label);
 
-  return fraud_count;
+  uint32_t fraud_count = count_top_labels(top_dist, top_label);
+  if (fraud_count > X_SCORE_TOPK) {
+    fraud_count = X_SCORE_TOPK;
+  }
+  return (uint8_t)fraud_count;
 }
 
 uint8_t x_score_predict_label(const XScoreIndexView *view, const double query[X_SCORE_DIMS]) {

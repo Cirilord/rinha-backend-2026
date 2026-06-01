@@ -10,7 +10,10 @@
 #define X_SCORE_TOPK 5
 #define X_SCORE_SCALE 10000
 #define X_SCORE_MAGIC "RNSPIVF1"
-#define X_SCORE_DEFAULT_NPROBE 16
+#define X_SCORE_DEFAULT_NPROBE 12
+#define X_SCORE_DEFAULT_NPROBE_BORDERLINE 0
+#define X_SCORE_DEFAULT_REPAIR_MIN 2
+#define X_SCORE_DEFAULT_REPAIR_MAX 3
 
 typedef struct {
   char magic[8];
@@ -48,6 +51,11 @@ typedef struct {
   uint32_t centroid_count;
   uint32_t block_count;
   uint32_t nprobe;
+  uint32_t nprobe_borderline;
+  uint32_t repair_min;
+  uint32_t repair_max;
+  int16_t *centroid_pair_soa;
+  uint32_t centroid_groups;
 } XScoreIndexView;
 
 bool x_score_open(const char *path, XScoreIndexView *out_view);

@@ -95,10 +95,13 @@ This section describes the vector search strategy used in `apps/server/src/x-sco
 
 1. Quantize query vector (`double -> int16 q16`).
 2. Compute distance to all IVF centroids.
-3. Select the nearest `nprobe` centroid lists.
+3. Select the nearest centroid lists using:
+   - `X_SCORE_NPROBE` by default
+   - `X_SCORE_NPROBE_BORDERLINE` for borderline transactions (when configured)
 4. Optionally prune lists using list AABB lower bound vs current top-k worst distance.
 5. Scan selected list blocks (AoSoA + SIMD) and update top-k (`K=5`).
-6. Count fraud labels in top-k and return fraud count.
+6. If top-k fraud count is ambiguous, run a bounded repair pass over extra candidate lists.
+7. Count fraud labels in top-k and return fraud count.
 
 ### SIMD and Hot Path
 
@@ -107,7 +110,11 @@ The `scan_block` hot path is architecture-specific:
 - `__ARM_NEON__` for `arm64`
 - scalar fallback otherwise
 
-`nprobe` is configurable at runtime via `X_SCORE_NPROBE` (default `16`).
+Runtime tuning:
+- `X_SCORE_NPROBE` (default `12`)
+- `X_SCORE_NPROBE_BORDERLINE` (default `0`, disabled)
+- `X_SCORE_REPAIR_MIN` (default `2`)
+- `X_SCORE_REPAIR_MAX` (default `3`)
 
 ## 4. Build System (Makefile)
 
@@ -251,7 +258,10 @@ Total: **1.00 CPU / 350MB**.
 ### API
 - `UNIX_SOCKET_PATH` (required)
 - `X_SCORE_INDEX_PATH` (required)
-- `X_SCORE_NPROBE` (optional, default `16`)
+- `X_SCORE_NPROBE` (optional, default `12`)
+- `X_SCORE_NPROBE_BORDERLINE` (optional, default `0`, set `>0` to enable adaptive probes)
+- `X_SCORE_REPAIR_MIN` (optional, default `2`, set `0` to disable repair pass)
+- `X_SCORE_REPAIR_MAX` (optional, default `3`, set `0` to disable repair pass)
 
 ### Load Balancer
 - `PORT` (default `9999`)
