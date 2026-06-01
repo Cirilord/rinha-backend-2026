@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build `resources/references.idx` in a specialist exact-kNN format.
+Build `resources/references.idx` in IVF format (centroids + inverted lists).
 
 Input:
 - resources/references.json.gz
@@ -10,27 +10,33 @@ Output:
 
 Layout (little-endian):
 - header: magic(8) + scale(i32) + dims(i32) + ref_count(i32) +
-          partition_count(i32) + node_count(i32) + block_count(i32)
-- partition directory (72 bytes each)
-- node directory (72 bytes each)
+          centroid_count(i32) + block_count(i32) + reserved(i32)
+- centroid table: centroid_count * dims * i16
+- list directory (72 bytes each):
+  - start_block(i32)
+  - block_count(i32)
+  - len(i32)
+  - reserved(i32)
+  - min[dims] (i16)
+  - max[dims] (i16)
 - vectors in AoSoA blocks (LANES=8): for each block -> dims -> lanes -> i16
 - labels in block order: for each block -> lanes -> u8
-- optional metadata tail:
-  - meta header: magic(8) + version(u32) + partition_count(u32) +
-                 super_bucket_count(u32=2) + groups_per_super(u32=8)
-  - super offsets: 3 * u32
-  - per-super group offsets: 2 * (8 + 1) * u32
-  - partition indices ordered by super/group: partition_count * u32
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
+import random
 import struct
 from array import array
-from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - fallback path
+    np = None
 
 INPUT_PATH = Path("resources/references.json.gz")
 OUTPUT_IDX_PATH = Path("resources/references.idx")
@@ -38,47 +44,30 @@ OUTPUT_IDX_PATH = Path("resources/references.idx")
 DIMS = 14
 LANES = 8
 SCALE = 10000
-MAGIC = b"RNSPCST1"
-META_MAGIC = b"RNSPMETA"
-META_VERSION = 1
+MAGIC = b"RNSPIVF1"
 
-# Second-level split bits (inside each primary partition key)
-SUBINDEX_SPLITS: tuple[tuple[int, int], ...] = (
-    (4, 2500),   # day_of_week
-    (4, 5000),   # day_of_week
-    (4, 7500),   # day_of_week
-    (0, 2500),   # amount
-    (8, 2500),   # tx_count_24h
-    (13, 2000),  # merchant_avg_amount
-)
+DEFAULT_NLIST = 64
+DEFAULT_MAX_ITER = 10
+DEFAULT_SEED = 2026
+DEFAULT_CHUNK = 4096
 
 
-@dataclass
-class BucketData:
-    count: int = 0
-    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
-    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
-    vectors: array = field(default_factory=lambda: array("h"))
-    labels: bytearray = field(default_factory=bytearray)
-
-
-@dataclass
-class PartitionData:
-    key: int
-    count: int = 0
-    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
-    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
-    buckets: dict[int, BucketData] = field(default_factory=dict)
-
-
-@dataclass
-class TreeNode:
-    minv: list[int]
-    maxv: list[int]
-    length: int
-    left: TreeNode | None = None
-    right: TreeNode | None = None
-    bucket: BucketData | None = None
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build IVF binary index for fraud scoring")
+    parser.add_argument("--input", type=Path, default=INPUT_PATH, help="path to references.json.gz")
+    parser.add_argument("--output", type=Path, default=OUTPUT_IDX_PATH, help="path to output .idx")
+    parser.add_argument("--nlist", type=int, default=DEFAULT_NLIST, help="number of IVF centroids")
+    parser.add_argument(
+        "--max-iter", type=int, default=DEFAULT_MAX_ITER, help="max k-means iterations"
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="random seed")
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK,
+        help="chunk size used during vectorized assignment",
+    )
+    return parser.parse_args()
 
 
 def quantize(value: float) -> int:
@@ -91,213 +80,149 @@ def quantize(value: float) -> int:
     return int(round(value * SCALE))
 
 
-def compute_partition_key(qvec: list[int]) -> int:
-    key = 0
-
-    if qvec[5] >= 0:
-        key |= 1 << 0
-    if qvec[9] > 0:
-        key |= 1 << 1
-    if qvec[10] > 0:
-        key |= 1 << 2
-    if qvec[11] > 0:
-        key |= 1 << 3
-
-    if qvec[12] <= 2000:
-        mcc_bucket = 0
-    elif qvec[12] <= 3000:
-        mcc_bucket = 1
-    elif qvec[12] <= 7500:
-        mcc_bucket = 2
-    else:
-        mcc_bucket = 3
-    key |= mcc_bucket << 4
-
-    if qvec[2] > 1013:
-        key |= 1 << 6
-    if qvec[8] > 2500:
-        key |= 1 << 7
-
-    return key
+def clamp_i16(value: int) -> int:
+    if value < -32768:
+        return -32768
+    if value > 32767:
+        return 32767
+    return value
 
 
-def compute_subindex_key(qvec: list[int]) -> int:
-    key = 0
-    for bit, (dim, cutoff) in enumerate(SUBINDEX_SPLITS):
-        if qvec[dim] > cutoff:
-            key |= 1 << bit
-    return key
+def assign_points_numpy(vectors: "np.ndarray", centroids: "np.ndarray", chunk_size: int) -> "np.ndarray":
+    n = vectors.shape[0]
+    assignments = np.empty(n, dtype=np.int32)
+
+    centroid_sq = np.sum(centroids * centroids, axis=1, dtype=np.float32)
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = vectors[start:end]
+        chunk_sq = np.sum(chunk * chunk, axis=1, dtype=np.float32)[:, None]
+
+        # ||x-c||^2 = ||x||^2 + ||c||^2 - 2x.c
+        dists = chunk_sq + centroid_sq[None, :] - 2.0 * (chunk @ centroids.T)
+        assignments[start:end] = np.argmin(dists, axis=1).astype(np.int32)
+
+    return assignments
 
 
-def partition_super_bucket(key: int) -> int:
-    return (key >> 2) & 1
+def fit_kmeans_numpy(
+    vectors_q16: "np.ndarray", nlist: int, max_iter: int, seed: int, chunk_size: int
+) -> tuple["np.ndarray", "np.ndarray"]:
+    rng = np.random.default_rng(seed)
+    n = vectors_q16.shape[0]
+
+    seed_indices = rng.choice(n, size=nlist, replace=False)
+    centroids = vectors_q16[seed_indices].astype(np.float32, copy=True)
+
+    prev_assignments = None
+
+    for it in range(max_iter):
+        assignments = assign_points_numpy(vectors_q16, centroids, chunk_size)
+        changes = (
+            int(assignments.size)
+            if prev_assignments is None
+            else int(np.count_nonzero(assignments != prev_assignments))
+        )
+
+        counts = np.bincount(assignments, minlength=nlist).astype(np.int64)
+        sums = np.zeros((nlist, DIMS), dtype=np.float64)
+        for d in range(DIMS):
+            sums[:, d] = np.bincount(assignments, weights=vectors_q16[:, d], minlength=nlist)
+
+        non_empty = counts > 0
+        centroids[non_empty] = (sums[non_empty] / counts[non_empty, None]).astype(np.float32)
+
+        empty_idx = np.flatnonzero(~non_empty)
+        if empty_idx.size > 0:
+            refill = rng.choice(n, size=empty_idx.size, replace=False)
+            centroids[empty_idx] = vectors_q16[refill].astype(np.float32)
+
+        prev_assignments = assignments
+        print(f"kmeans iter {it + 1}/{max_iter}: changed={changes}")
+        if changes == 0:
+            break
+
+    final_assignments = assign_points_numpy(vectors_q16, centroids, chunk_size)
+    return centroids, final_assignments
 
 
-def partition_group_bucket(key: int) -> int:
-    mcc_bucket = (key >> 4) & 0b11
-    is_online = (key >> 1) & 0b1
-    return (mcc_bucket << 1) | is_online
-
-
-def build_super_group_metadata(partition_entries: list[tuple[int, int, int, list[int], list[int], int]]) -> tuple[list[int], list[list[int]], list[int]]:
-    partition_count = len(partition_entries)
-    groups_per_super = 8
-    super_buckets = 2
-    total_groups = groups_per_super * super_buckets
-
-    counts = [0] * total_groups
-    for key, *_ in partition_entries:
-        sup = partition_super_bucket(key)
-        grp = partition_group_bucket(key)
-        counts[sup * groups_per_super + grp] += 1
-
-    super_offsets = [0, sum(counts[:groups_per_super]), partition_count]
-
-    group_offsets = [[0] * (groups_per_super + 1) for _ in range(super_buckets)]
-    group_offsets[0][0] = super_offsets[0]
-    for g in range(groups_per_super):
-        group_offsets[0][g + 1] = group_offsets[0][g] + counts[g]
-
-    group_offsets[1][0] = super_offsets[1]
-    for g in range(groups_per_super):
-        idx = groups_per_super + g
-        group_offsets[1][g + 1] = group_offsets[1][g] + counts[idx]
-
-    cursor = [0] * total_groups
-    for g in range(groups_per_super):
-        cursor[g] = group_offsets[0][g]
-        cursor[groups_per_super + g] = group_offsets[1][g]
-
-    partition_indices = [0] * partition_count
-    for idx, (key, *_rest) in enumerate(partition_entries):
-        sup = partition_super_bucket(key)
-        grp = partition_group_bucket(key)
-        global_group = sup * groups_per_super + grp
-        out_pos = cursor[global_group]
-        partition_indices[out_pos] = idx
-        cursor[global_group] += 1
-
-    return super_offsets, group_offsets, partition_indices
-
-
-def update_minmax(minv: list[int], maxv: list[int], qvec: list[int]) -> None:
-    for d, v in enumerate(qvec):
-        if v < minv[d]:
-            minv[d] = v
-        if v > maxv[d]:
-            maxv[d] = v
-
-
-def merge_bounds(a_min: list[int], a_max: list[int], b_min: list[int], b_max: list[int]) -> tuple[list[int], list[int]]:
-    out_min = [0] * DIMS
-    out_max = [0] * DIMS
+def l2_sq_int(a: list[int], b: list[int]) -> int:
+    total = 0
     for d in range(DIMS):
-        out_min[d] = a_min[d] if a_min[d] < b_min[d] else b_min[d]
-        out_max[d] = a_max[d] if a_max[d] > b_max[d] else b_max[d]
-    return out_min, out_max
+        diff = a[d] - b[d]
+        total += diff * diff
+    return total
 
 
-def build_tree_from_leaves(leaves: list[TreeNode]) -> TreeNode:
-    if len(leaves) == 1:
-        return leaves[0]
-
-    gmin = [32767] * DIMS
-    gmax = [-32768] * DIMS
-    for leaf in leaves:
-        for d in range(DIMS):
-            if leaf.minv[d] < gmin[d]:
-                gmin[d] = leaf.minv[d]
-            if leaf.maxv[d] > gmax[d]:
-                gmax[d] = leaf.maxv[d]
-
-    split_dim = 0
-    split_span = gmax[0] - gmin[0]
-    for d in range(1, DIMS):
-        span = gmax[d] - gmin[d]
-        if span > split_span:
-            split_span = span
-            split_dim = d
-
-    ordered = sorted(leaves, key=lambda n: n.minv[split_dim] + n.maxv[split_dim])
-    mid = len(ordered) // 2
-    left = build_tree_from_leaves(ordered[:mid])
-    right = build_tree_from_leaves(ordered[mid:])
-
-    merged_min, merged_max = merge_bounds(left.minv, left.maxv, right.minv, right.maxv)
-    return TreeNode(
-        minv=merged_min,
-        maxv=merged_max,
-        length=left.length + right.length,
-        left=left,
-        right=right,
-        bucket=None,
-    )
+def nearest_centroid_int(vec: list[int], centroids: list[list[int]]) -> int:
+    best_idx = 0
+    best_dist = l2_sq_int(vec, centroids[0])
+    for cidx in range(1, len(centroids)):
+        dist = l2_sq_int(vec, centroids[cidx])
+        if dist < best_dist:
+            best_idx = cidx
+            best_dist = dist
+    return best_idx
 
 
-def emit_bucket(bucket: BucketData, vectors_blob: array, labels_blob: bytearray, running_blocks: int) -> tuple[int, int]:
-    start_block = running_blocks
-    count = bucket.count
-    blocks = (count + LANES - 1) // LANES
+def fit_kmeans_fallback(vectors: list[list[int]], nlist: int, max_iter: int, seed: int) -> tuple[list[list[int]], list[int]]:
+    # Python-only fallback (no numpy): keep a conservative setup to avoid very long build times.
+    n = len(vectors)
+    rng = random.Random(seed)
+    seeds = rng.sample(range(n), nlist)
+    centroids = [vectors[idx][:] for idx in seeds]
 
-    data = bucket.vectors
-    labels = bucket.labels
+    assignments = [-1] * n
+    for it in range(max_iter):
+        sums = [[0] * DIMS for _ in range(nlist)]
+        counts = [0] * nlist
+        changes = 0
 
-    for b in range(blocks):
-        base_idx = b * LANES
-        for d in range(DIMS):
-            for lane in range(LANES):
-                i = base_idx + lane
-                if i < count:
-                    vectors_blob.append(data[i * DIMS + d])
-                else:
-                    vectors_blob.append(0)
-        for lane in range(LANES):
-            i = base_idx + lane
-            if i < count:
-                labels_blob.append(labels[i])
-            else:
-                labels_blob.append(0)
+        for i, vec in enumerate(vectors):
+            cidx = nearest_centroid_int(vec, centroids)
+            if assignments[i] != cidx:
+                assignments[i] = cidx
+                changes += 1
 
-    return start_block, blocks
+            counts[cidx] += 1
+            dst = sums[cidx]
+            for d in range(DIMS):
+                dst[d] += vec[d]
 
+        for cidx in range(nlist):
+            ccount = counts[cidx]
+            if ccount == 0:
+                centroids[cidx] = vectors[(cidx * 1301081 + it * 7919) % n][:]
+                continue
+            src = sums[cidx]
+            dst = centroids[cidx]
+            inv = float(ccount)
+            for d in range(DIMS):
+                dst[d] = int(round(src[d] / inv))
 
-def emit_tree(
-    node: TreeNode,
-    vectors_blob: array,
-    labels_blob: bytearray,
-    node_entries: list[tuple[int, int, int, int, list[int], list[int]]],
-    running_blocks: int,
-) -> tuple[int, int]:
-    if node.bucket is not None:
-        start_block, blocks = emit_bucket(node.bucket, vectors_blob, labels_blob, running_blocks)
-        running_blocks += blocks
-        node_idx = len(node_entries)
-        node_entries.append((-1, -1, start_block, node.length, node.minv, node.maxv))
-        return node_idx, running_blocks
+        print(f"kmeans iter {it + 1}/{max_iter}: changed={changes}")
+        if changes == 0:
+            break
 
-    if node.left is None or node.right is None:
-        raise RuntimeError("invalid internal tree node")
-
-    left_idx, running_blocks = emit_tree(node.left, vectors_blob, labels_blob, node_entries, running_blocks)
-    right_idx, running_blocks = emit_tree(node.right, vectors_blob, labels_blob, node_entries, running_blocks)
-
-    node_idx = len(node_entries)
-    node_entries.append((left_idx, right_idx, -1, node.length, node.minv, node.maxv))
-    return node_idx, running_blocks
+    final_assignments = [nearest_centroid_int(vec, centroids) for vec in vectors]
+    return centroids, final_assignments
 
 
 def main() -> None:
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"input not found: {INPUT_PATH}")
+    args = parse_args()
 
-    with gzip.open(INPUT_PATH, "rt", encoding="utf-8") as f:
+    if not args.input.exists():
+        raise FileNotFoundError(f"input not found: {args.input}")
+
+    with gzip.open(args.input, "rt", encoding="utf-8") as f:
         rows = json.load(f)
 
     if not isinstance(rows, list) or len(rows) == 0:
         raise ValueError("invalid or empty dataset")
 
-    partitions: dict[int, PartitionData] = {}
-    total_count = 0
+    vectors: list[list[int]] = []
+    labels: list[int] = []
 
     for i, row in enumerate(rows):
         vector = row.get("vector")
@@ -305,85 +230,80 @@ def main() -> None:
         if not isinstance(vector, list) or len(vector) != DIMS:
             raise ValueError(f"invalid vector at index {i}")
 
-        qvec = [quantize(float(x)) for x in vector]
-        lbl = 1 if label == "fraud" else 0
-        pkey = compute_partition_key(qvec)
+        vectors.append([quantize(float(x)) for x in vector])
+        labels.append(1 if label == "fraud" else 0)
 
-        p = partitions.get(pkey)
-        if p is None:
-            p = PartitionData(key=pkey)
-            partitions[pkey] = p
+    total_count = len(vectors)
+    nlist = max(1, min(args.nlist, total_count))
 
-        p.count += 1
-        update_minmax(p.minv, p.maxv, qvec)
+    if np is not None:
+        vectors_np = np.asarray(vectors, dtype=np.float32)
+        centroids_np, assignments_np = fit_kmeans_numpy(
+            vectors_np, nlist=nlist, max_iter=args.max_iter, seed=args.seed, chunk_size=max(256, args.chunk_size)
+        )
+        centroids_int = np.rint(centroids_np).astype(np.int16)
+        assignments = assignments_np.tolist()
+    else:  # pragma: no cover - fallback path
+        if nlist > 32:
+            print("numpy not available; clamping nlist to 32 for manageable build time")
+            nlist = 32
+        fallback_iter = min(args.max_iter, 6)
+        centroids_py, assignments = fit_kmeans_fallback(vectors, nlist, fallback_iter, args.seed)
+        centroids_int = [[clamp_i16(v) for v in c] for c in centroids_py]
 
-        skey = compute_subindex_key(qvec)
-        bucket = p.buckets.get(skey)
-        if bucket is None:
-            bucket = BucketData()
-            p.buckets[skey] = bucket
-
-        bucket.count += 1
-        bucket.labels.append(lbl)
-        bucket.vectors.extend(qvec)
-        update_minmax(bucket.minv, bucket.maxv, qvec)
-
-        total_count += 1
-
-    sorted_keys = sorted(partitions.keys())
-    partition_count = len(sorted_keys)
-
-    partition_entries: list[tuple[int, int, int, list[int], list[int], int]] = []
-    node_entries: list[tuple[int, int, int, int, list[int], list[int]]] = []
+    postings: list[list[int]] = [[] for _ in range(nlist)]
+    for vidx, cidx in enumerate(assignments):
+        postings[cidx].append(vidx)
 
     vectors_blob = array("h")
     labels_blob = bytearray()
+    list_entries: list[tuple[int, int, int, list[int], list[int]]] = []
+
     running_blocks = 0
-    max_leaves_per_partition = 0
+    for cidx in range(nlist):
+        ids = postings[cidx]
+        llen = len(ids)
+        lblocks = (llen + LANES - 1) // LANES
+        start_block = running_blocks
 
-    for key in sorted_keys:
-        p = partitions[key]
+        minv = [32767] * DIMS
+        maxv = [-32768] * DIMS
 
-        leaves: list[TreeNode] = []
-        for _, bucket in sorted(p.buckets.items(), key=lambda kv: kv[0]):
-            if bucket.count <= 0:
-                continue
-            leaves.append(
-                TreeNode(
-                    minv=bucket.minv.copy(),
-                    maxv=bucket.maxv.copy(),
-                    length=bucket.count,
-                    left=None,
-                    right=None,
-                    bucket=bucket,
-                )
-            )
+        if llen == 0:
+            minv = [0] * DIMS
+            maxv = [0] * DIMS
 
-        if not leaves:
-            continue
+        for b in range(lblocks):
+            base = b * LANES
+            for d in range(DIMS):
+                for lane in range(LANES):
+                    pos = base + lane
+                    if pos < llen:
+                        vec = vectors[ids[pos]]
+                        val = vec[d]
+                        vectors_blob.append(val)
+                        if val < minv[d]:
+                            minv[d] = val
+                        if val > maxv[d]:
+                            maxv[d] = val
+                    else:
+                        vectors_blob.append(0)
+            for lane in range(LANES):
+                pos = base + lane
+                if pos < llen:
+                    labels_blob.append(labels[ids[pos]])
+                else:
+                    labels_blob.append(0)
 
-        if len(leaves) > max_leaves_per_partition:
-            max_leaves_per_partition = len(leaves)
+        running_blocks += lblocks
+        list_entries.append((start_block, lblocks, llen, minv, maxv))
 
-        root = build_tree_from_leaves(leaves)
-        root_idx, running_blocks = emit_tree(root, vectors_blob, labels_blob, node_entries, running_blocks)
-        partition_entries.append((key, root_idx, p.count, p.minv, p.maxv, len(leaves)))
-
-        # release partition payload after emitting
-        for bucket in p.buckets.values():
-            bucket.vectors = array("h")
-            bucket.labels = bytearray()
-        p.buckets.clear()
-
-    node_count = len(node_entries)
     total_blocks = running_blocks
 
     if len(vectors_blob) != total_blocks * DIMS * LANES:
         raise RuntimeError("invalid vectors blob size")
     if len(labels_blob) != total_blocks * LANES:
         raise RuntimeError("invalid labels blob size")
-    if partition_count != len(partition_entries):
-        raise RuntimeError("partition count mismatch")
 
     out = bytearray()
     out.extend(
@@ -393,50 +313,39 @@ def main() -> None:
             SCALE,
             DIMS,
             total_count,
-            partition_count,
-            node_count,
+            nlist,
             total_blocks,
+            0,
         )
     )
 
-    for key, root, length, minv, maxv, _leaf_count in partition_entries:
-        out.extend(struct.pack("<Iiii", key, root, 0, length))
-        out.extend(struct.pack("<" + "h" * DIMS, *minv))
-        out.extend(struct.pack("<" + "h" * DIMS, *maxv))
+    for cidx in range(nlist):
+        centroid = centroids_int[cidx]
+        if np is not None:
+            packed = [clamp_i16(int(v)) for v in centroid.tolist()]
+        else:  # pragma: no cover - fallback path
+            packed = [clamp_i16(int(v)) for v in centroid]
+        out.extend(struct.pack("<" + "h" * DIMS, *packed))
 
-    for left, right, start_block, length, minv, maxv in node_entries:
-        out.extend(struct.pack("<iiii", left, right, start_block, length))
+    for start_block, block_count, llen, minv, maxv in list_entries:
+        out.extend(struct.pack("<iiii", start_block, block_count, llen, 0))
         out.extend(struct.pack("<" + "h" * DIMS, *minv))
         out.extend(struct.pack("<" + "h" * DIMS, *maxv))
 
     out.extend(vectors_blob.tobytes())
     out.extend(labels_blob)
 
-    super_offsets, group_offsets, partition_indices = build_super_group_metadata(partition_entries)
-    out.extend(
-        struct.pack(
-            "<8sIIII",
-            META_MAGIC,
-            META_VERSION,
-            partition_count,
-            2,
-            8,
-        )
-    )
-    out.extend(struct.pack("<III", *super_offsets))
-    out.extend(struct.pack("<" + "I" * 9, *group_offsets[0]))
-    out.extend(struct.pack("<" + "I" * 9, *group_offsets[1]))
-    if partition_count > 0:
-        out.extend(struct.pack("<" + "I" * partition_count, *partition_indices))
+    args.output.write_bytes(out)
 
-    OUTPUT_IDX_PATH.write_bytes(out)
+    empty_lists = sum(1 for ids in postings if len(ids) == 0)
+    largest_list = max((len(ids) for ids in postings), default=0)
 
     print(f"done: {total_count} vectors")
-    print(f"partitions: {partition_count}")
-    print(f"nodes: {node_count}")
+    print(f"nlist: {nlist}")
+    print(f"empty lists: {empty_lists}")
+    print(f"largest list: {largest_list}")
     print(f"blocks: {total_blocks}")
-    print(f"max leaves per partition: {max_leaves_per_partition}")
-    print(f"wrote: {OUTPUT_IDX_PATH}")
+    print(f"wrote: {args.output}")
     print(f"size: {len(out)} bytes")
 
 
