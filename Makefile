@@ -25,14 +25,14 @@ SERVER_SRCS := apps/server/src/main.c \
                apps/server/src/server.c \
                apps/server/src/responses.c \
                apps/server/src/transaction_context.c \
-               apps/server/src/xgboost_model.c
+               apps/server/src/x-score.c
 
 LB_SRCS := apps/load-balancer/src/main.c
 
 .PHONY: server load-balancer clean
 
 server:
-	$(CC) $(CFLAGS) -o server $(SERVER_SRCS) -lm
+	$(CC) $(CFLAGS) -o server $(SERVER_SRCS)
 
 load-balancer:
 	$(CC) $(CFLAGS) -o load-balancer $(LB_SRCS)

@@ -8,5 +8,7 @@ RUN make server TARGETARCH=${TARGETARCH} && mv server /build-server
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=build /build-server /usr/local/bin/server
+RUN mkdir -p /app/resources
+COPY resources/references.idx /app/resources/references.idx
 ENV UNIX_SOCKET_PATH=/shared/api.sock
 CMD ["/usr/local/bin/server"]
