@@ -2,6 +2,8 @@
 
 #include "server.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -65,7 +67,26 @@ ssize_t read_http_request(int fd, char *buf, size_t cap) {
 
   while (used + 1 < cap) {
     ssize_t n = read(fd, buf + used, cap - used - 1);
-    if (n <= 0) {
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        while (poll(&pfd, 1, -1) < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return (used > 0) ? (ssize_t)used : -1;
+        }
+        continue;
+      }
+      return (used > 0) ? (ssize_t)used : -1;
+    }
+    if (n == 0) {
       return (used > 0) ? (ssize_t)used : -1;
     }
     used += (size_t)n;

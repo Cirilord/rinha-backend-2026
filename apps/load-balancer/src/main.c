@@ -1,10 +1,12 @@
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -14,7 +16,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #if defined(__linux__)
+#include <sys/epoll.h>
 #include <sys/syscall.h>
+#else
+#include <poll.h>
 #endif
 #include <sys/types.h>
 #include <sys/un.h>
@@ -35,6 +40,12 @@
 #define SEND_FD_IMPL_LABEL "asm syscall (aarch64/linux)"
 #else
 #define SEND_FD_IMPL_LABEL "libc sendmsg fallback"
+#endif
+
+#if defined(__linux__)
+#define LISTENER_WAIT_IMPL_LABEL "epoll"
+#else
+#define LISTENER_WAIT_IMPL_LABEL "poll fallback"
 #endif
 
 #define DEFAULT_PORT 9999
@@ -159,7 +170,8 @@ static int send_fd(int unix_sock, int fd_to_send) {
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
 
-  char dummy = 'X';
+  // Only a minimal control byte is sent; client payload stays on the passed FD.
+  char dummy = '\0';
   struct iovec io = {
     .iov_base = &dummy,
     .iov_len = sizeof(dummy),
@@ -250,6 +262,30 @@ static int create_tcp_listener(int port) {
   return fd;
 }
 
+static int accept_client_fd(int listener) {
+  int client_fd = -1;
+
+#if defined(__linux__)
+  client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
+  if (client_fd >= 0 || errno != ENOSYS) {
+    return client_fd;
+  }
+#endif
+
+  client_fd = accept(listener, NULL, NULL);
+  if (client_fd < 0) {
+    return -1;
+  }
+
+  int status_flags = fcntl(client_fd, F_GETFL, 0);
+  if (status_flags < 0 || fcntl(client_fd, F_SETFL, status_flags | O_NONBLOCK) < 0) {
+    close(client_fd);
+    return -1;
+  }
+
+  return client_fd;
+}
+
 int main(void) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -270,32 +306,70 @@ int main(void) {
 
   log_msg("INFO", "listening on 0.0.0.0:%d", port);
   log_msg("INFO", "send_fd implementation: %s", SEND_FD_IMPL_LABEL);
+  log_msg("INFO", "listener wait implementation: %s", LISTENER_WAIT_IMPL_LABEL);
   for (int i = 0; i < worker_count; i++) {
     log_msg("INFO", "worker[%d] socket path: %s", i, workers[i].path);
   }
 
   int rr = 0;
+#if defined(__linux__)
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0) {
+    log_msg("ERROR", "failed to create epoll instance: %s", strerror(errno));
+    close(listener);
+    return 1;
+  }
+
+  struct epoll_event listener_ev;
+  memset(&listener_ev, 0, sizeof(listener_ev));
+  listener_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  listener_ev.data.fd = listener;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener, &listener_ev) < 0) {
+    log_msg("ERROR", "failed to register listener on epoll: %s", strerror(errno));
+    close(epoll_fd);
+    close(listener);
+    return 1;
+  }
+#else
   struct pollfd listener_pfd;
   listener_pfd.fd = listener;
   listener_pfd.events = POLLIN;
   listener_pfd.revents = 0;
+#endif
 
   while (keep_running) {
+#if defined(__linux__)
+    struct epoll_event ev;
+    int nready = epoll_wait(epoll_fd, &ev, 1, -1);
+#else
     int nready = poll(&listener_pfd, 1, -1);
+#endif
     if (nready < 0) {
       if (errno == EINTR) {
         continue;
       }
+#if defined(__linux__)
+      log_msg("WARN", "epoll_wait failed: %s", strerror(errno));
+#else
       log_msg("WARN", "poll failed: %s", strerror(errno));
+#endif
       break;
     }
 
+#if defined(__linux__)
+    if (nready == 0 || ev.data.fd != listener ||
+        (ev.events & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0) {
+      continue;
+    }
+#else
     if ((listener_pfd.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
       continue;
     }
+#endif
 
     while (keep_running) {
-      int client_fd = accept(listener, NULL, NULL);
+      int client_fd = accept_client_fd(listener);
       if (client_fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           break;
@@ -337,6 +411,9 @@ int main(void) {
     }
   }
 
+#if defined(__linux__)
+  close(epoll_fd);
+#endif
   close(listener);
   for (int i = 0; i < worker_count; i++) {
     if (workers[i].control_fd >= 0) {

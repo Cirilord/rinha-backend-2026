@@ -1,12 +1,19 @@
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -33,6 +40,30 @@ static void on_signal(int signo) {
   keep_running = 0;
 }
 
+static int accept_control_fd(int server_fd) {
+  int ctrl_fd = -1;
+
+#if defined(__linux__)
+  ctrl_fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK);
+  if (ctrl_fd >= 0 || errno != ENOSYS) {
+    return ctrl_fd;
+  }
+#endif
+
+  ctrl_fd = accept(server_fd, NULL, NULL);
+  if (ctrl_fd < 0) {
+    return -1;
+  }
+
+  int status_flags = fcntl(ctrl_fd, F_GETFL, 0);
+  if (status_flags < 0 || fcntl(ctrl_fd, F_SETFL, status_flags | O_NONBLOCK) < 0) {
+    close(ctrl_fd);
+    return -1;
+  }
+
+  return ctrl_fd;
+}
+
 static int recv_fd(int unix_sock) {
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
@@ -50,12 +81,18 @@ static int recv_fd(int unix_sock) {
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
 
-  if (recvmsg(unix_sock, &msg, 0) <= 0) {
+  ssize_t n = recvmsg(unix_sock, &msg, 0);
+  if (n < 0) {
+    return -1;
+  }
+  if (n == 0) {
+    errno = ECONNRESET;
     return -1;
   }
 
   struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
   if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+    errno = EBADMSG;
     return -1;
   }
 
@@ -125,6 +162,170 @@ int main(void) {
 
   fprintf(stderr, "listening for fd passing at %s\n", socket_path);
 
+#if defined(__linux__)
+  int ctrl_fds[MAX_CTRL_CONNS];
+  int ctrl_count = 0;
+  struct epoll_event events[1 + MAX_CTRL_CONNS];
+  for (int i = 0; i < MAX_CTRL_CONNS; i++) {
+    ctrl_fds[i] = -1;
+  }
+
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0) {
+    close(server_fd);
+    unlink(socket_path);
+    x_score_close(&xscore);
+    return 1;
+  }
+
+  struct epoll_event server_ev;
+  memset(&server_ev, 0, sizeof(server_ev));
+  server_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  server_ev.data.fd = server_fd;
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &server_ev) < 0) {
+    close(epoll_fd);
+    close(server_fd);
+    unlink(socket_path);
+    x_score_close(&xscore);
+    return 1;
+  }
+
+  while (keep_running) {
+    int ready = epoll_wait(epoll_fd, events, 1 + MAX_CTRL_CONNS, -1);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+
+    for (int ev_idx = 0; ev_idx < ready; ev_idx++) {
+      int fd = events[ev_idx].data.fd;
+      uint32_t ev = events[ev_idx].events;
+      if ((ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0) {
+        continue;
+      }
+
+      if (fd == server_fd) {
+        if (ctrl_count >= MAX_CTRL_CONNS) {
+          continue;
+        }
+
+        int ctrl_fd = accept_control_fd(server_fd);
+        if (ctrl_fd < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          continue;
+        }
+
+        struct epoll_event ctrl_ev;
+        memset(&ctrl_ev, 0, sizeof(ctrl_ev));
+        ctrl_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        ctrl_ev.data.fd = ctrl_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ctrl_ev) < 0) {
+          close(ctrl_fd);
+          continue;
+        }
+
+        ctrl_fds[ctrl_count] = ctrl_fd;
+        ctrl_count++;
+        continue;
+      }
+
+      int client_fd = recv_fd(fd);
+      if (client_fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+          continue;
+        }
+        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        for (int i = 0; i < ctrl_count; i++) {
+          if (ctrl_fds[i] == fd) {
+            ctrl_fds[i] = ctrl_fds[ctrl_count - 1];
+            ctrl_fds[ctrl_count - 1] = -1;
+            ctrl_count--;
+            break;
+          }
+        }
+        continue;
+      }
+
+      char request[REQUEST_BUFFER_SIZE];
+      ssize_t nread = read_http_request(client_fd, request, sizeof(request));
+      if (nread <= 0) {
+        close(client_fd);
+        continue;
+      }
+
+      request[nread] = '\0';
+      const size_t request_len = (size_t)nread;
+
+      if (memcmp(request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
+        (void)write(client_fd, RESPONSE_READY.data, RESPONSE_READY.len);
+        close(client_fd);
+        continue;
+      }
+
+      if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
+        const char *body = NULL;
+        size_t body_len = 0;
+        if (!get_body(request, request_len, &body, &body_len)) {
+          (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
+          close(client_fd);
+          continue;
+        }
+
+        TransactionContext ctx = transaction_context_from_body(body, body_len);
+        if (ctx.id[0] == '\0') {
+          ctx.destroy(&ctx);
+          (void)write(client_fd, RESPONSE_BAD_REQUEST.data, RESPONSE_BAD_REQUEST.len);
+          close(client_fd);
+          continue;
+        }
+
+        double vector[14];
+        ctx.to_vector(&ctx, vector);
+        ctx.destroy(&ctx);
+
+        uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+        // uint8_t fraud_count = 0;
+        const Response *resp = &RESPONSE_FRAUD_10;
+        switch (fraud_count) {
+        case 0:
+          resp = &RESPONSE_FRAUD_00;
+          break;
+        case 1:
+          resp = &RESPONSE_FRAUD_02;
+          break;
+        case 2:
+          resp = &RESPONSE_FRAUD_04;
+          break;
+        case 3:
+          resp = &RESPONSE_FRAUD_06;
+          break;
+        case 4:
+          resp = &RESPONSE_FRAUD_08;
+          break;
+        default:
+          resp = &RESPONSE_FRAUD_10;
+          break;
+        }
+        (void)write(client_fd, resp->data, resp->len);
+        close(client_fd);
+        continue;
+      }
+
+      (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
+      close(client_fd);
+    }
+  }
+
+  for (int i = 0; i < ctrl_count; i++) {
+    close(ctrl_fds[i]);
+  }
+  close(epoll_fd);
+#else
   struct pollfd pfds[1 + MAX_CTRL_CONNS];
   int ctrl_count = 0;
   memset(pfds, 0, sizeof(pfds));
@@ -141,7 +342,7 @@ int main(void) {
     }
 
     if ((pfds[0].revents & POLLIN) != 0 && ctrl_count < MAX_CTRL_CONNS) {
-      int ctrl_fd = accept(server_fd, NULL, NULL);
+      int ctrl_fd = accept_control_fd(server_fd);
       if (ctrl_fd >= 0) {
         pfds[1 + ctrl_count].fd = ctrl_fd;
         pfds[1 + ctrl_count].events = POLLIN;
@@ -158,6 +359,9 @@ int main(void) {
 
       int client_fd = recv_fd(p->fd);
       if (client_fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+          continue;
+        }
         close(p->fd);
         pfds[1 + i] = pfds[ctrl_count];
         ctrl_count--;
@@ -184,7 +388,7 @@ int main(void) {
       if (memcmp(request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
         const char *body = NULL;
         size_t body_len = 0;
-        if (!get_body(request, (size_t)nread, &body, &body_len)) {
+        if (!get_body(request, request_len, &body, &body_len)) {
           (void)write(client_fd, RESPONSE_NOT_FOUND.data, RESPONSE_NOT_FOUND.len);
           close(client_fd);
           continue;
@@ -238,6 +442,7 @@ int main(void) {
   for (int i = 0; i < ctrl_count; i++) {
     close(pfds[1 + i].fd);
   }
+#endif
   close(server_fd);
   unlink(socket_path);
   x_score_close(&xscore);

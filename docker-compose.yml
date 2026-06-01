@@ -8,10 +8,15 @@ services:
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
+    logging:
+      driver: none
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     networks:
       - rinha
     deploy:
@@ -29,10 +34,15 @@ services:
       X_SCORE_INDEX_PATH: "/app/resources/references.idx"
     volumes:
       - shared-sockets:/shared
+    logging:
+      driver: none
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     networks:
       - rinha
     deploy:
@@ -52,6 +62,8 @@ services:
       WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
     volumes:
       - shared-sockets:/shared
+    logging:
+      driver: none
     ulimits:
       nofile:
         soft: 65535
@@ -77,4 +89,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: size=10m
+      o: "size=4m,uid=0,gid=0,mode=0777"
