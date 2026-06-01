@@ -31,15 +31,17 @@ This avoids extra TCP hops between LB and API.
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
 - **Persistent control sockets** to APIs (reconnect only on failure).
-- **Optional Linux syscall fast path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` with C fallback on other targets.
-- **epoll-based listener wait loop on Linux** (with `poll` fallback outside Linux) plus non-blocking accept drain.
-- **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK)` on Linux (with `accept` fallback) and drains until `EAGAIN` per wakeup.
+- **Architecture-specific syscall path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` without generic fallback.
+- **Linux-only epoll listener loop** with non-blocking accept drain.
+- **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK)` and drains until `EAGAIN` per wakeup.
 - **Zero-copy request forwarding at LB layer**: accept -> select upstream -> pass client FD -> close local duplicate.
+- **Non-Linux editor mocks** under `packages/mocks/sys/epoll.h` and `packages/mocks/sys/syscall.h`, intended only to avoid local typing/tooling errors.
 - **Minimal dependencies** (single C binary).
 
 ### `apps/server`
-- **epoll-based control-channel multiplexing on Linux** (`MAX_CTRL_CONNS`) with `poll` fallback outside Linux.
-- **Control channel accepts via `accept4(..., SOCK_NONBLOCK)` on Linux** (with fallback), for LB FD-passing sockets.
+- **Linux-only epoll control-channel multiplexing** (`MAX_CTRL_CONNS`) for FD passing from LB.
+- **Control channel accepts via `accept4(..., SOCK_NONBLOCK)`** for LB FD-passing sockets.
+- **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` for local typing/tooling compatibility.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
   - `POST /fraud-score`

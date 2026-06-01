@@ -19,7 +19,8 @@
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #else
-#include <poll.h>
+#include "../../../packages/mocks/sys/epoll.h"
+#include "../../../packages/mocks/sys/syscall.h"
 #endif
 #include <sys/types.h>
 #include <sys/un.h>
@@ -34,25 +35,11 @@
 #define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
 #endif
 
-#if defined(__x86_64__) && defined(__linux__)
-#define SEND_FD_IMPL_LABEL "asm syscall (x86_64/linux)"
-#elif defined(__aarch64__) && defined(__linux__)
-#define SEND_FD_IMPL_LABEL "asm syscall (aarch64/linux)"
-#else
-#define SEND_FD_IMPL_LABEL "libc sendmsg fallback"
-#endif
-
-#if defined(__linux__)
-#define LISTENER_WAIT_IMPL_LABEL "epoll"
-#else
-#define LISTENER_WAIT_IMPL_LABEL "poll fallback"
-#endif
-
+#define BACKLOG 2048
 #define DEFAULT_PORT 9999
-#define MAX_WORKERS 16
-#define MAX_SOCKET_PATH 108
 #define MAX_ENV_LEN 1024
-#define BACKLOG 1024
+#define MAX_SOCKET_PATH 108
+#define MAX_WORKERS 16
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -191,7 +178,7 @@ static int send_fd(int unix_sock, int fd_to_send) {
   *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
   ssize_t sent = -1;
-#if defined(__x86_64__) && defined(__linux__)
+#if defined(__x86_64__)
   register long rax __asm__("rax") = SYS_sendmsg;
   register long rdi __asm__("rdi") = (long)unix_sock;
   register long rsi __asm__("rsi") = (long)&msg;
@@ -203,7 +190,7 @@ static int send_fd(int unix_sock, int fd_to_send) {
   } else {
     sent = (ssize_t)rax;
   }
-#elif defined(__aarch64__) && defined(__linux__)
+#elif defined(__aarch64__)
   register long x8 __asm__("x8") = SYS_sendmsg;
   register long x0 __asm__("x0") = (long)unix_sock;
   register long x1 __asm__("x1") = (long)&msg;
@@ -215,8 +202,6 @@ static int send_fd(int unix_sock, int fd_to_send) {
   } else {
     sent = (ssize_t)x0;
   }
-#else
-  sent = sendmsg(unix_sock, &msg, 0);
 #endif
   if (sent < 0) {
     return -1;
@@ -262,30 +247,6 @@ static int create_tcp_listener(int port) {
   return fd;
 }
 
-static int accept_client_fd(int listener) {
-  int client_fd = -1;
-
-#if defined(__linux__)
-  client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
-  if (client_fd >= 0 || errno != ENOSYS) {
-    return client_fd;
-  }
-#endif
-
-  client_fd = accept(listener, NULL, NULL);
-  if (client_fd < 0) {
-    return -1;
-  }
-
-  int status_flags = fcntl(client_fd, F_GETFL, 0);
-  if (status_flags < 0 || fcntl(client_fd, F_SETFL, status_flags | O_NONBLOCK) < 0) {
-    close(client_fd);
-    return -1;
-  }
-
-  return client_fd;
-}
-
 int main(void) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -305,14 +266,11 @@ int main(void) {
   }
 
   log_msg("INFO", "listening on 0.0.0.0:%d", port);
-  log_msg("INFO", "send_fd implementation: %s", SEND_FD_IMPL_LABEL);
-  log_msg("INFO", "listener wait implementation: %s", LISTENER_WAIT_IMPL_LABEL);
   for (int i = 0; i < worker_count; i++) {
     log_msg("INFO", "worker[%d] socket path: %s", i, workers[i].path);
   }
 
   int rr = 0;
-#if defined(__linux__)
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
     log_msg("ERROR", "failed to create epoll instance: %s", strerror(errno));
@@ -331,45 +289,25 @@ int main(void) {
     close(listener);
     return 1;
   }
-#else
-  struct pollfd listener_pfd;
-  listener_pfd.fd = listener;
-  listener_pfd.events = POLLIN;
-  listener_pfd.revents = 0;
-#endif
 
   while (keep_running) {
-#if defined(__linux__)
     struct epoll_event ev;
     int nready = epoll_wait(epoll_fd, &ev, 1, -1);
-#else
-    int nready = poll(&listener_pfd, 1, -1);
-#endif
     if (nready < 0) {
       if (errno == EINTR) {
         continue;
       }
-#if defined(__linux__)
       log_msg("WARN", "epoll_wait failed: %s", strerror(errno));
-#else
-      log_msg("WARN", "poll failed: %s", strerror(errno));
-#endif
       break;
     }
 
-#if defined(__linux__)
     if (nready == 0 || ev.data.fd != listener ||
         (ev.events & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0) {
       continue;
     }
-#else
-    if ((listener_pfd.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
-      continue;
-    }
-#endif
 
     while (keep_running) {
-      int client_fd = accept_client_fd(listener);
+      int client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
       if (client_fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           break;
@@ -411,9 +349,7 @@ int main(void) {
     }
   }
 
-#if defined(__linux__)
   close(epoll_fd);
-#endif
   close(listener);
   for (int i = 0; i < worker_count; i++) {
     if (workers[i].control_fd >= 0) {
