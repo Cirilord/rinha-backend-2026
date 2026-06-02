@@ -23,6 +23,10 @@
 #define SOCK_CLOEXEC 0
 #endif
 
+#ifndef SOCK_SEQPACKET
+#define SOCK_SEQPACKET 0
+#endif
+
 #ifndef SO_REUSEPORT
 #define SO_REUSEPORT 0
 #endif

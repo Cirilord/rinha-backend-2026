@@ -46,6 +46,7 @@ This avoids extra TCP hops between LB and API.
 - **Linux-only epoll multiplexing for both control sockets and forwarded client sockets**.
 - **Control channel accepts via `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`** for LB FD-passing sockets.
 - **FD-indexed state tables in the worker hot path**: control sockets and active client state are resolved directly by file descriptor, avoiding linear scans and fixed client slot caps after FD passing.
+- **Reused client-state allocations** via a local freelist, reducing `malloc`/`free` churn for the per-connection request buffers after FD passing.
 - **Incremental non-blocking request reads** with per-client buffers; no blocking `poll()` fallback in the request path.
 - **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling, while the connection itself is still closed after each response for benchmark stability.
 - **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h` for local typing/tooling compatibility.

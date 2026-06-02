@@ -37,7 +37,7 @@
 #define MAX_EVENTS 512
 #define REQUEST_BUFFER_SIZE 8192
 
-typedef struct {
+typedef struct ClientConn {
   int fd;
   size_t used;
   size_t expected_total;
@@ -45,6 +45,7 @@ typedef struct {
   const char *response_data;
   size_t response_len;
   size_t response_offset;
+  struct ClientConn *next_free;
   char request[REQUEST_BUFFER_SIZE];
 } ClientConn;
 
@@ -94,14 +95,20 @@ static int recv_fd(int unix_sock) {
   return client_fd;
 }
 
-static void close_client_conn(int epoll_fd, ClientConn **clients_by_fd, int fd) {
+static void close_client_conn(int epoll_fd, ClientConn **clients_by_fd, ClientConn **free_clients,
+                              int fd) {
   if (fd < 0 || fd >= MAX_TRACKED_FDS) {
+    return;
+  }
+  ClientConn *client = clients_by_fd[fd];
+  if (client == NULL) {
     return;
   }
   (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
   close(fd);
-  free(clients_by_fd[fd]);
   clients_by_fd[fd] = NULL;
+  client->next_free = *free_clients;
+  *free_clients = client;
 }
 
 static void warm_up(const XScoreIndexView *xscore) {
@@ -168,6 +175,7 @@ int main(void) {
 
   unsigned char *fd_kinds = calloc(MAX_TRACKED_FDS, sizeof(*fd_kinds));
   ClientConn **clients_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*clients_by_fd));
+  ClientConn *free_clients = NULL;
   struct epoll_event *events = calloc(MAX_EVENTS, sizeof(*events));
   if (fd_kinds == NULL || clients_by_fd == NULL || events == NULL) {
     free(events);
@@ -263,7 +271,7 @@ int main(void) {
           fd_kinds[fd] = 0;
           close(fd);
         } else if (clients_by_fd[fd] != NULL) {
-          close_client_conn(epoll_fd, clients_by_fd, fd);
+          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
         }
         continue;
       }
@@ -289,12 +297,25 @@ int main(void) {
             continue;
           }
 
-          ClientConn *client = calloc(1, sizeof(*client));
+          ClientConn *client = free_clients;
+          if (client != NULL) {
+            free_clients = client->next_free;
+          } else {
+            client = malloc(sizeof(*client));
+          }
           if (client == NULL) {
             close(client_fd);
             continue;
           }
+          client->used = 0;
+          client->expected_total = 0;
+          client->request_len = 0;
           client->fd = client_fd;
+          client->response_data = NULL;
+          client->response_len = 0;
+          client->response_offset = 0;
+          client->next_free = NULL;
+          client->request[0] = '\0';
           clients_by_fd[client_fd] = client;
 
           struct epoll_event client_ev;
@@ -303,7 +324,8 @@ int main(void) {
           client_ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
             close(client_fd);
-            free(client);
+            client->next_free = free_clients;
+            free_clients = client;
             clients_by_fd[client_fd] = NULL;
           }
         }
@@ -344,7 +366,7 @@ int main(void) {
         }
 
         if (close_client) {
-          close_client_conn(epoll_fd, clients_by_fd, fd);
+          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
           continue;
         }
 
@@ -352,7 +374,7 @@ int main(void) {
           continue;
         }
 
-        close_client_conn(epoll_fd, clients_by_fd, fd);
+        close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
         continue;
       }
 
@@ -373,7 +395,7 @@ int main(void) {
           break;
         }
         if (read_status != HTTP_READ_COMPLETE) {
-          close_client_conn(epoll_fd, clients_by_fd, fd);
+          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
           break;
         }
 
@@ -456,7 +478,7 @@ int main(void) {
         }
 
         if (close_client) {
-          close_client_conn(epoll_fd, clients_by_fd, fd);
+          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
           break;
         }
 
@@ -466,12 +488,12 @@ int main(void) {
           client_ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
           client_ev.data.fd = fd;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &client_ev) < 0) {
-            close_client_conn(epoll_fd, clients_by_fd, fd);
+            close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
           }
           break;
         }
 
-        close_client_conn(epoll_fd, clients_by_fd, fd);
+        close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
         break;
       }
     }
@@ -484,6 +506,11 @@ int main(void) {
       close(fd);
       free(clients_by_fd[fd]);
     }
+  }
+  while (free_clients != NULL) {
+    ClientConn *client = free_clients;
+    free_clients = client->next_free;
+    free(client);
   }
   close(epoll_fd);
   close(server_fd);
