@@ -31,8 +31,16 @@ struct epoll_event {
 #define EPOLL_CTL_DEL 2
 #endif
 
+#ifndef EPOLL_CTL_MOD
+#define EPOLL_CTL_MOD 3
+#endif
+
 #ifndef EPOLLIN
 #define EPOLLIN 0x001
+#endif
+
+#ifndef EPOLLOUT
+#define EPOLLOUT 0x004
 #endif
 
 #ifndef EPOLLERR

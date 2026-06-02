@@ -16,13 +16,13 @@
 #include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/epoll.h>
-#include <sys/syscall.h>
 #else
 #include "../../../packages/mocks/sys/epoll.h"
-#include "../../../packages/mocks/sys/syscall.h"
+#include "../../../packages/mocks/sys/socket.h"
 #endif
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef CMSG_SPACE
@@ -46,13 +46,19 @@ typedef struct {
   int control_fd;
 } worker_t;
 
+enum {
+  SEND_FD_OK = 0,
+  SEND_FD_RETRY = 1,
+  SEND_FD_FATAL = -1,
+};
+
 static void on_signal(int signo) {
   (void)signo;
   keep_running = 0;
 }
 
 static int connect_worker(const char *socket_path) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return -1;
   }
@@ -63,6 +69,12 @@ static int connect_worker(const char *socket_path) {
   strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(fd);
     return -1;
   }
@@ -108,41 +120,26 @@ static int send_fd(int unix_sock, int fd_to_send) {
   cmsg->cmsg_type = SCM_RIGHTS;
   *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
-  ssize_t sent = -1;
-#if defined(__x86_64__)
-  register long rax __asm__("rax") = SYS_sendmsg;
-  register long rdi __asm__("rdi") = (long)unix_sock;
-  register long rsi __asm__("rsi") = (long)&msg;
-  register long rdx __asm__("rdx") = 0;
-  __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx) : "rcx", "r11", "memory");
-  if (rax < 0) {
-    errno = (int)(-rax);
-    sent = -1;
-  } else {
-    sent = (ssize_t)rax;
-  }
-#elif defined(__aarch64__)
-  register long x8 __asm__("x8") = SYS_sendmsg;
-  register long x0 __asm__("x0") = (long)unix_sock;
-  register long x1 __asm__("x1") = (long)&msg;
-  register long x2 __asm__("x2") = 0;
-  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "cc", "memory");
-  if (x0 < 0) {
-    errno = (int)(-x0);
-    sent = -1;
-  } else {
-    sent = (ssize_t)x0;
-  }
-#endif
-  if (sent < 0) {
-    return -1;
-  }
+  for (;;) {
+    if (sendmsg(unix_sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT) >= 0) {
+      return SEND_FD_OK;
+    }
 
-  return 0;
+    if (errno == EINTR) {
+      continue;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM ||
+        errno == EINPROGRESS || errno == EALREADY || errno == ENOTCONN) {
+      return SEND_FD_RETRY;
+    }
+
+    return SEND_FD_FATAL;
+  }
 }
 
 static int create_tcp_listener(int port) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return -1;
   }
@@ -152,12 +149,16 @@ static int create_tcp_listener(int port) {
     close(fd);
     return -1;
   }
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
+    close(fd);
+    return -1;
+  }
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
   if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     close(fd);
@@ -165,12 +166,6 @@ static int create_tcp_listener(int port) {
   }
 
   if (listen(fd, BACKLOG) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(fd);
     return -1;
   }
@@ -273,7 +268,7 @@ int main(void) {
     }
 
     while (keep_running) {
-      int client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
+      int client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
       if (client_fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           break;
@@ -293,10 +288,15 @@ int main(void) {
           continue;
         }
 
-        if (send_fd(workers[idx].control_fd, client_fd) == 0) {
+        int send_result = send_fd(workers[idx].control_fd, client_fd);
+        if (send_result == SEND_FD_OK) {
           rr = (idx + 1) % worker_count;
           forwarded = true;
           break;
+        }
+
+        if (send_result == SEND_FD_RETRY) {
+          continue;
         }
 
         close(workers[idx].control_fd);
@@ -308,7 +308,7 @@ int main(void) {
                            "Content-Length: 19\r\n"
                            "Connection: close\r\n\r\n"
                            "no worker available";
-        (void)write(client_fd, resp, strlen(resp));
+        (void)send(client_fd, resp, strlen(resp), MSG_NOSIGNAL | MSG_DONTWAIT);
       }
 
       close(client_fd);

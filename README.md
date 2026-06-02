@@ -31,17 +31,20 @@ This avoids extra TCP hops between LB and API.
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
 - **Persistent control sockets** to APIs (reconnect only on failure).
-- **Architecture-specific syscall path** (`x86_64`/`aarch64`) for `sendmsg(SCM_RIGHTS)` without generic fallback.
+- **FD passing via libc `sendmsg(SCM_RIGHTS)`** over persistent Unix control sockets, using `MSG_NOSIGNAL | MSG_DONTWAIT`.
+- **Persistent Unix worker sockets** promoted to non-blocking mode after connect, so FD passing does not block the listener loop.
 - **Linux-only epoll listener loop** with non-blocking accept drain.
-- **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK)` and drains until `EAGAIN` per wakeup.
+- **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` and drains until `EAGAIN` per wakeup.
 - **Zero-copy request forwarding at LB layer**: accept -> select upstream -> pass client FD -> close local duplicate.
-- **Non-Linux editor mocks** under `packages/mocks/sys/epoll.h` and `packages/mocks/sys/syscall.h`, intended only to avoid local typing/tooling errors.
+- **Non-Linux editor mocks** under `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h`, intended only to avoid local typing/tooling errors.
 - **Minimal dependencies** (single C binary).
 
 ### `apps/server`
-- **Linux-only epoll control-channel multiplexing** (`MAX_CTRL_CONNS`) for FD passing from LB.
-- **Control channel accepts via `accept4(..., SOCK_NONBLOCK)`** for LB FD-passing sockets.
-- **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` for local typing/tooling compatibility.
+- **Linux-only epoll multiplexing for both control sockets and forwarded client sockets**.
+- **Control channel accepts via `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`** for LB FD-passing sockets.
+- **Incremental non-blocking request reads** with per-client buffers; no blocking `poll()` fallback in the request path.
+- **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling.
+- **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h` for local typing/tooling compatibility.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`
   - `POST /fraud-score`
@@ -125,9 +128,18 @@ Targets:
 - `make load-balancer`
 - `make clean`
 
+Default release flags:
+- `-Ofast`
+- `-DNDEBUG`
+- `-fomit-frame-pointer`
+- `-flto`
+
 Architecture-aware flags (`TARGETARCH`):
-- `amd64`: adds `-mavx2 -mfma -march=haswell`
-- `arm64`: no AVX2 flags
+- `amd64`: adds `-march=haswell -mtune=haswell`
+- `arm64`: no extra architecture-specific flags
+
+Note:
+- `-fno-rtti` is not used because the project is compiled as C, not C++.
 
 Examples:
 

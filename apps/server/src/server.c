@@ -3,17 +3,19 @@
 #include "server.h"
 
 #include <errno.h>
-#include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__linux__)
+#include "../../../packages/mocks/sys/socket.h"
+#endif
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 int create_unix_server(const char *path) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return -1;
   }
@@ -56,63 +58,56 @@ static size_t parse_content_length(const char *buf) {
   return (size_t)strtoul(p, NULL, 10);
 }
 
-ssize_t read_http_request(int fd, char *buf, size_t cap) {
-  size_t used = 0;
-  bool headers_done = false;
-  size_t expected_total = 0;
-
+HttpReadStatus read_http_request(int fd, char *buf, size_t cap, size_t *used,
+                                 size_t *expected_total, size_t *out_request_len) {
   if (cap == 0) {
-    return -1;
+    return HTTP_READ_ERROR;
+  }
+  if (buf == NULL || used == NULL || expected_total == NULL || out_request_len == NULL) {
+    return HTTP_READ_ERROR;
   }
 
-  while (used + 1 < cap) {
-    ssize_t n = read(fd, buf + used, cap - used - 1);
+  while (*used + 1 < cap) {
+    ssize_t n = read(fd, buf + *used, cap - *used - 1);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        while (poll(&pfd, 1, -1) < 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          return (used > 0) ? (ssize_t)used : -1;
-        }
-        continue;
+        return HTTP_READ_PENDING;
       }
-      return (used > 0) ? (ssize_t)used : -1;
+      return HTTP_READ_ERROR;
     }
     if (n == 0) {
-      return (used > 0) ? (ssize_t)used : -1;
+      return HTTP_READ_CLOSED;
     }
-    used += (size_t)n;
-    buf[used] = '\0';
+    *used += (size_t)n;
+    buf[*used] = '\0';
 
-    if (!headers_done) {
+    if (*expected_total == 0) {
       const char *headers_end = find_headers_end(buf);
       if (headers_end == NULL) {
         continue;
       }
-      headers_done = true;
-      {
-        size_t headers_len = (size_t)(headers_end - buf) + 4;
-        size_t content_len = parse_content_length(buf);
-        expected_total = headers_len + content_len;
-        if (used >= expected_total) {
-          return (ssize_t)used;
-        }
+
+      size_t headers_len = (size_t)(headers_end - buf) + 4;
+      size_t content_len = parse_content_length(buf);
+      *expected_total = headers_len + content_len;
+      if (*expected_total + 1 > cap) {
+        return HTTP_READ_OVERFLOW;
       }
-    } else if (used >= expected_total) {
-      return (ssize_t)used;
+      if (*used >= *expected_total) {
+        *out_request_len = *expected_total;
+        return HTTP_READ_COMPLETE;
+      }
+    } else if (*used >= *expected_total) {
+      *out_request_len = *expected_total;
+      return HTTP_READ_COMPLETE;
     }
   }
 
   buf[cap - 1] = '\0';
-  return (ssize_t)(cap - 1);
+  return HTTP_READ_OVERFLOW;
 }
 
 bool get_body(const char *request, size_t request_len, const char **out_body, size_t *out_len) {

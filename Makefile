@@ -12,9 +12,9 @@ TARGETARCH := arm64
 endif
 endif
 
-CFLAGS_BASE := -O3 -Wall -Wextra -std=c11
+CFLAGS_BASE := -Ofast -fomit-frame-pointer -flto -Wall -Wextra -std=c11
 ifeq ($(TARGETARCH),amd64)
-CFLAGS_ARCH := -mavx2 -mfma -march=haswell
+CFLAGS_ARCH := -march=haswell -mtune=haswell
 else
 CFLAGS_ARCH :=
 endif
