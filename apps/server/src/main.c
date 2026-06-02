@@ -4,7 +4,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -32,6 +31,7 @@
 #endif
 #define MAX_CTRL_CONNS 4
 #define MAX_CLIENT_CONNS 128
+#define MAX_TRACKED_FDS 65536
 #define MAX_EVENTS (1 + MAX_CTRL_CONNS + MAX_CLIENT_CONNS)
 #define REQUEST_BUFFER_SIZE 8192
 
@@ -155,11 +155,16 @@ int main(void) {
   fprintf(stderr, "listening for fd passing at %s\n", socket_path);
 
   int *ctrl_fds = calloc(MAX_CTRL_CONNS, sizeof(*ctrl_fds));
+  int *ctrl_slot_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*ctrl_slot_by_fd));
   ClientConn *client_conns = calloc(MAX_CLIENT_CONNS, sizeof(*client_conns));
+  int *client_slot_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*client_slot_by_fd));
   struct epoll_event *events = calloc(MAX_EVENTS, sizeof(*events));
-  if (ctrl_fds == NULL || client_conns == NULL || events == NULL) {
+  if (ctrl_fds == NULL || ctrl_slot_by_fd == NULL || client_conns == NULL ||
+      client_slot_by_fd == NULL || events == NULL) {
     free(events);
+    free(client_slot_by_fd);
     free(client_conns);
+    free(ctrl_slot_by_fd);
     free(ctrl_fds);
     close(server_fd);
     unlink(socket_path);
@@ -170,14 +175,22 @@ int main(void) {
   for (int i = 0; i < MAX_CTRL_CONNS; i++) {
     ctrl_fds[i] = -1;
   }
+  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
+    ctrl_slot_by_fd[i] = -1;
+  }
   for (int i = 0; i < MAX_CLIENT_CONNS; i++) {
     client_conns[i].fd = -1;
+  }
+  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
+    client_slot_by_fd[i] = -1;
   }
 
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
     free(events);
+    free(client_slot_by_fd);
     free(client_conns);
+    free(ctrl_slot_by_fd);
     free(ctrl_fds);
     close(server_fd);
     unlink(socket_path);
@@ -192,7 +205,9 @@ int main(void) {
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &server_ev) < 0) {
     close(epoll_fd);
     free(events);
+    free(client_slot_by_fd);
     free(client_conns);
+    free(ctrl_slot_by_fd);
     free(ctrl_fds);
     close(server_fd);
     unlink(socket_path);
@@ -237,6 +252,10 @@ int main(void) {
             close(ctrl_fd);
             continue;
           }
+          if (ctrl_fd >= MAX_TRACKED_FDS) {
+            close(ctrl_fd);
+            continue;
+          }
 
           struct epoll_event ctrl_ev;
           memset(&ctrl_ev, 0, sizeof(ctrl_ev));
@@ -248,16 +267,14 @@ int main(void) {
           }
 
           ctrl_fds[ctrl_slot] = ctrl_fd;
+          ctrl_slot_by_fd[ctrl_fd] = ctrl_slot;
         }
         continue;
       }
 
       int ctrl_slot = -1;
-      for (int i = 0; i < MAX_CTRL_CONNS; i++) {
-        if (ctrl_fds[i] == fd) {
-          ctrl_slot = i;
-          break;
-        }
+      if (fd >= 0 && fd < MAX_TRACKED_FDS) {
+        ctrl_slot = ctrl_slot_by_fd[fd];
       }
       if (ctrl_slot >= 0) {
         while (keep_running) {
@@ -270,19 +287,13 @@ int main(void) {
               continue;
             }
             (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            ctrl_slot_by_fd[fd] = -1;
             close(fd);
             ctrl_fds[ctrl_slot] = -1;
             break;
           }
 
-          int status_flags = fcntl(client_fd, F_GETFL, 0);
-          if (status_flags < 0 || fcntl(client_fd, F_SETFL, status_flags | O_NONBLOCK) < 0) {
-            close(client_fd);
-            continue;
-          }
-
-          int fd_flags = fcntl(client_fd, F_GETFD, 0);
-          if (fd_flags < 0 || fcntl(client_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+          if (client_fd >= MAX_TRACKED_FDS) {
             close(client_fd);
             continue;
           }
@@ -301,6 +312,7 @@ int main(void) {
 
           memset(&client_conns[client_slot], 0, sizeof(client_conns[client_slot]));
           client_conns[client_slot].fd = client_fd;
+          client_slot_by_fd[client_fd] = client_slot;
 
           struct epoll_event client_ev;
           memset(&client_ev, 0, sizeof(client_ev));
@@ -308,6 +320,7 @@ int main(void) {
           client_ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
             close(client_fd);
+            client_slot_by_fd[client_fd] = -1;
             client_conns[client_slot].fd = -1;
             continue;
           }
@@ -316,11 +329,8 @@ int main(void) {
       }
 
       int client_slot = -1;
-      for (int i = 0; i < MAX_CLIENT_CONNS; i++) {
-        if (client_conns[i].fd == fd) {
-          client_slot = i;
-          break;
-        }
+      if (fd >= 0 && fd < MAX_TRACKED_FDS) {
+        client_slot = client_slot_by_fd[fd];
       }
       if (client_slot < 0) {
         continue;
@@ -356,6 +366,7 @@ int main(void) {
 
         if (close_client || client->response_offset >= client->response_len) {
           (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+          client_slot_by_fd[client->fd] = -1;
           close(client->fd);
           memset(client, 0, sizeof(*client));
           client->fd = -1;
@@ -368,6 +379,7 @@ int main(void) {
         client_ev.data.fd = client->fd;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &client_ev) < 0) {
           (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+          client_slot_by_fd[client->fd] = -1;
           close(client->fd);
           memset(client, 0, sizeof(*client));
           client->fd = -1;
@@ -377,6 +389,7 @@ int main(void) {
 
       if ((ev & EPOLLIN) == 0) {
         (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+        client_slot_by_fd[client->fd] = -1;
         close(client->fd);
         memset(client, 0, sizeof(*client));
         client->fd = -1;
@@ -391,6 +404,7 @@ int main(void) {
       }
       if (read_status != HTTP_READ_COMPLETE) {
         (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+        client_slot_by_fd[client->fd] = -1;
         close(client->fd);
         memset(client, 0, sizeof(*client));
         client->fd = -1;
@@ -475,6 +489,7 @@ int main(void) {
 
       if (close_client || client->response_offset >= client->response_len) {
         (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+        client_slot_by_fd[client->fd] = -1;
         close(client->fd);
         memset(client, 0, sizeof(*client));
         client->fd = -1;
@@ -487,6 +502,7 @@ int main(void) {
       client_ev.data.fd = client->fd;
       if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &client_ev) < 0) {
         (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+        client_slot_by_fd[client->fd] = -1;
         close(client->fd);
         memset(client, 0, sizeof(*client));
         client->fd = -1;
@@ -509,7 +525,9 @@ int main(void) {
   unlink(socket_path);
   x_score_close(&xscore);
   free(events);
+  free(client_slot_by_fd);
   free(client_conns);
+  free(ctrl_slot_by_fd);
   free(ctrl_fds);
   return 0;
 }
