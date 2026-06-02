@@ -35,6 +35,7 @@ This avoids extra TCP hops between LB and API.
 - **Persistent Unix worker sockets** promoted to non-blocking mode after connect, so FD passing does not block the listener loop.
 - **Linux-only epoll listener loop** with non-blocking accept drain.
 - **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` and drains until `EAGAIN` per wakeup.
+- **Light TCP tuning on the LB path**: applies `TCP_DEFER_ACCEPT` on the listener and `TCP_NODELAY` on accepted client sockets before FD passing.
 - **Background e2e startup warmup**: the LB issues internal `/fraud-score` requests against `127.0.0.1:PORT` to warm the full path (listener, fd passing, server parsing, response path).
 - **Readiness gating during warmup**: `/ready` is held at `503` until the e2e warmup finishes, reducing cold-start impact on the first benchmark run.
 - **Zero-copy request forwarding at LB layer**: accept -> select upstream -> pass client FD -> close local duplicate.
@@ -44,6 +45,7 @@ This avoids extra TCP hops between LB and API.
 ### `apps/server`
 - **Linux-only epoll multiplexing for both control sockets and forwarded client sockets**.
 - **Control channel accepts via `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`** for LB FD-passing sockets.
+- **Bounded slot tables tuned for the current load profile**: `4` control sockets and `128` active client sockets per worker.
 - **Incremental non-blocking request reads** with per-client buffers; no blocking `poll()` fallback in the request path.
 - **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling.
 - **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h` for local typing/tooling compatibility.

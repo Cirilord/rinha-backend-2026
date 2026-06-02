@@ -30,8 +30,8 @@
 #ifndef CMSG_SPACE
 #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
 #endif
-#define MAX_CTRL_CONNS 16
-#define MAX_CLIENT_CONNS 1024
+#define MAX_CTRL_CONNS 4
+#define MAX_CLIENT_CONNS 128
 #define MAX_EVENTS (1 + MAX_CTRL_CONNS + MAX_CLIENT_CONNS)
 #define REQUEST_BUFFER_SIZE 8192
 

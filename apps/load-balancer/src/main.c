@@ -7,6 +7,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#if defined(__linux__)
+#include <netinet/tcp.h>
+#else
+#include "../../../packages/mocks/netinet/tcp.h"
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -173,14 +178,23 @@ static int create_tcp_listener(int port) {
     return -1;
   }
 
-  int one = 1;
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
+  int yes = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
     close(fd);
     return -1;
   }
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) < 0) {
     close(fd);
     return -1;
+  }
+
+  int defer_accept = 1;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_accept, sizeof(defer_accept)) < 0) {
+    if (!(errno == ENOPROTOOPT || errno == EOPNOTSUPP || errno == ENOTSUP || errno == EINVAL ||
+          errno == EPERM)) {
+      close(fd);
+      return -1;
+    }
   }
 
   struct sockaddr_in addr;
@@ -313,6 +327,15 @@ int main(void) {
         }
         fprintf(stderr, "WARN: accept failed: %s\n", strerror(errno));
         break;
+      }
+
+      int yes = 1;
+      if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
+        if (!(errno == ENOPROTOOPT || errno == EOPNOTSUPP || errno == ENOTSUP ||
+              errno == EINVAL || errno == EPERM)) {
+          close(client_fd);
+          continue;
+        }
       }
 
       if (warmup_handle_ready_gate(client_fd)) {
