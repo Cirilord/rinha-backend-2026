@@ -31,8 +31,8 @@ This avoids extra TCP hops between LB and API.
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
 - **Persistent control sockets** to APIs, with eager startup preconnect before serving external traffic.
-- **FD passing via libc `sendmsg(SCM_RIGHTS)`** over persistent Unix control sockets, using `MSG_NOSIGNAL | MSG_DONTWAIT`.
-- **Persistent Unix worker sockets** promoted to non-blocking mode after connect, so FD passing does not block the listener loop.
+- **FD passing via libc `sendmsg(SCM_RIGHTS)`** over persistent Unix control sockets, using `MSG_NOSIGNAL`.
+- **Persistent Unix worker sockets** kept connected for the full process lifetime, reducing reconnect churn in the LB -> API handoff.
 - **Linux-only epoll listener loop** with non-blocking accept drain.
 - **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` and drains until `EAGAIN` per wakeup.
 - **Light TCP tuning on the LB path**: applies `TCP_DEFER_ACCEPT` on the listener and `TCP_NODELAY` on accepted client sockets before FD passing.
@@ -45,10 +45,9 @@ This avoids extra TCP hops between LB and API.
 ### `apps/server`
 - **Linux-only epoll multiplexing for both control sockets and forwarded client sockets**.
 - **Control channel accepts via `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`** for LB FD-passing sockets.
-- **Bounded slot tables tuned for the current load profile**: `4` control sockets and `128` active client sockets per worker.
-- **FD-indexed lookup tables in the worker hot path**: control and client sockets are resolved directly by file descriptor, avoiding linear scans after FD passing.
+- **FD-indexed state tables in the worker hot path**: control sockets and active client state are resolved directly by file descriptor, avoiding linear scans and fixed client slot caps after FD passing.
 - **Incremental non-blocking request reads** with per-client buffers; no blocking `poll()` fallback in the request path.
-- **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling.
+- **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling, while the connection itself is still closed after each response for benchmark stability.
 - **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h` for local typing/tooling compatibility.
 - **Minimal HTTP parsing** optimized for the challenge endpoints:
   - `GET /ready`

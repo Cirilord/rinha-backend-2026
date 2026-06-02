@@ -57,7 +57,6 @@ typedef struct {
 
 enum {
   SEND_FD_OK = 0,
-  SEND_FD_RETRY = 1,
   SEND_FD_FATAL = -1,
 };
 
@@ -82,12 +81,6 @@ static int connect_worker(const char *socket_path) {
   strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(fd);
     return -1;
   }
@@ -155,17 +148,12 @@ static int send_fd(int unix_sock, int fd_to_send) {
   *((int *)CMSG_DATA(cmsg)) = fd_to_send;
 
   for (;;) {
-    if (sendmsg(unix_sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT) >= 0) {
+    if (sendmsg(unix_sock, &msg, MSG_NOSIGNAL) >= 0) {
       return SEND_FD_OK;
     }
 
     if (errno == EINTR) {
       continue;
-    }
-
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM ||
-        errno == EINPROGRESS || errno == EALREADY || errno == ENOTCONN) {
-      return SEND_FD_RETRY;
     }
 
     return SEND_FD_FATAL;
@@ -356,10 +344,6 @@ int main(void) {
           rr = (idx + 1) % worker_count;
           forwarded = true;
           break;
-        }
-
-        if (send_result == SEND_FD_RETRY) {
-          continue;
         }
 
         close(workers[idx].control_fd);

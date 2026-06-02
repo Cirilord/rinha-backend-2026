@@ -9,16 +9,13 @@ typedef struct {
   size_t len;
 } Response;
 
+#define RESPONSE_CLOSE_INDEX 0
+#define RESPONSE_KEEP_ALIVE_INDEX 1
 #define FRAUD_RESPONSES_LEN 6
 
-extern const Response RESPONSE_READY;
-extern const Response RESPONSE_NOT_FOUND;
-extern const Response RESPONSE_BAD_REQUEST;
-extern const Response RESPONSE_FRAUD_00;
-extern const Response RESPONSE_FRAUD_02;
-extern const Response RESPONSE_FRAUD_04;
-extern const Response RESPONSE_FRAUD_06;
-extern const Response RESPONSE_FRAUD_08;
-extern const Response RESPONSE_FRAUD_10;
+extern const Response RESPONSE_READY_VARIANTS[2];
+extern const Response RESPONSE_NOT_FOUND_VARIANTS[2];
+extern const Response RESPONSE_BAD_REQUEST_VARIANTS[2];
+extern const Response RESPONSE_FRAUD_VARIANTS[2][FRAUD_RESPONSES_LEN];
 
 #endif

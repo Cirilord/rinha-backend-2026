@@ -14,14 +14,14 @@
       "false_positive_detections": 0,
       "false_negative_detections": 24037,
       "true_positive_detections": 0,
-      "true_negative_detections": 30022,
+      "true_negative_detections": 30021,
       "http_errors": 0
     },
-    "failure_rate": "44.46%",
+    "failure_rate": "44.47%",
     "weighted_errors_E": 72111,
-    "error_rate_epsilon": 1.333931,
+    "error_rate_epsilon": 1.333956,
     "p99_score": {
-      "value": 2650.6,
+      "value": 2649.1,
       "cut_triggered": false
     },
     "detection_score": {
@@ -30,6 +30,6 @@
       "absolute_penalty": null,
       "cut_triggered": true
     },
-    "final_score": -349.4
+    "final_score": -350.9
   }
 }

@@ -29,10 +29,12 @@
 #ifndef CMSG_SPACE
 #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
 #endif
-#define MAX_CTRL_CONNS 4
-#define MAX_CLIENT_CONNS 128
+#ifndef EPOLLRDHUP
+#define EPOLLRDHUP 0
+#endif
+
 #define MAX_TRACKED_FDS 65536
-#define MAX_EVENTS (1 + MAX_CTRL_CONNS + MAX_CLIENT_CONNS)
+#define MAX_EVENTS 512
 #define REQUEST_BUFFER_SIZE 8192
 
 typedef struct {
@@ -90,6 +92,16 @@ static int recv_fd(int unix_sock) {
   int client_fd = -1;
   memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(int));
   return client_fd;
+}
+
+static void close_client_conn(int epoll_fd, ClientConn **clients_by_fd, int fd) {
+  if (fd < 0 || fd >= MAX_TRACKED_FDS) {
+    return;
+  }
+  (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+  close(fd);
+  free(clients_by_fd[fd]);
+  clients_by_fd[fd] = NULL;
 }
 
 static void warm_up(const XScoreIndexView *xscore) {
@@ -154,44 +166,24 @@ int main(void) {
 
   fprintf(stderr, "listening for fd passing at %s\n", socket_path);
 
-  int *ctrl_fds = calloc(MAX_CTRL_CONNS, sizeof(*ctrl_fds));
-  int *ctrl_slot_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*ctrl_slot_by_fd));
-  ClientConn *client_conns = calloc(MAX_CLIENT_CONNS, sizeof(*client_conns));
-  int *client_slot_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*client_slot_by_fd));
+  unsigned char *fd_kinds = calloc(MAX_TRACKED_FDS, sizeof(*fd_kinds));
+  ClientConn **clients_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*clients_by_fd));
   struct epoll_event *events = calloc(MAX_EVENTS, sizeof(*events));
-  if (ctrl_fds == NULL || ctrl_slot_by_fd == NULL || client_conns == NULL ||
-      client_slot_by_fd == NULL || events == NULL) {
+  if (fd_kinds == NULL || clients_by_fd == NULL || events == NULL) {
     free(events);
-    free(client_slot_by_fd);
-    free(client_conns);
-    free(ctrl_slot_by_fd);
-    free(ctrl_fds);
+    free(clients_by_fd);
+    free(fd_kinds);
     close(server_fd);
     unlink(socket_path);
     x_score_close(&xscore);
     return 1;
   }
 
-  for (int i = 0; i < MAX_CTRL_CONNS; i++) {
-    ctrl_fds[i] = -1;
-  }
-  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-    ctrl_slot_by_fd[i] = -1;
-  }
-  for (int i = 0; i < MAX_CLIENT_CONNS; i++) {
-    client_conns[i].fd = -1;
-  }
-  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-    client_slot_by_fd[i] = -1;
-  }
-
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
     free(events);
-    free(client_slot_by_fd);
-    free(client_conns);
-    free(ctrl_slot_by_fd);
-    free(ctrl_fds);
+    free(clients_by_fd);
+    free(fd_kinds);
     close(server_fd);
     unlink(socket_path);
     x_score_close(&xscore);
@@ -200,15 +192,13 @@ int main(void) {
 
   struct epoll_event server_ev;
   memset(&server_ev, 0, sizeof(server_ev));
-  server_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  server_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
   server_ev.data.fd = server_fd;
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &server_ev) < 0) {
     close(epoll_fd);
     free(events);
-    free(client_slot_by_fd);
-    free(client_conns);
-    free(ctrl_slot_by_fd);
-    free(ctrl_fds);
+    free(clients_by_fd);
+    free(fd_kinds);
     close(server_fd);
     unlink(socket_path);
     x_score_close(&xscore);
@@ -241,17 +231,6 @@ int main(void) {
             break;
           }
 
-          int ctrl_slot = -1;
-          for (int i = 0; i < MAX_CTRL_CONNS; i++) {
-            if (ctrl_fds[i] < 0) {
-              ctrl_slot = i;
-              break;
-            }
-          }
-          if (ctrl_slot < 0) {
-            close(ctrl_fd);
-            continue;
-          }
           if (ctrl_fd >= MAX_TRACKED_FDS) {
             close(ctrl_fd);
             continue;
@@ -259,24 +238,37 @@ int main(void) {
 
           struct epoll_event ctrl_ev;
           memset(&ctrl_ev, 0, sizeof(ctrl_ev));
-          ctrl_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+          ctrl_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
           ctrl_ev.data.fd = ctrl_fd;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ctrl_ev) < 0) {
             close(ctrl_fd);
             continue;
           }
 
-          ctrl_fds[ctrl_slot] = ctrl_fd;
-          ctrl_slot_by_fd[ctrl_fd] = ctrl_slot;
+          fd_kinds[ctrl_fd] = 1;
         }
         continue;
       }
 
-      int ctrl_slot = -1;
-      if (fd >= 0 && fd < MAX_TRACKED_FDS) {
-        ctrl_slot = ctrl_slot_by_fd[fd];
+      if (fd < 0 || fd >= MAX_TRACKED_FDS) {
+        if (fd >= 0) {
+          close(fd);
+        }
+        continue;
       }
-      if (ctrl_slot >= 0) {
+
+      if ((ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
+        if (fd_kinds[fd] == 1) {
+          (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+          fd_kinds[fd] = 0;
+          close(fd);
+        } else if (clients_by_fd[fd] != NULL) {
+          close_client_conn(epoll_fd, clients_by_fd, fd);
+        }
+        continue;
+      }
+
+      if (fd_kinds[fd] == 1) {
         while (keep_running) {
           int client_fd = recv_fd(fd);
           if (client_fd < 0) {
@@ -287,64 +279,51 @@ int main(void) {
               continue;
             }
             (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-            ctrl_slot_by_fd[fd] = -1;
+            fd_kinds[fd] = 0;
             close(fd);
-            ctrl_fds[ctrl_slot] = -1;
             break;
           }
 
-          if (client_fd >= MAX_TRACKED_FDS) {
+          if (client_fd >= MAX_TRACKED_FDS || clients_by_fd[client_fd] != NULL) {
             close(client_fd);
             continue;
           }
 
-          int client_slot = -1;
-          for (int i = 0; i < MAX_CLIENT_CONNS; i++) {
-            if (client_conns[i].fd < 0) {
-              client_slot = i;
-              break;
-            }
-          }
-          if (client_slot < 0) {
+          ClientConn *client = calloc(1, sizeof(*client));
+          if (client == NULL) {
             close(client_fd);
             continue;
           }
-
-          memset(&client_conns[client_slot], 0, sizeof(client_conns[client_slot]));
-          client_conns[client_slot].fd = client_fd;
-          client_slot_by_fd[client_fd] = client_slot;
+          client->fd = client_fd;
+          clients_by_fd[client_fd] = client;
 
           struct epoll_event client_ev;
           memset(&client_ev, 0, sizeof(client_ev));
-          client_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+          client_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
           client_ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
             close(client_fd);
-            client_slot_by_fd[client_fd] = -1;
-            client_conns[client_slot].fd = -1;
-            continue;
+            free(client);
+            clients_by_fd[client_fd] = NULL;
           }
         }
         continue;
       }
 
-      int client_slot = -1;
-      if (fd >= 0 && fd < MAX_TRACKED_FDS) {
-        client_slot = client_slot_by_fd[fd];
-      }
-      if (client_slot < 0) {
+      ClientConn *client = clients_by_fd[fd];
+      if (client == NULL) {
+        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
         continue;
       }
 
-      ClientConn *client = &client_conns[client_slot];
-
-      if (client->response_data != NULL) {
+      if ((ev & EPOLLOUT) != 0 && client->response_data != NULL) {
         bool close_client = false;
 
         while (client->response_offset < client->response_len) {
           size_t remaining = client->response_len - client->response_offset;
           ssize_t nwritten =
-            send(client->fd, client->response_data + client->response_offset, remaining,
+            send(fd, client->response_data + client->response_offset, remaining,
                  MSG_NOSIGNAL | MSG_DONTWAIT);
           if (nwritten > 0) {
             client->response_offset += (size_t)nwritten;
@@ -364,160 +343,146 @@ int main(void) {
           break;
         }
 
-        if (close_client || client->response_offset >= client->response_len) {
-          (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-          client_slot_by_fd[client->fd] = -1;
-          close(client->fd);
-          memset(client, 0, sizeof(*client));
-          client->fd = -1;
+        if (close_client) {
+          close_client_conn(epoll_fd, clients_by_fd, fd);
           continue;
         }
 
-        struct epoll_event client_ev;
-        memset(&client_ev, 0, sizeof(client_ev));
-        client_ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-        client_ev.data.fd = client->fd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &client_ev) < 0) {
-          (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-          client_slot_by_fd[client->fd] = -1;
-          close(client->fd);
-          memset(client, 0, sizeof(*client));
-          client->fd = -1;
+        if (client->response_offset < client->response_len) {
+          continue;
         }
+
+        close_client_conn(epoll_fd, clients_by_fd, fd);
         continue;
       }
 
-      if ((ev & EPOLLIN) == 0) {
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-        client_slot_by_fd[client->fd] = -1;
-        close(client->fd);
-        memset(client, 0, sizeof(*client));
-        client->fd = -1;
+      if (client->response_data != NULL) {
         continue;
       }
 
-      size_t request_len = 0;
-      HttpReadStatus read_status = read_http_request(client->fd, client->request, sizeof(client->request),
-                                                     &client->used, &client->expected_total, &request_len);
-      if (read_status == HTTP_READ_PENDING) {
-        continue;
-      }
-      if (read_status != HTTP_READ_COMPLETE) {
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-        client_slot_by_fd[client->fd] = -1;
-        close(client->fd);
-        memset(client, 0, sizeof(*client));
-        client->fd = -1;
+      if ((ev & EPOLLIN) == 0 && client->used == 0) {
         continue;
       }
 
-      client->request_len = request_len;
-      client->request[request_len] = '\0';
+      while (keep_running) {
+        size_t request_len = 0;
+        HttpReadStatus read_status =
+          read_http_request(fd, client->request, sizeof(client->request), &client->used,
+                            &client->expected_total, &request_len);
+        if (read_status == HTTP_READ_PENDING) {
+          break;
+        }
+        if (read_status != HTTP_READ_COMPLETE) {
+          close_client_conn(epoll_fd, clients_by_fd, fd);
+          break;
+        }
 
-      const Response *resp = &RESPONSE_NOT_FOUND;
-      if (memcmp(client->request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
-        resp = &RESPONSE_READY;
-      } else if (memcmp(client->request, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
-        const char *body = NULL;
-        size_t body_len = 0;
-        if (!get_body(client->request, request_len, &body, &body_len)) {
-          resp = &RESPONSE_NOT_FOUND;
-        } else {
-          TransactionContext ctx = transaction_context_from_body(body, body_len);
-          if (ctx.id[0] == '\0') {
-            ctx.destroy(&ctx);
-            resp = &RESPONSE_BAD_REQUEST;
+        client->request_len = request_len;
+        client->request[request_len] = '\0';
+        int response_variant = RESPONSE_CLOSE_INDEX;
+        const Response *resp = &RESPONSE_NOT_FOUND_VARIANTS[response_variant];
+
+        if (memcmp(client->request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
+          resp = &RESPONSE_READY_VARIANTS[response_variant];
+        } else if (memcmp(client->request, REQ_POST_FRAUD_SCORE,
+                          sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
+          const char *body = NULL;
+          size_t body_len = 0;
+          if (!get_body(client->request, request_len, &body, &body_len)) {
+            resp = &RESPONSE_NOT_FOUND_VARIANTS[response_variant];
           } else {
-            double vector[14];
-            ctx.to_vector(&ctx, vector);
-            ctx.destroy(&ctx);
+            TransactionContext ctx = transaction_context_from_body(body, body_len);
+            if (ctx.id[0] == '\0') {
+              ctx.destroy(&ctx);
+              resp = &RESPONSE_BAD_REQUEST_VARIANTS[response_variant];
+            } else {
+              double vector[14];
+              ctx.to_vector(&ctx, vector);
+              ctx.destroy(&ctx);
 
-            // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-            uint8_t fraud_count = 0;
-            resp = &RESPONSE_FRAUD_10;
-            switch (fraud_count) {
-            case 0:
-              resp = &RESPONSE_FRAUD_00;
-              break;
-            case 1:
-              resp = &RESPONSE_FRAUD_02;
-              break;
-            case 2:
-              resp = &RESPONSE_FRAUD_04;
-              break;
-            case 3:
-              resp = &RESPONSE_FRAUD_06;
-              break;
-            case 4:
-              resp = &RESPONSE_FRAUD_08;
-              break;
-            default:
-              resp = &RESPONSE_FRAUD_10;
-              break;
+              // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
+              uint8_t fraud_count = 0;
+              resp = &RESPONSE_FRAUD_VARIANTS[response_variant][5];
+              switch (fraud_count) {
+              case 0:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][0];
+                break;
+              case 1:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][1];
+                break;
+              case 2:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][2];
+                break;
+              case 3:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][3];
+                break;
+              case 4:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][4];
+                break;
+              default:
+                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][5];
+                break;
+              }
             }
           }
         }
-      }
 
-      client->response_data = resp->data;
-      client->response_len = resp->len;
-      client->response_offset = 0;
+        client->response_data = resp->data;
+        client->response_len = resp->len;
+        client->response_offset = 0;
 
-      bool close_client = false;
-      while (client->response_offset < client->response_len) {
-        size_t remaining = client->response_len - client->response_offset;
-        ssize_t nwritten =
-          send(client->fd, client->response_data + client->response_offset, remaining,
-               MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (nwritten > 0) {
-          client->response_offset += (size_t)nwritten;
-          continue;
-        }
-        if (nwritten == 0) {
+        bool close_client = false;
+        while (client->response_offset < client->response_len) {
+          size_t remaining = client->response_len - client->response_offset;
+          ssize_t nwritten =
+            send(fd, client->response_data + client->response_offset, remaining,
+                 MSG_NOSIGNAL | MSG_DONTWAIT);
+          if (nwritten > 0) {
+            client->response_offset += (size_t)nwritten;
+            continue;
+          }
+          if (nwritten == 0) {
+            close_client = true;
+            break;
+          }
+          if (errno == EINTR) {
+            continue;
+          }
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+          }
           close_client = true;
           break;
         }
-        if (errno == EINTR) {
-          continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+
+        if (close_client) {
+          close_client_conn(epoll_fd, clients_by_fd, fd);
           break;
         }
-        close_client = true;
+
+        if (client->response_offset < client->response_len) {
+          struct epoll_event client_ev;
+          memset(&client_ev, 0, sizeof(client_ev));
+          client_ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+          client_ev.data.fd = fd;
+          if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &client_ev) < 0) {
+            close_client_conn(epoll_fd, clients_by_fd, fd);
+          }
+          break;
+        }
+
+        close_client_conn(epoll_fd, clients_by_fd, fd);
         break;
       }
-
-      if (close_client || client->response_offset >= client->response_len) {
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-        client_slot_by_fd[client->fd] = -1;
-        close(client->fd);
-        memset(client, 0, sizeof(*client));
-        client->fd = -1;
-        continue;
-      }
-
-      struct epoll_event client_ev;
-      memset(&client_ev, 0, sizeof(client_ev));
-      client_ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-      client_ev.data.fd = client->fd;
-      if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &client_ev) < 0) {
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
-        client_slot_by_fd[client->fd] = -1;
-        close(client->fd);
-        memset(client, 0, sizeof(*client));
-        client->fd = -1;
-      }
     }
   }
 
-  for (int i = 0; i < MAX_CTRL_CONNS; i++) {
-    if (ctrl_fds[i] >= 0) {
-      close(ctrl_fds[i]);
-    }
-  }
-  for (int i = 0; i < MAX_CLIENT_CONNS; i++) {
-    if (client_conns[i].fd >= 0) {
-      close(client_conns[i].fd);
+  for (int fd = 0; fd < MAX_TRACKED_FDS; fd++) {
+    if (fd_kinds[fd] == 1) {
+      close(fd);
+    } else if (clients_by_fd[fd] != NULL) {
+      close(fd);
+      free(clients_by_fd[fd]);
     }
   }
   close(epoll_fd);
@@ -525,9 +490,7 @@ int main(void) {
   unlink(socket_path);
   x_score_close(&xscore);
   free(events);
-  free(client_slot_by_fd);
-  free(client_conns);
-  free(ctrl_slot_by_fd);
-  free(ctrl_fds);
+  free(clients_by_fd);
+  free(fd_kinds);
   return 0;
 }

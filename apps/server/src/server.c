@@ -67,7 +67,30 @@ HttpReadStatus read_http_request(int fd, char *buf, size_t cap, size_t *used,
     return HTTP_READ_ERROR;
   }
 
-  while (*used + 1 < cap) {
+  while (true) {
+    if (*expected_total == 0) {
+      const char *headers_end = find_headers_end(buf);
+      if (headers_end != NULL) {
+        size_t headers_len = (size_t)(headers_end - buf) + 4;
+        size_t content_len = parse_content_length(buf);
+        *expected_total = headers_len + content_len;
+        if (*expected_total + 1 > cap) {
+          return HTTP_READ_OVERFLOW;
+        }
+        if (*used >= *expected_total) {
+          *out_request_len = *expected_total;
+          return HTTP_READ_COMPLETE;
+        }
+      }
+    } else if (*used >= *expected_total) {
+      *out_request_len = *expected_total;
+      return HTTP_READ_COMPLETE;
+    }
+
+    if (*used + 1 >= cap) {
+      break;
+    }
+
     ssize_t n = read(fd, buf + *used, cap - *used - 1);
     if (n < 0) {
       if (errno == EINTR) {
@@ -83,27 +106,6 @@ HttpReadStatus read_http_request(int fd, char *buf, size_t cap, size_t *used,
     }
     *used += (size_t)n;
     buf[*used] = '\0';
-
-    if (*expected_total == 0) {
-      const char *headers_end = find_headers_end(buf);
-      if (headers_end == NULL) {
-        continue;
-      }
-
-      size_t headers_len = (size_t)(headers_end - buf) + 4;
-      size_t content_len = parse_content_length(buf);
-      *expected_total = headers_len + content_len;
-      if (*expected_total + 1 > cap) {
-        return HTTP_READ_OVERFLOW;
-      }
-      if (*used >= *expected_total) {
-        *out_request_len = *expected_total;
-        return HTTP_READ_COMPLETE;
-      }
-    } else if (*used >= *expected_total) {
-      *out_request_len = *expected_total;
-      return HTTP_READ_COMPLETE;
-    }
   }
 
   buf[cap - 1] = '\0';
