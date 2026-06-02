@@ -30,11 +30,13 @@ This avoids extra TCP hops between LB and API.
 
 ### `apps/load-balancer`
 - **Round-robin dispatch** across API Unix sockets.
-- **Persistent control sockets** to APIs (reconnect only on failure).
+- **Persistent control sockets** to APIs, with eager startup preconnect before serving external traffic.
 - **FD passing via libc `sendmsg(SCM_RIGHTS)`** over persistent Unix control sockets, using `MSG_NOSIGNAL | MSG_DONTWAIT`.
 - **Persistent Unix worker sockets** promoted to non-blocking mode after connect, so FD passing does not block the listener loop.
 - **Linux-only epoll listener loop** with non-blocking accept drain.
 - **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` and drains until `EAGAIN` per wakeup.
+- **Background e2e startup warmup**: the LB issues internal `/fraud-score` requests against `127.0.0.1:PORT` to warm the full path (listener, fd passing, server parsing, response path).
+- **Readiness gating during warmup**: `/ready` is held at `503` until the e2e warmup finishes, reducing cold-start impact on the first benchmark run.
 - **Zero-copy request forwarding at LB layer**: accept -> select upstream -> pass client FD -> close local duplicate.
 - **Non-Linux editor mocks** under `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h`, intended only to avoid local typing/tooling errors.
 - **Minimal dependencies** (single C binary).
@@ -217,7 +219,12 @@ python3 scripts/tune_partition_cutoffs.py \
 ├── apps
 │   ├── load-balancer
 │   │   ├── Dockerfile
-│   │   └── src/main.c
+│   │   └── src/
+│   │       ├── main.c
+│   │       ├── utils.c
+│   │       ├── utils.h
+│   │       ├── warmup.c
+│   │       └── warmup.h
 │   └── server
 │       ├── Dockerfile
 │       └── src/

@@ -22,8 +22,10 @@
 #endif
 #include <sys/types.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
+
+#include "utils.h"
+#include "warmup.h"
 
 #ifndef CMSG_SPACE
 #define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
@@ -38,6 +40,8 @@
 #define MAX_ENV_LEN 1024
 #define MAX_SOCKET_PATH 108
 #define MAX_WORKERS 16
+#define STARTUP_CONNECT_ATTEMPTS 50
+#define STARTUP_CONNECT_SLEEP_MS 100
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -53,6 +57,10 @@ enum {
 };
 
 static void on_signal(int signo) {
+  if (signo == SIGUSR1) {
+    warmup_mark_done();
+    return;
+  }
   (void)signo;
   keep_running = 0;
 }
@@ -94,6 +102,27 @@ static int ensure_worker_connected(worker_t *worker) {
 
   worker->control_fd = fd;
   return 0;
+}
+
+static void preconnect_workers(worker_t *workers, int worker_count) {
+  for (int attempt = 0; attempt < STARTUP_CONNECT_ATTEMPTS; attempt++) {
+    bool all_connected = true;
+
+    for (int i = 0; i < worker_count; i++) {
+      if (ensure_worker_connected(&workers[i]) < 0) {
+        all_connected = false;
+      }
+    }
+
+    if (all_connected) {
+      fprintf(stderr, "INFO: all worker control sockets connected\n");
+      return;
+    }
+
+    sleep_ms(STARTUP_CONNECT_SLEEP_MS);
+  }
+
+  fprintf(stderr, "WARN: some worker control sockets were not connected during startup warmup\n");
 }
 
 static int send_fd(int unix_sock, int fd_to_send) {
@@ -176,6 +205,8 @@ static int create_tcp_listener(int port) {
 int main(void) {
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
+  signal(SIGCHLD, SIG_IGN);
+  signal(SIGUSR1, on_signal);
 
   const char *port_str = getenv("PORT");
   if (port_str == NULL || *port_str == '\0') {
@@ -231,6 +262,8 @@ int main(void) {
     fprintf(stderr, "INFO: worker[%d] socket path: %s\n", i, workers[i].path);
   }
 
+  preconnect_workers(workers, worker_count);
+
   int rr = 0;
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
@@ -250,6 +283,8 @@ int main(void) {
     close(listener);
     return 1;
   }
+
+  spawn_e2e_warmup(port);
 
   while (keep_running) {
     struct epoll_event ev;
@@ -278,6 +313,11 @@ int main(void) {
         }
         fprintf(stderr, "WARN: accept failed: %s\n", strerror(errno));
         break;
+      }
+
+      if (warmup_handle_ready_gate(client_fd)) {
+        close(client_fd);
+        continue;
       }
 
       bool forwarded = false;

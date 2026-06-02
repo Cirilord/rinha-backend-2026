@@ -27,7 +27,9 @@ SERVER_SRCS := apps/server/src/main.c \
                apps/server/src/transaction_context.c \
                apps/server/src/x-score.c
 
-LB_SRCS := apps/load-balancer/src/main.c
+LB_SRCS := apps/load-balancer/src/main.c \
+           apps/load-balancer/src/utils.c \
+           apps/load-balancer/src/warmup.c
 
 .PHONY: server load-balancer clean
 
