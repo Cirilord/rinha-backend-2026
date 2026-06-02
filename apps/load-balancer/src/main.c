@@ -33,7 +33,7 @@
 #define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
 #endif
 
-#define BACKLOG 2048
+#define BACKLOG 65535
 #define DEFAULT_PORT 9999
 #define MAX_ENV_LEN 1024
 #define MAX_SOCKET_PATH 108
