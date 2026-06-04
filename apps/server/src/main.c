@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "listener.h"
+#include "transaction_context.h"
 #include "utils.h"
 
 static const uint8_t RESPONSE[] = "HTTP/1.1 200 OK\r\n"
@@ -66,6 +67,8 @@ struct tracked_fd {
 struct parse_result {
   uint8_t status;
   size_t consumed;
+  size_t body_start;
+  size_t body_len;
 };
 
 struct client_conn {
@@ -417,6 +420,8 @@ static struct parse_result parse_request(const uint8_t *buf, size_t len) {
   struct parse_result result;
   result.status = PARSE_NEED;
   result.consumed = 0;
+  result.body_start = 0;
+  result.body_len = 0;
 
   int is_ready = 0;
   int is_fraud_score = 0;
@@ -472,6 +477,8 @@ static struct parse_result parse_request(const uint8_t *buf, size_t len) {
 
     result.status = PARSE_NOT_FOUND;
     result.consumed = body_start + content_length;
+    result.body_start = body_start;
+    result.body_len = content_length;
     return result;
   }
 
@@ -487,6 +494,8 @@ static struct parse_result parse_request(const uint8_t *buf, size_t len) {
 
   result.status = PARSE_GOT;
   result.consumed = body_start + content_length;
+  result.body_start = body_start;
+  result.body_len = content_length;
   return result;
 }
 
@@ -573,7 +582,13 @@ static int process_requests(int epoll_fd, int index) {
 
     const uint8_t *response = RESPONSE;
     size_t response_len = sizeof(RESPONSE) - 1;
-    if (parsed.status == PARSE_READY) {
+    if (parsed.status == PARSE_GOT) {
+      transaction_context ctx = transaction_context__from_body(
+        (const char *)(client->in_buf + client->in_start + parsed.body_start), parsed.body_len);
+      double vector[14];
+      transaction_context__to_vector(&ctx, vector);
+      transaction_context__destroy(&ctx);
+    } else if (parsed.status == PARSE_READY) {
       response = RESPONSE_READY;
       response_len = sizeof(RESPONSE_READY) - 1;
     } else if (parsed.status == PARSE_NOT_FOUND) {
