@@ -1,15 +1,47 @@
+name: rinha-backend
+
 services:
+  load-balancer:
+    build:
+      context: .
+      dockerfile: apps/load-balancer/Dockerfile
+    container_name: load-balancer
+    depends_on:
+      - api1
+      - api2
+    ports:
+      - "9999:9999"
+    cpus: 0.2
+    mem_limit: 20m
+    logging:
+      driver: none
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - sockets:/tmp
+    networks:
+      - rinha
+
   api1:
     build:
       context: .
-      dockerfile: ./apps/server/Dockerfile
+      dockerfile: apps/server/Dockerfile
+    command: ["/tmp/server-1.sock"]
+    cpus: 0.4
+    mem_limit: 165m
     environment:
-      UNIX_SOCKET_PATH: "/shared/api1.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
-    volumes:
-      - shared-sockets:/shared
+      CONN_POOL_CAP: "512"
+      EPOLL_SPIN_US: "0"
+      EPOLL_IDLE_US: "60"
+      EPOLL_BUSY_POLL_US: "100"
+      EPOLL_BUSY_POLL_BUDGET: "8"
+      EPOLL_PREFER_BUSY_POLL: "1"
     logging:
       driver: none
+    restart: unless-stopped
     ulimits:
       nofile:
         soft: 65535
@@ -17,25 +49,28 @@ services:
       memlock:
         soft: -1
         hard: -1
+    volumes:
+      - sockets:/tmp
     networks:
       - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.40"
-          memory: "150MB"
 
   api2:
     build:
       context: .
-      dockerfile: ./apps/server/Dockerfile
+      dockerfile: apps/server/Dockerfile
+    command: ["/tmp/server-2.sock"]
+    cpus: 0.4
+    mem_limit: 165m
     environment:
-      UNIX_SOCKET_PATH: "/shared/api2.sock"
-      X_SCORE_INDEX_PATH: "/app/resources/references.idx"
-    volumes:
-      - shared-sockets:/shared
+      CONN_POOL_CAP: "512"
+      EPOLL_SPIN_US: "0"
+      EPOLL_IDLE_US: "60"
+      EPOLL_BUSY_POLL_US: "100"
+      EPOLL_BUSY_POLL_BUDGET: "8"
+      EPOLL_PREFER_BUSY_POLL: "1"
     logging:
       driver: none
+    restart: unless-stopped
     ulimits:
       nofile:
         soft: 65535
@@ -43,50 +78,19 @@ services:
       memlock:
         soft: -1
         hard: -1
-    networks:
-      - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.40"
-          memory: "150MB"
-
-  load-balancer:
-    build:
-      context: .
-      dockerfile: ./apps/load-balancer/Dockerfile
-    ports:
-      - "9999:9999"
-    environment:
-      PORT: "9999"
-      WORKER_SOCKETS: "/shared/api1.sock,/shared/api2.sock"
     volumes:
-      - shared-sockets:/shared
-    logging:
-      driver: none
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
-    depends_on:
-      - api1
-      - api2
+      - sockets:/tmp
     networks:
       - rinha
-    deploy:
-      resources:
-        limits:
-          cpus: "0.20"
-          memory: "50MB"
-
-networks:
-  rinha:
-    driver: bridge
 
 volumes:
-  shared-sockets:
+  sockets:
     driver: local
     driver_opts:
       type: tmpfs
       device: tmpfs
       o: "size=4m,uid=0,gid=0,mode=0777"
+
+networks:
+  rinha:
+    driver: bridge

@@ -1,5 +1,5 @@
-#ifndef LOAD_BALANCER_UTILS_H
-#define LOAD_BALANCER_UTILS_H
+#ifndef SERVER_UTILS_H
+#define SERVER_UTILS_H
 
 void fatal(const char *message) __attribute__((noreturn));
 

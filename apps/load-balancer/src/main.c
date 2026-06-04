@@ -1,375 +1,164 @@
-#if defined(__linux__)
 #define _GNU_SOURCE
-#endif
-#define _POSIX_C_SOURCE 200809L
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
+#ifdef __linux__
 #include <netinet/in.h>
-#if defined(__linux__)
 #include <netinet/tcp.h>
-#else
-#include "../../../packages/mocks/netinet/tcp.h"
-#endif
-#include <signal.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#if defined(__linux__)
-#include <sys/epoll.h>
 #else
-#include "../../../packages/mocks/sys/epoll.h"
+#include "../../../packages/mocks/netinet/in.h"
+#include "../../../packages/mocks/netinet/tcp.h"
 #include "../../../packages/mocks/sys/socket.h"
 #endif
-#include <sys/types.h>
+
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <string.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "listener.h"
 #include "utils.h"
-#include "warmup.h"
 
-#ifndef CMSG_SPACE
-#define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
-#endif
-
-#ifndef CMSG_LEN
-#define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
-#endif
-
-#define BACKLOG 65535
-#define DEFAULT_PORT 9999
-#define MAX_ENV_LEN 1024
-#define MAX_SOCKET_PATH 108
-#define MAX_WORKERS 16
-#define STARTUP_CONNECT_ATTEMPTS 50
-#define STARTUP_CONNECT_SLEEP_MS 100
-
-static volatile sig_atomic_t keep_running = 1;
-
-typedef struct {
-  char path[MAX_SOCKET_PATH];
-  int control_fd;
-} worker_t;
-
-enum {
-  SEND_FD_OK = 0,
-  SEND_FD_FATAL = -1,
+static const char *BACKEND_PATHS[] = {
+  "/tmp/server-1.sock",
+  "/tmp/server-2.sock",
 };
 
-static void on_signal(int signo) {
-  if (signo == SIGUSR1) {
-    warmup_mark_done();
-    return;
-  }
-  (void)signo;
-  keep_running = 0;
-}
+#define BACKEND_COUNT 2
+#define ACCEPT_BATCH 64
 
-static int connect_worker(const char *socket_path) {
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+struct backend {
+  int fd;
+  char dummy;
+  struct iovec iov;
+  union {
+    struct cmsghdr cm;
+    char buf[CMSG_SPACE(sizeof(int))];
+  } control;
+  struct msghdr msg;
+  struct cmsghdr *cmsg;
+};
+
+static int connect_backend(const char *socket_path) {
+  int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
   if (fd < 0) {
-    return -1;
+    fatal("socket");
   }
+
+  int sndbuf = 256 * 1024;
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
-    return -1;
+  while (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (errno != ENOENT && errno != ECONNREFUSED) {
+      fatal("connect");
+    }
+    usleep(50000);
   }
 
   return fd;
 }
 
-static int ensure_worker_connected(worker_t *worker) {
-  if (worker->control_fd >= 0) {
-    return 0;
-  }
-
-  int fd = connect_worker(worker->path);
-  if (fd < 0) {
-    return -1;
-  }
-
-  worker->control_fd = fd;
-  return 0;
+static void init_backend(struct backend *backend, int fd) {
+  memset(backend, 0, sizeof(*backend));
+  backend->fd = fd;
+  backend->dummy = 'F';
+  backend->iov.iov_base = &backend->dummy;
+  backend->iov.iov_len = sizeof(backend->dummy);
+  backend->msg.msg_iov = &backend->iov;
+  backend->msg.msg_iovlen = 1;
+  backend->msg.msg_control = backend->control.buf;
+  backend->msg.msg_controllen = sizeof(backend->control.buf);
+  backend->cmsg = CMSG_FIRSTHDR(&backend->msg);
+  backend->cmsg->cmsg_level = SOL_SOCKET;
+  backend->cmsg->cmsg_type = SCM_RIGHTS;
+  backend->cmsg->cmsg_len = CMSG_LEN(sizeof(int));
 }
 
-static void preconnect_workers(worker_t *workers, int worker_count) {
-  for (int attempt = 0; attempt < STARTUP_CONNECT_ATTEMPTS; attempt++) {
-    bool all_connected = true;
-
-    for (int i = 0; i < worker_count; i++) {
-      if (ensure_worker_connected(&workers[i]) < 0) {
-        all_connected = false;
-      }
-    }
-
-    if (all_connected) {
-      fprintf(stderr, "INFO: all worker control sockets connected\n");
-      return;
-    }
-
-    sleep_ms(STARTUP_CONNECT_SLEEP_MS);
-  }
-
-  fprintf(stderr, "WARN: some worker control sockets were not connected during startup warmup\n");
-}
-
-static int send_fd(int unix_sock, int fd_to_send) {
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
-
-  // Only a minimal control byte is sent; client payload stays on the passed FD.
-  char dummy = '\0';
-  struct iovec io = {
-    .iov_base = &dummy,
-    .iov_len = sizeof(dummy),
-  };
-  msg.msg_iov = &io;
-  msg.msg_iovlen = 1;
-
-  char control[CMSG_SPACE(sizeof(int))];
-  memset(control, 0, sizeof(control));
-  msg.msg_control = control;
-  msg.msg_controllen = sizeof(control);
-
-  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-  cmsg->cmsg_level = SOL_SOCKET;
-  cmsg->cmsg_type = SCM_RIGHTS;
-  *((int *)CMSG_DATA(cmsg)) = fd_to_send;
+static int send_fd_with_flags(struct backend *backend, int client_fd, int flags) {
+  backend->msg.msg_controllen = sizeof(backend->control.buf);
+  memcpy(CMSG_DATA(backend->cmsg), &client_fd, sizeof(client_fd));
 
   for (;;) {
-    if (sendmsg(unix_sock, &msg, MSG_NOSIGNAL) >= 0) {
-      return SEND_FD_OK;
+    ssize_t sent = sendmsg(backend->fd, &backend->msg, MSG_NOSIGNAL | flags);
+    if (sent > 0) {
+      return 0;
     }
-
-    if (errno == EINTR) {
+    if (sent < 0 && errno == EINTR) {
       continue;
     }
-
-    return SEND_FD_FATAL;
+    return -1;
   }
 }
 
-static int create_tcp_listener(int port) {
-  int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  int yes = 1;
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-    close(fd);
-    return -1;
-  }
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  int defer_accept = 1;
-  if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_accept, sizeof(defer_accept)) < 0) {
-    if (!(errno == ENOPROTOOPT || errno == EOPNOTSUPP || errno == ENOTSUP || errno == EINVAL ||
-          errno == EPERM)) {
-      close(fd);
-      return -1;
+static int handoff_client(struct backend backends[BACKEND_COUNT], int first_backend,
+                          int client_fd) {
+  for (int offset = 0; offset < BACKEND_COUNT; offset++) {
+    int target = (first_backend + offset) % BACKEND_COUNT;
+    if (send_fd_with_flags(&backends[target], client_fd, MSG_DONTWAIT) == 0) {
+      return 0;
     }
   }
 
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((uint16_t)port);
-
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  if (listen(fd, BACKLOG) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  return fd;
+  return send_fd_with_flags(&backends[first_backend], client_fd, 0);
 }
 
 int main(void) {
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
-  signal(SIGCHLD, SIG_IGN);
-  signal(SIGUSR1, on_signal);
+  signal(SIGPIPE, SIG_IGN);
 
-  const char *port_str = getenv("PORT");
-  if (port_str == NULL || *port_str == '\0') {
-    fprintf(stderr, "ERROR: PORT is required and cannot be empty\n");
-    return 1;
-  }
-  char *end = NULL;
-  int port = (int)strtol(port_str, &end, 10);
-  if (*end != '\0' || port < 1 || port > 65535) {
-    fprintf(stderr, "ERROR: invalid PORT='%s'\n", port_str);
-    return 1;
+  int listener_fd = create_listener(9999, 65535);
+  struct backend backends[BACKEND_COUNT];
+  for (int i = 0; i < BACKEND_COUNT; i++) {
+    init_backend(&backends[i], connect_backend(BACKEND_PATHS[i]));
   }
 
-  const char *worker_sockets = getenv("WORKER_SOCKETS");
-  if (worker_sockets == NULL || *worker_sockets == '\0') {
-    fprintf(stderr, "ERROR: WORKER_SOCKETS is required and cannot be empty\n");
-    return 1;
-  }
+  int next_backend = 0;
+  struct pollfd pfd;
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = listener_fd;
+  pfd.events = POLLIN;
 
-  worker_t workers[MAX_WORKERS];
-  char buffer[MAX_ENV_LEN];
-  strncpy(buffer, worker_sockets, sizeof(buffer) - 1);
-  buffer[sizeof(buffer) - 1] = '\0';
-
-  int worker_count = 0;
-  char *token = strtok(buffer, ",");
-  while (token != NULL && worker_count < MAX_WORKERS) {
-    while (*token == ' ') {
-      token++;
-    }
-
-    size_t len = strnlen(token, MAX_SOCKET_PATH);
-    if (len == 0 || len >= MAX_SOCKET_PATH) {
-      fprintf(stderr, "WARN: skipping invalid worker socket path: '%s'\n", token);
-    } else {
-      strncpy(workers[worker_count].path, token, sizeof(workers[worker_count].path) - 1);
-      workers[worker_count].path[sizeof(workers[worker_count].path) - 1] = '\0';
-      workers[worker_count].control_fd = -1;
-      worker_count++;
-    }
-
-    token = strtok(NULL, ",");
-  }
-
-  int listener = create_tcp_listener(port);
-  if (listener < 0) {
-    fprintf(stderr, "ERROR: failed to create TCP listener on port %d: %s\n", port, strerror(errno));
-    return 1;
-  }
-
-  fprintf(stderr, "INFO: listening on 0.0.0.0:%d\n", port);
-  for (int i = 0; i < worker_count; i++) {
-    fprintf(stderr, "INFO: worker[%d] socket path: %s\n", i, workers[i].path);
-  }
-
-  preconnect_workers(workers, worker_count);
-
-  int rr = 0;
-  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-  if (epoll_fd < 0) {
-    fprintf(stderr, "ERROR: failed to create epoll instance: %s\n", strerror(errno));
-    close(listener);
-    return 1;
-  }
-
-  struct epoll_event listener_ev;
-  memset(&listener_ev, 0, sizeof(listener_ev));
-  listener_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-  listener_ev.data.fd = listener;
-
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener, &listener_ev) < 0) {
-    fprintf(stderr, "ERROR: failed to register listener on epoll: %s\n", strerror(errno));
-    close(epoll_fd);
-    close(listener);
-    return 1;
-  }
-
-  spawn_e2e_warmup(port);
-
-  while (keep_running) {
-    struct epoll_event ev;
-    int nready = epoll_wait(epoll_fd, &ev, 1, -1);
-    if (nready < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      fprintf(stderr, "WARN: epoll_wait failed: %s\n", strerror(errno));
-      break;
-    }
-
-    if (nready == 0 || ev.data.fd != listener ||
-        (ev.events & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0) {
-      continue;
-    }
-
-    while (keep_running) {
-      int client_fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  for (;;) {
+    int accepted = 0;
+    while (accepted < ACCEPT_BATCH) {
+      int client_fd = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
       if (client_fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          break;
-        }
         if (errno == EINTR) {
           continue;
         }
-        fprintf(stderr, "WARN: accept failed: %s\n", strerror(errno));
-        break;
-      }
-
-      int yes = 1;
-      if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
-        if (!(errno == ENOPROTOOPT || errno == EOPNOTSUPP || errno == ENOTSUP ||
-              errno == EINVAL || errno == EPERM)) {
-          close(client_fd);
-          continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;
         }
+        fatal("accept4");
       }
 
-      if (warmup_handle_ready_gate(client_fd)) {
+      accepted++;
+
+      int one = 1;
+      if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+        fatal("setsockopt");
+      }
+      if (setsockopt(client_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one)) < 0) {
+        fatal("setsockopt");
+      }
+
+      int first_backend = next_backend;
+      next_backend = (next_backend + 1) % BACKEND_COUNT;
+      if (handoff_client(backends, first_backend, client_fd) < 0) {
         close(client_fd);
         continue;
       }
 
-      bool forwarded = false;
-      for (int tries = 0; tries < worker_count; tries++) {
-        int idx = (rr + tries) % worker_count;
-
-        if (ensure_worker_connected(&workers[idx]) < 0) {
-          continue;
-        }
-
-        int send_result = send_fd(workers[idx].control_fd, client_fd);
-        if (send_result == SEND_FD_OK) {
-          rr = (idx + 1) % worker_count;
-          forwarded = true;
-          break;
-        }
-
-        close(workers[idx].control_fd);
-        workers[idx].control_fd = -1;
-      }
-
-      if (!forwarded) {
-        const char *resp = "HTTP/1.1 503 Service Unavailable\r\n"
-                           "Content-Length: 19\r\n"
-                           "Connection: close\r\n\r\n"
-                           "no worker available";
-        (void)send(client_fd, resp, strlen(resp), MSG_NOSIGNAL | MSG_DONTWAIT);
-      }
-
       close(client_fd);
     }
-  }
 
-  close(epoll_fd);
-  close(listener);
-  for (int i = 0; i < worker_count; i++) {
-    if (workers[i].control_fd >= 0) {
-      close(workers[i].control_fd);
+    if (accepted == 0) {
+      poll(&pfd, 1, -1);
     }
   }
-
-  fprintf(stderr, "INFO: shutdown complete\n");
-  return 0;
 }

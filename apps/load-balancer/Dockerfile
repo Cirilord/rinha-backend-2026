@@ -1,14 +1,17 @@
-FROM gcc:14-bookworm AS build
-ARG TARGETARCH
-WORKDIR /src
-COPY Makefile ./Makefile
-COPY apps/load-balancer/src ./apps/load-balancer/src
-RUN make load-balancer TARGETARCH=${TARGETARCH} && mv load-balancer /build-load-balancer
+FROM alpine:3.22 AS build
 
-FROM debian:bookworm-slim
-WORKDIR /app
-COPY --from=build /build-load-balancer /usr/local/bin/load-balancer
-ENV PORT=9999
-ENV WORKER_SOCKETS=/shared/backend-1.sock,/shared/backend-2.sock
-EXPOSE 9999
-CMD ["/usr/local/bin/load-balancer"]
+RUN apk add --no-cache build-base linux-headers
+
+ARG CC=gcc
+ARG TARGETARCH
+ARG CFLAGS_BASE="-Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -std=c11 -Wall -Wextra"
+ARG CFLAGS_ARCH=""
+
+WORKDIR /src
+COPY apps/load-balancer/src/ /src/
+RUN mkdir -p /out && \
+    ${CC} ${CFLAGS_BASE} ${CFLAGS_ARCH} -o /out/load-balancer /src/*.c
+
+FROM scratch
+COPY --from=build /out/load-balancer /load-balancer
+ENTRYPOINT ["/load-balancer"]

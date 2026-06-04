@@ -1,30 +1,15 @@
-#ifndef LOAD_BALANCER_MOCKS_NETINET_TCP_H
-#define LOAD_BALANCER_MOCKS_NETINET_TCP_H
+#pragma once
 
-// Visual/editor-only mock header for non-Linux environments.
-
+#ifdef __APPLE__
 #ifndef TCP_NODELAY
-#define TCP_NODELAY 0
+#define TCP_NODELAY 0x01
 #endif
 
 #ifndef TCP_QUICKACK
-#define TCP_QUICKACK 0
+#define TCP_QUICKACK 0x0c
 #endif
 
 #ifndef TCP_DEFER_ACCEPT
-#define TCP_DEFER_ACCEPT 0
+#define TCP_DEFER_ACCEPT 0x09
 #endif
-
-#ifndef TCP_FASTOPEN
-#define TCP_FASTOPEN 0
-#endif
-
-#ifndef SO_BUSY_POLL
-#define SO_BUSY_POLL 0
-#endif
-
-#ifndef SO_BUSY_POLL_BUDGET
-#define SO_BUSY_POLL_BUDGET 0
-#endif
-
 #endif

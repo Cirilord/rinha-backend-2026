@@ -1,3 +1,5 @@
+PROJECT_NAME := rinha-backend
+
 CC ?= gcc
 
 TARGETARCH ?=
@@ -12,32 +14,53 @@ TARGETARCH := arm64
 endif
 endif
 
-CFLAGS_BASE := -Ofast -fomit-frame-pointer -flto -Wall -Wextra -std=c11
+CFLAGS_BASE := -Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -std=c11 -Wall -Wextra
 ifeq ($(TARGETARCH),amd64)
 CFLAGS_ARCH := -march=haswell -mtune=haswell
 else
 CFLAGS_ARCH :=
 endif
 
-CFLAGS ?= $(CFLAGS_BASE) $(CFLAGS_ARCH)
+BUILD_ARGS := \
+	--build-arg CC=$(CC) \
+	--build-arg TARGETARCH=$(TARGETARCH) \
+	--build-arg CFLAGS_BASE="$(CFLAGS_BASE)" \
+	--build-arg CFLAGS_ARCH="$(CFLAGS_ARCH)"
 
-SERVER_SRCS := apps/server/src/main.c \
-               apps/server/src/server.c \
-               apps/server/src/responses.c \
-               apps/server/src/transaction_context.c \
-               apps/server/src/x-score.c
+COMPOSE ?= docker compose
+COMPOSE_FILE ?= docker-compose.yml
 
-LB_SRCS := apps/load-balancer/src/main.c \
-           apps/load-balancer/src/utils.c \
-           apps/load-balancer/src/warmup.c
+.PHONY: build up down logs smoke test print-flags
 
-.PHONY: server load-balancer clean
+build:
+	$(COMPOSE) -f $(COMPOSE_FILE) build $(BUILD_ARGS)
 
-server:
-	$(CC) $(CFLAGS) -o server $(SERVER_SRCS)
+up:
+	$(MAKE) build COMPOSE_FILE=$(COMPOSE_FILE) TARGETARCH=$(TARGETARCH) CC=$(CC)
+	$(COMPOSE) -f $(COMPOSE_FILE) up -d
 
-load-balancer:
-	$(CC) $(CFLAGS) -o load-balancer $(LB_SRCS)
+down:
+	$(COMPOSE) -f $(COMPOSE_FILE) down -v
 
-clean:
-	rm -f server load-balancer
+logs:
+	$(COMPOSE) -f $(COMPOSE_FILE) logs -f --tail=200
+
+smoke:
+	docker run --rm -i \
+	  --network $(PROJECT_NAME)_rinha \
+	  -v "$$PWD:/work" -w /work \
+	  -e BASE_URL=http://load-balancer:9999 \
+	  grafana/k6 run test/smoke.js
+
+test:
+	docker run --rm -i \
+	  --network $(PROJECT_NAME)_rinha \
+	  -v "$$PWD:/work" -w /work \
+	  -e BASE_URL=http://load-balancer:9999 \
+	  grafana/k6 run test/test.js
+
+print-flags:
+	@echo "TARGETARCH=$(TARGETARCH)"
+	@echo "CC=$(CC)"
+	@echo "CFLAGS_BASE=$(CFLAGS_BASE)"
+	@echo "CFLAGS_ARCH=$(CFLAGS_ARCH)"

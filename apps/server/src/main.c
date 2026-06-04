@@ -1,523 +1,734 @@
-#if defined(__linux__)
 #define _GNU_SOURCE
-#endif
-#define _POSIX_C_SOURCE 200809L
 
-#include <errno.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#if defined(__linux__)
+#ifdef __linux__
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #else
+#include "../../../packages/mocks/netinet/in.h"
+#include "../../../packages/mocks/netinet/tcp.h"
 #include "../../../packages/mocks/sys/epoll.h"
 #include "../../../packages/mocks/sys/socket.h"
 #endif
-#include <sys/socket.h>
+
+#include <errno.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "responses.h"
-#include "server.h"
-#include "transaction_context.h"
-#include "x-score.h"
+#include "listener.h"
+#include "utils.h"
 
-#ifndef CMSG_LEN
-#define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
-#endif
-#ifndef CMSG_SPACE
-#define CMSG_SPACE(len) (sizeof(struct cmsghdr) + (len))
-#endif
-#ifndef EPOLLRDHUP
-#define EPOLLRDHUP 0
-#endif
-
-#define MAX_TRACKED_FDS 65536
-#define MAX_EVENTS 512
-#define REQUEST_BUFFER_SIZE 8192
-
-typedef struct ClientConn {
-  int fd;
-  size_t used;
-  size_t expected_total;
-  size_t request_len;
-  const char *response_data;
-  size_t response_len;
-  size_t response_offset;
-  struct ClientConn *next_free;
-  char request[REQUEST_BUFFER_SIZE];
-} ClientConn;
-
-static volatile sig_atomic_t keep_running = 1;
+static const uint8_t RESPONSE[] = "HTTP/1.1 200 OK\r\n"
+                                  "Content-Length: 33\r\n"
+                                  "\r\n"
+                                  "{\"approved\":true,\"fraud_score\":0}";
+static const uint8_t RESPONSE_READY[] = "HTTP/1.1 200 OK\r\n"
+                                        "Content-Length: 0\r\n"
+                                        "\r\n";
+static const uint8_t RESPONSE_404[] = "HTTP/1.1 404 Not Found\r\n"
+                                      "Content-Length: 0\r\n"
+                                      "\r\n";
 static const char REQ_GET_READY[] = "GET /ready ";
 static const char REQ_POST_FRAUD_SCORE[] = "POST /fraud-score ";
 
-static void on_signal(int signo) {
-  (void)signo;
-  keep_running = 0;
+#define MAX_REQ_HEAD 4096
+#define MAX_BODY 4096
+#define CONN_BUF_CAP 16384
+#define WRITE_BUF_CAP 512
+#define MAX_EVENTS 128
+#define MAX_CLIENTS 2048
+#define MAX_TRACKED_FDS 65536
+struct epoll_params {
+  uint32_t busy_poll_usecs;
+  uint16_t busy_poll_budget;
+  uint8_t prefer_busy_poll;
+  uint8_t pad;
+};
+
+enum fd_kind {
+  FD_NONE = 0,
+  FD_CONTROL = 1,
+  FD_CLIENT = 2,
+};
+
+struct tracked_fd {
+  uint8_t kind;
+  int index;
+};
+
+struct parse_result {
+  uint8_t status;
+  size_t consumed;
+};
+
+struct client_conn {
+  int fd;
+  uint8_t active;
+  size_t in_len;
+  size_t write_len;
+  size_t write_pos;
+  uint8_t in_buf[CONN_BUF_CAP];
+  uint8_t write_buf[WRITE_BUF_CAP];
+};
+
+enum {
+  PARSE_NEED = 0,
+  PARSE_BAD = 1,
+  PARSE_GOT = 2,
+  PARSE_NOT_FOUND = 3,
+  PARSE_READY = 4,
+};
+
+static struct tracked_fd fd_table[MAX_TRACKED_FDS];
+static struct client_conn clients[MAX_CLIENTS];
+
+static int set_nonblocking(int fd) {
+#ifdef __linux__
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#else
+  (void)fd;
+  return 0;
+#endif
 }
 
-static int recv_fd(int unix_sock) {
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
+static void set_quickack(int fd) {
+#ifdef __linux__
+  int one = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#else
+  (void)fd;
+#endif
+}
 
-  char buf[1];
-  struct iovec io = {
-    .iov_base = buf,
-    .iov_len = sizeof(buf),
-  };
-  msg.msg_iov = &io;
-  msg.msg_iovlen = 1;
+#ifdef __linux__
+static int getenv_int(const char *name, int fallback) {
+  const char *value = getenv(name);
+  if (!value || !*value) {
+    return fallback;
+  }
+
+  int parsed = atoi(value);
+  return parsed >= 0 ? parsed : fallback;
+}
+
+static long getenv_long(const char *name, long fallback) {
+  const char *value = getenv(name);
+  if (!value || !*value) {
+    return fallback;
+  }
+
+  long parsed = strtol(value, NULL, 10);
+  return parsed >= 0 ? parsed : fallback;
+}
+
+static unsigned long iow(unsigned int ty, unsigned int nr, unsigned int size) {
+  return (unsigned long)((1U << 30) | (size << 16) | (ty << 8) | nr);
+}
+
+static void configure_busy_poll(int epoll_fd) {
+  struct epoll_params params;
+  memset(&params, 0, sizeof(params));
+  params.busy_poll_usecs = (uint32_t)getenv_int("EPOLL_BUSY_POLL_US", 100);
+  params.busy_poll_budget = (uint16_t)getenv_int("EPOLL_BUSY_POLL_BUDGET", 8);
+  params.prefer_busy_poll = (uint8_t)getenv_int("EPOLL_PREFER_BUSY_POLL", 1);
+  if (params.busy_poll_usecs == 0 && params.prefer_busy_poll == 0) {
+    return;
+  }
+
+  unsigned long ep_iocsparams = iow(0x8A, 0x01, (unsigned int)sizeof(params));
+  ioctl(epoll_fd, ep_iocsparams, &params);
+}
+
+static int wait_events(int epoll_fd, struct epoll_event *events, int max_events) {
+  long spin_us = getenv_long("EPOLL_SPIN_US", 0);
+  int timeout_ms = getenv_int("EPOLL_TIMEOUT_MS", 1);
+
+  int ready = 0;
+  if (spin_us > 0) {
+    ready = epoll_wait(epoll_fd, events, max_events, 0);
+    if (ready == 0) {
+      struct timespec start;
+      clock_gettime(CLOCK_MONOTONIC, &start);
+      for (;;) {
+        ready = epoll_wait(epoll_fd, events, max_events, 0);
+        if (ready != 0) {
+          break;
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_us =
+          (now.tv_sec - start.tv_sec) * 1000000L + (now.tv_nsec - start.tv_nsec) / 1000L;
+        if (elapsed_us >= spin_us) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (ready != 0) {
+    return ready;
+  }
+
+#ifdef SYS_epoll_pwait2
+  long idle_us = getenv_long("EPOLL_IDLE_US", 60);
+  if (idle_us > 0) {
+    struct timespec timeout;
+    timeout.tv_sec = idle_us / 1000000L;
+    timeout.tv_nsec = (idle_us % 1000000L) * 1000L;
+    ready = epoll_pwait2(epoll_fd, events, max_events, &timeout, NULL);
+    if (ready >= 0 || errno != ENOSYS) {
+      return ready;
+    }
+  }
+#endif
+
+  return epoll_wait(epoll_fd, events, max_events, timeout_ms);
+}
+#else
+static void configure_busy_poll(int epoll_fd) { (void)epoll_fd; }
+
+static int wait_events(int epoll_fd, struct epoll_event *events, int max_events) {
+  return epoll_wait(epoll_fd, events, max_events, -1);
+}
+#endif
+
+static ssize_t find_double_crlf(const uint8_t *buf, size_t len) {
+  if (len < 4) {
+    return -1;
+  }
+
+  for (size_t i = 3; i < len; i++) {
+    if (buf[i] == '\n' && buf[i - 1] == '\r' && buf[i - 2] == '\n' && buf[i - 3] == '\r') {
+      return (ssize_t)(i - 3);
+    }
+  }
+
+  return -1;
+}
+
+static size_t parse_content_length(const uint8_t *headers, size_t header_len) {
+  static const uint8_t needle[] = "content-length:";
+  const size_t needle_len = sizeof(needle) - 1;
+
+  size_t i = 0;
+  while (i + needle_len <= header_len) {
+    size_t k = 0;
+    while (k < needle_len) {
+      uint8_t h = headers[i + k];
+      if (h >= 'A' && h <= 'Z') {
+        h = (uint8_t)(h + 32);
+      }
+      if (h != needle[k]) {
+        break;
+      }
+      k++;
+    }
+
+    if (k != needle_len) {
+      i++;
+      continue;
+    }
+
+    size_t j = i + needle_len;
+    while (j < header_len && (headers[j] == ' ' || headers[j] == '\t')) {
+      j++;
+    }
+
+    size_t start = j;
+    size_t value = 0;
+    while (j < header_len && headers[j] >= '0' && headers[j] <= '9') {
+      value = value * 10 + (size_t)(headers[j] - '0');
+      j++;
+    }
+
+    if (j == start) {
+      return SIZE_MAX;
+    }
+
+    return value;
+  }
+
+  return SIZE_MAX;
+}
+
+static void update_interest(int epoll_fd, int fd, int want_write) {
+  struct epoll_event event;
+  memset(&event, 0, sizeof(event));
+  event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+  if (want_write) {
+    event.events |= EPOLLOUT;
+  }
+  event.data.fd = fd;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+    fatal("epoll_ctl mod");
+  }
+}
+
+static void reset_client(struct client_conn *client) {
+  client->in_len = 0;
+  client->write_len = 0;
+  client->write_pos = 0;
+}
+
+static void consume_input(struct client_conn *client, size_t consumed) {
+  if (consumed >= client->in_len) {
+    client->in_len = 0;
+    return;
+  }
+
+  memmove(client->in_buf, client->in_buf + consumed, client->in_len - consumed);
+  client->in_len -= consumed;
+}
+
+static void close_client(int epoll_fd, int index) {
+  struct client_conn *client = &clients[index];
+  int fd = client->fd;
+  if (fd >= 0) {
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    if (fd < MAX_TRACKED_FDS) {
+      fd_table[fd].kind = FD_NONE;
+      fd_table[fd].index = -1;
+    }
+    close(fd);
+  }
+
+  memset(client, 0, sizeof(*client));
+  client->fd = -1;
+}
+
+static int alloc_client(void) {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (!clients[i].active) {
+      memset(&clients[i], 0, sizeof(clients[i]));
+      clients[i].active = 1;
+      clients[i].fd = -1;
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+static int register_client(int epoll_fd, int client_fd) {
+  int index = alloc_client();
+  if (index < 0) {
+    close(client_fd);
+    return -1;
+  }
+
+  clients[index].fd = client_fd;
+  reset_client(&clients[index]);
+  set_quickack(client_fd);
+
+  struct epoll_event event;
+  memset(&event, 0, sizeof(event));
+  event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+  event.data.fd = client_fd;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+    close_client(epoll_fd, index);
+    return -1;
+  }
+
+  if (client_fd < MAX_TRACKED_FDS) {
+    fd_table[client_fd].kind = FD_CLIENT;
+    fd_table[client_fd].index = index;
+  }
+
+  return index;
+}
+
+static int recv_fd(int socket_fd) {
+  char payload = 0;
+  struct iovec iov;
+  iov.iov_base = &payload;
+  iov.iov_len = sizeof(payload);
 
   char control[CMSG_SPACE(sizeof(int))];
   memset(control, 0, sizeof(control));
+
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
 
-  ssize_t n = recvmsg(unix_sock, &msg, MSG_CMSG_CLOEXEC);
-  if (n < 0) {
-    return -1;
-  }
-  if (n == 0) {
-    errno = ECONNRESET;
+  ssize_t received = recvmsg(socket_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (received <= 0) {
+    if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return -2;
+    }
     return -1;
   }
 
   struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-    errno = EBADMSG;
+  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
     return -1;
   }
 
   int client_fd = -1;
-  memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(int));
+  memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(client_fd));
   return client_fd;
 }
 
-static void close_client_conn(int epoll_fd, ClientConn **clients_by_fd, ClientConn **free_clients,
-                              int fd) {
-  if (fd < 0 || fd >= MAX_TRACKED_FDS) {
-    return;
-  }
-  ClientConn *client = clients_by_fd[fd];
-  if (client == NULL) {
-    return;
-  }
-  (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-  close(fd);
-  clients_by_fd[fd] = NULL;
-  client->next_free = *free_clients;
-  *free_clients = client;
-}
+static struct parse_result parse_request(const uint8_t *buf, size_t len) {
+  struct parse_result result;
+  result.status = PARSE_NEED;
+  result.consumed = 0;
 
-static void warm_up(const XScoreIndexView *xscore) {
-  static const char warmup_body[] =
-    "{\"id\":\"tx-warmup\","
-    "\"transaction\":{\"amount\":384.88,\"installments\":3,\"requested_at\":"
-    "\"2026-03-11T20:23:35Z\"},"
-    "\"customer\":{\"avg_amount\":769.76,\"tx_count_24h\":3,\"known_"
-    "merchants\":[\"MERC-009\",\"MERC-001\",\"MERC-001\"]},"
-    "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"5912\",\"avg_amount\":298."
-    "95},"
-    "\"terminal\":{\"is_online\":false,\"card_present\":true,\"km_from_"
-    "home\":13.7090520965},"
-    "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\",\"km_from_"
-    "current\":18.8626479774}}";
+  int is_ready = 0;
+  int is_fraud_score = 0;
 
-  TransactionContext ctx = transaction_context_from_body(warmup_body, sizeof(warmup_body) - 1);
-  if (ctx.id[0] != '\0') {
-    double vector[14];
-    volatile uint8_t warmup_sink = 0;
-    ctx.to_vector(&ctx, vector);
-    ctx.destroy(&ctx);
-
-    // Heat parser/vector path and touch x-score pages ahead of first real
-    // requests.
-    for (int i = 0; i < 32; i++) {
-      warmup_sink ^= x_score_predict_fraud_count(xscore, vector);
+  if (len >= sizeof(REQ_GET_READY) - 1) {
+    if (memcmp(buf, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
+      is_ready = 1;
     }
-    (void)warmup_sink;
+  }
+
+  if (len >= sizeof(REQ_POST_FRAUD_SCORE) - 1) {
+    if (memcmp(buf, REQ_POST_FRAUD_SCORE, sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
+      is_fraud_score = 1;
+    }
+  }
+
+  ssize_t head_end = find_double_crlf(buf, len);
+  if (head_end < 0) {
+    if (len > MAX_REQ_HEAD) {
+      result.status = PARSE_BAD;
+      result.consumed = len;
+    }
+    return result;
+  }
+
+  size_t header_end = (size_t)head_end;
+  size_t body_start = header_end + 4;
+
+  if (is_ready) {
+    result.status = PARSE_READY;
+    result.consumed = body_start;
+    return result;
+  }
+
+  size_t content_length = parse_content_length(buf, header_end);
+
+  if (!is_fraud_score) {
+    if (content_length == SIZE_MAX) {
+      result.status = PARSE_NOT_FOUND;
+      result.consumed = body_start;
+      return result;
+    }
+
+    if (content_length > MAX_BODY) {
+      result.status = PARSE_BAD;
+      result.consumed = len;
+      return result;
+    }
+
+    if (len < body_start + content_length) {
+      return result;
+    }
+
+    result.status = PARSE_NOT_FOUND;
+    result.consumed = body_start + content_length;
+    return result;
+  }
+
+  if (content_length == SIZE_MAX || content_length > MAX_BODY) {
+    result.status = PARSE_BAD;
+    result.consumed = len;
+    return result;
+  }
+
+  if (len < body_start + content_length) {
+    return result;
+  }
+
+  result.status = PARSE_GOT;
+  result.consumed = body_start + content_length;
+  return result;
+}
+
+static int write_all_nonblock(int fd, const uint8_t *buf, size_t len, size_t *written_total) {
+  while (*written_total < len) {
+    ssize_t written = send(fd, buf + *written_total, len - *written_total, MSG_NOSIGNAL);
+    if (written > 0) {
+      *written_total += (size_t)written;
+      continue;
+    }
+
+    if (written == 0) {
+      return -1;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 1;
+    }
+
+    if (errno == EINTR) {
+      continue;
+    }
+
+    return -1;
+  }
+
+  return 0;
+}
+
+static int flush_write(struct client_conn *client) {
+  while (client->write_pos < client->write_len) {
+    ssize_t written = send(client->fd, client->write_buf + client->write_pos,
+                           client->write_len - client->write_pos, MSG_NOSIGNAL);
+    if (written > 0) {
+      client->write_pos += (size_t)written;
+      continue;
+    }
+
+    if (written == 0) {
+      return -1;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 0;
+    }
+
+    if (errno == EINTR) {
+      continue;
+    }
+
+    return -1;
+  }
+
+  client->write_len = 0;
+  client->write_pos = 0;
+  return 1;
+}
+
+static int process_requests(int epoll_fd, int index) {
+  struct client_conn *client = &clients[index];
+
+  for (;;) {
+    if (client->write_pos < client->write_len) {
+      int flushed = flush_write(client);
+      if (flushed < 0) {
+        return -1;
+      }
+      if (flushed == 0) {
+        update_interest(epoll_fd, client->fd, 1);
+        return 0;
+      }
+      update_interest(epoll_fd, client->fd, 0);
+    }
+
+    struct parse_result parsed = parse_request(client->in_buf, client->in_len);
+    if (parsed.status == PARSE_NEED) {
+      return 0;
+    }
+
+    if (parsed.status == PARSE_BAD) {
+      return -1;
+    }
+
+    const uint8_t *response = RESPONSE;
+    size_t response_len = sizeof(RESPONSE) - 1;
+    if (parsed.status == PARSE_READY) {
+      response = RESPONSE_READY;
+      response_len = sizeof(RESPONSE_READY) - 1;
+    } else if (parsed.status == PARSE_NOT_FOUND) {
+      response = RESPONSE_404;
+      response_len = sizeof(RESPONSE_404) - 1;
+    }
+
+    consume_input(client, parsed.consumed);
+
+    size_t written_total = 0;
+    int write_result = write_all_nonblock(client->fd, response, response_len, &written_total);
+    if (write_result < 0) {
+      return -1;
+    }
+
+    if (write_result > 0) {
+      size_t remaining = response_len - written_total;
+      if (remaining > sizeof(client->write_buf)) {
+        return -1;
+      }
+
+      memcpy(client->write_buf, response + written_total, remaining);
+      client->write_len = remaining;
+      client->write_pos = 0;
+      update_interest(epoll_fd, client->fd, 1);
+      return 0;
+    }
   }
 }
 
-int main(void) {
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+static void handle_control_fd(int epoll_fd, int control_fd) {
+  for (;;) {
+    int client_fd = recv_fd(control_fd);
+    if (client_fd == -2) {
+      return;
+    }
 
-  const char *socket_path = getenv("UNIX_SOCKET_PATH");
-  if (socket_path == NULL || *socket_path == '\0') {
-    fprintf(stderr, "UNIX_SOCKET_PATH is required and cannot be empty\n");
-    return 1;
+    if (client_fd < 0) {
+      return;
+    }
+
+    int index = register_client(epoll_fd, client_fd);
+    if (index >= 0) {
+      if (process_requests(epoll_fd, index) != 0) {
+        close_client(epoll_fd, index);
+      }
+    }
+  }
+}
+
+static int handle_client_read(int epoll_fd, int index) {
+  struct client_conn *client = &clients[index];
+
+  for (;;) {
+    if (client->in_len == sizeof(client->in_buf)) {
+      return -1;
+    }
+
+    ssize_t received =
+      recv(client->fd, client->in_buf + client->in_len, sizeof(client->in_buf) - client->in_len, 0);
+    if (received > 0) {
+      client->in_len += (size_t)received;
+      break;
+    }
+
+    if (received == 0) {
+      return -1;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      break;
+    }
+
+    if (errno == EINTR) {
+      continue;
+    }
+
+    return -1;
   }
 
-  const char *xscore_path = getenv("X_SCORE_INDEX_PATH");
-  if (xscore_path == NULL || *xscore_path == '\0') {
-    fprintf(stderr, "X_SCORE_INDEX_PATH is required and cannot be empty\n");
-    return 1;
+  return process_requests(epoll_fd, index);
+}
+
+static int handle_client_write(int epoll_fd, int index) {
+  return process_requests(epoll_fd, index);
+}
+
+int main(int argc, char **argv) {
+  const char *socket_path = "/tmp/server.sock";
+  if (argc > 1 && argv[1][0] != '\0') {
+    socket_path = argv[1];
   }
 
-  XScoreIndexView xscore;
-  if (!x_score_open(xscore_path, &xscore)) {
-    fprintf(stderr, "failed to load x-score index from resources/references.idx\n");
-    return 1;
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    clients[i].fd = -1;
   }
-  warm_up(&xscore);
-
-  int server_fd = create_unix_server(socket_path);
-  if (server_fd < 0) {
-    fprintf(stderr, "failed to bind unix socket '%s': %s\n", socket_path, strerror(errno));
-    x_score_close(&xscore);
-    return 1;
+  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
+    fd_table[i].index = -1;
   }
 
-  fprintf(stderr, "listening for fd passing at %s\n", socket_path);
-
-  unsigned char *fd_kinds = calloc(MAX_TRACKED_FDS, sizeof(*fd_kinds));
-  ClientConn **clients_by_fd = calloc(MAX_TRACKED_FDS, sizeof(*clients_by_fd));
-  ClientConn *free_clients = NULL;
-  struct epoll_event *events = calloc(MAX_EVENTS, sizeof(*events));
-  if (fd_kinds == NULL || clients_by_fd == NULL || events == NULL) {
-    free(events);
-    free(clients_by_fd);
-    free(fd_kinds);
-    close(server_fd);
-    unlink(socket_path);
-    x_score_close(&xscore);
-    return 1;
+  int listener_fd = create_listener(socket_path, 4);
+  int control_fd;
+  for (;;) {
+    control_fd = accept4(listener_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (control_fd >= 0) {
+      break;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      poll(NULL, 0, 1);
+      continue;
+    }
+    fatal("accept4");
+  }
+  close(listener_fd);
+  if (set_nonblocking(control_fd) < 0) {
+    fatal("set_nonblocking");
   }
 
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
-    free(events);
-    free(clients_by_fd);
-    free(fd_kinds);
-    close(server_fd);
-    unlink(socket_path);
-    x_score_close(&xscore);
-    return 1;
+    fatal("epoll_create1");
+  }
+  configure_busy_poll(epoll_fd);
+
+  struct epoll_event control_event;
+  memset(&control_event, 0, sizeof(control_event));
+  control_event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+  control_event.data.fd = control_fd;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, control_fd, &control_event) < 0) {
+    fatal("epoll_ctl add control");
   }
 
-  struct epoll_event server_ev;
-  memset(&server_ev, 0, sizeof(server_ev));
-  server_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-  server_ev.data.fd = server_fd;
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &server_ev) < 0) {
-    close(epoll_fd);
-    free(events);
-    free(clients_by_fd);
-    free(fd_kinds);
-    close(server_fd);
-    unlink(socket_path);
-    x_score_close(&xscore);
-    return 1;
+  if (control_fd < MAX_TRACKED_FDS) {
+    fd_table[control_fd].kind = FD_CONTROL;
+    fd_table[control_fd].index = -1;
   }
 
-  while (keep_running) {
-    int ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+  struct epoll_event events[MAX_EVENTS];
+  for (;;) {
+    int ready = wait_events(epoll_fd, events, MAX_EVENTS);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
       }
-      break;
+      fatal("epoll_wait");
     }
 
-    for (int ev_idx = 0; ev_idx < ready; ev_idx++) {
-      int fd = events[ev_idx].data.fd;
-      uint32_t ev = events[ev_idx].events;
-
-      if (fd == server_fd) {
-        while (keep_running) {
-          int ctrl_fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-          if (ctrl_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              break;
-            }
-            if (errno == EINTR) {
-              continue;
-            }
-            break;
-          }
-
-          if (ctrl_fd >= MAX_TRACKED_FDS) {
-            close(ctrl_fd);
-            continue;
-          }
-
-          struct epoll_event ctrl_ev;
-          memset(&ctrl_ev, 0, sizeof(ctrl_ev));
-          ctrl_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-          ctrl_ev.data.fd = ctrl_fd;
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &ctrl_ev) < 0) {
-            close(ctrl_fd);
-            continue;
-          }
-
-          fd_kinds[ctrl_fd] = 1;
-        }
-        continue;
-      }
-
+    for (int i = 0; i < ready; i++) {
+      int fd = events[i].data.fd;
       if (fd < 0 || fd >= MAX_TRACKED_FDS) {
-        if (fd >= 0) {
-          close(fd);
-        }
         continue;
       }
 
-      if ((ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
-        if (fd_kinds[fd] == 1) {
-          (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-          fd_kinds[fd] = 0;
-          close(fd);
-        } else if (clients_by_fd[fd] != NULL) {
-          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-        }
+      if (fd_table[fd].kind == FD_CONTROL) {
+        handle_control_fd(epoll_fd, fd);
         continue;
       }
 
-      if (fd_kinds[fd] == 1) {
-        while (keep_running) {
-          int client_fd = recv_fd(fd);
-          if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              break;
-            }
-            if (errno == EINTR) {
-              continue;
-            }
-            (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-            fd_kinds[fd] = 0;
-            close(fd);
-            break;
-          }
-
-          if (client_fd >= MAX_TRACKED_FDS || clients_by_fd[client_fd] != NULL) {
-            close(client_fd);
-            continue;
-          }
-
-          ClientConn *client = free_clients;
-          if (client != NULL) {
-            free_clients = client->next_free;
-          } else {
-            client = malloc(sizeof(*client));
-          }
-          if (client == NULL) {
-            close(client_fd);
-            continue;
-          }
-          client->used = 0;
-          client->expected_total = 0;
-          client->request_len = 0;
-          client->fd = client_fd;
-          client->response_data = NULL;
-          client->response_len = 0;
-          client->response_offset = 0;
-          client->next_free = NULL;
-          client->request[0] = '\0';
-          clients_by_fd[client_fd] = client;
-
-          struct epoll_event client_ev;
-          memset(&client_ev, 0, sizeof(client_ev));
-          client_ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-          client_ev.data.fd = client_fd;
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
-            close(client_fd);
-            client->next_free = free_clients;
-            free_clients = client;
-            clients_by_fd[client_fd] = NULL;
-          }
-        }
+      if (fd_table[fd].kind != FD_CLIENT) {
         continue;
       }
 
-      ClientConn *client = clients_by_fd[fd];
-      if (client == NULL) {
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-        close(fd);
+      int index = fd_table[fd].index;
+      if (index < 0 || index >= MAX_CLIENTS || !clients[index].active) {
         continue;
       }
 
-      if ((ev & EPOLLOUT) != 0 && client->response_data != NULL) {
-        bool close_client = false;
-
-        while (client->response_offset < client->response_len) {
-          size_t remaining = client->response_len - client->response_offset;
-          ssize_t nwritten =
-            send(fd, client->response_data + client->response_offset, remaining,
-                 MSG_NOSIGNAL | MSG_DONTWAIT);
-          if (nwritten > 0) {
-            client->response_offset += (size_t)nwritten;
-            continue;
-          }
-          if (nwritten == 0) {
-            close_client = true;
-            break;
-          }
-          if (errno == EINTR) {
-            continue;
-          }
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-          }
-          close_client = true;
-          break;
-        }
-
-        if (close_client) {
-          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-          continue;
-        }
-
-        if (client->response_offset < client->response_len) {
-          continue;
-        }
-
-        close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
+      if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        close_client(epoll_fd, index);
         continue;
       }
 
-      if (client->response_data != NULL) {
+      if ((events[i].events & EPOLLIN) && handle_client_read(epoll_fd, index) != 0) {
+        close_client(epoll_fd, index);
         continue;
       }
 
-      if ((ev & EPOLLIN) == 0 && client->used == 0) {
-        continue;
-      }
-
-      while (keep_running) {
-        size_t request_len = 0;
-        HttpReadStatus read_status =
-          read_http_request(fd, client->request, sizeof(client->request), &client->used,
-                            &client->expected_total, &request_len);
-        if (read_status == HTTP_READ_PENDING) {
-          break;
-        }
-        if (read_status != HTTP_READ_COMPLETE) {
-          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-          break;
-        }
-
-        client->request_len = request_len;
-        client->request[request_len] = '\0';
-        int response_variant = RESPONSE_CLOSE_INDEX;
-        const Response *resp = &RESPONSE_NOT_FOUND_VARIANTS[response_variant];
-
-        if (memcmp(client->request, REQ_GET_READY, sizeof(REQ_GET_READY) - 1) == 0) {
-          resp = &RESPONSE_READY_VARIANTS[response_variant];
-        } else if (memcmp(client->request, REQ_POST_FRAUD_SCORE,
-                          sizeof(REQ_POST_FRAUD_SCORE) - 1) == 0) {
-          const char *body = NULL;
-          size_t body_len = 0;
-          if (!get_body(client->request, request_len, &body, &body_len)) {
-            resp = &RESPONSE_NOT_FOUND_VARIANTS[response_variant];
-          } else {
-            TransactionContext ctx = transaction_context_from_body(body, body_len);
-            if (ctx.id[0] == '\0') {
-              ctx.destroy(&ctx);
-              resp = &RESPONSE_BAD_REQUEST_VARIANTS[response_variant];
-            } else {
-              double vector[14];
-              ctx.to_vector(&ctx, vector);
-              ctx.destroy(&ctx);
-
-              // uint8_t fraud_count = x_score_predict_fraud_count(&xscore, vector);
-              uint8_t fraud_count = 0;
-              resp = &RESPONSE_FRAUD_VARIANTS[response_variant][5];
-              switch (fraud_count) {
-              case 0:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][0];
-                break;
-              case 1:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][1];
-                break;
-              case 2:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][2];
-                break;
-              case 3:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][3];
-                break;
-              case 4:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][4];
-                break;
-              default:
-                resp = &RESPONSE_FRAUD_VARIANTS[response_variant][5];
-                break;
-              }
-            }
-          }
-        }
-
-        client->response_data = resp->data;
-        client->response_len = resp->len;
-        client->response_offset = 0;
-
-        bool close_client = false;
-        while (client->response_offset < client->response_len) {
-          size_t remaining = client->response_len - client->response_offset;
-          ssize_t nwritten =
-            send(fd, client->response_data + client->response_offset, remaining,
-                 MSG_NOSIGNAL | MSG_DONTWAIT);
-          if (nwritten > 0) {
-            client->response_offset += (size_t)nwritten;
-            continue;
-          }
-          if (nwritten == 0) {
-            close_client = true;
-            break;
-          }
-          if (errno == EINTR) {
-            continue;
-          }
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-          }
-          close_client = true;
-          break;
-        }
-
-        if (close_client) {
-          close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-          break;
-        }
-
-        if (client->response_offset < client->response_len) {
-          struct epoll_event client_ev;
-          memset(&client_ev, 0, sizeof(client_ev));
-          client_ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-          client_ev.data.fd = fd;
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &client_ev) < 0) {
-            close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-          }
-          break;
-        }
-
-        close_client_conn(epoll_fd, clients_by_fd, &free_clients, fd);
-        break;
+      if ((events[i].events & EPOLLOUT) && handle_client_write(epoll_fd, index) != 0) {
+        close_client(epoll_fd, index);
       }
     }
   }
-
-  for (int fd = 0; fd < MAX_TRACKED_FDS; fd++) {
-    if (fd_kinds[fd] == 1) {
-      close(fd);
-    } else if (clients_by_fd[fd] != NULL) {
-      close(fd);
-      free(clients_by_fd[fd]);
-    }
-  }
-  while (free_clients != NULL) {
-    ClientConn *client = free_clients;
-    free_clients = client->next_free;
-    free(client);
-  }
-  close(epoll_fd);
-  close(server_fd);
-  unlink(socket_path);
-  x_score_close(&xscore);
-  free(events);
-  free(clients_by_fd);
-  free(fd_kinds);
-  return 0;
 }

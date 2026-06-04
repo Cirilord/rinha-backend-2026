@@ -1,9 +1,7 @@
-#ifndef LOAD_BALANCER_MOCKS_SYS_SYSCALL_H
-#define LOAD_BALANCER_MOCKS_SYS_SYSCALL_H
+#pragma once
 
-// Visual/editor-only mock header for non-Linux environments.
-#ifndef SYS_sendmsg
-#define SYS_sendmsg 0
+#ifdef __APPLE__
+#ifndef SYS_accept4
+#define SYS_accept4 0
 #endif
-
 #endif

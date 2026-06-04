@@ -1,14 +1,17 @@
-FROM gcc:14-bookworm AS build
-ARG TARGETARCH
-WORKDIR /src
-COPY Makefile ./Makefile
-COPY apps/server/src ./apps/server/src
-RUN make server TARGETARCH=${TARGETARCH} && mv server /build-server
+FROM alpine:3.22 AS build
 
-FROM debian:bookworm-slim
-WORKDIR /app
-COPY --from=build /build-server /usr/local/bin/server
-RUN mkdir -p /app/resources
-COPY resources/references.idx /app/resources/references.idx
-ENV UNIX_SOCKET_PATH=/shared/api.sock
-CMD ["/usr/local/bin/server"]
+RUN apk add --no-cache build-base linux-headers
+
+ARG CC=gcc
+ARG TARGETARCH
+ARG CFLAGS_BASE="-Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -std=c11 -Wall -Wextra"
+ARG CFLAGS_ARCH=""
+
+WORKDIR /src
+COPY apps/server/src/ /src/
+RUN mkdir -p /out && \
+    ${CC} ${CFLAGS_BASE} ${CFLAGS_ARCH} -o /out/server /src/*.c
+
+FROM scratch
+COPY --from=build /out/server /server
+ENTRYPOINT ["/server"]
