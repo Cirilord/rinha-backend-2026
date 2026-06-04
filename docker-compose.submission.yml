@@ -11,6 +11,8 @@ services:
       - "9999:9999"
     cpus: 0.2
     mem_limit: 20m
+    environment:
+      UPSTREAM_SOCKETS: "/tmp/server-1.sock,/tmp/server-2.sock"
     logging:
       driver: none
     restart: unless-stopped
