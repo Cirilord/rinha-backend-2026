@@ -71,7 +71,9 @@ struct parse_result {
 struct client_conn {
   int fd;
   uint8_t active;
-  size_t in_len;
+  uint8_t want_write;
+  size_t in_start;
+  size_t in_end;
   size_t write_len;
   size_t write_pos;
   uint8_t in_buf[CONN_BUF_CAP];
@@ -264,6 +266,14 @@ static size_t parse_content_length(const uint8_t *headers, size_t header_len) {
 }
 
 static void update_interest(int epoll_fd, int fd, int want_write) {
+  int index = (fd >= 0 && fd < MAX_TRACKED_FDS) ? fd_table[fd].index : -1;
+  if (index >= 0 && index < MAX_CLIENTS && clients[index].active) {
+    if (clients[index].want_write == (uint8_t)want_write) {
+      return;
+    }
+    clients[index].want_write = (uint8_t)want_write;
+  }
+
   struct epoll_event event;
   memset(&event, 0, sizeof(event));
   event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
@@ -278,19 +288,37 @@ static void update_interest(int epoll_fd, int fd, int want_write) {
 }
 
 static void reset_client(struct client_conn *client) {
-  client->in_len = 0;
+  client->in_start = 0;
+  client->in_end = 0;
   client->write_len = 0;
   client->write_pos = 0;
+  client->want_write = 0;
 }
 
 static void consume_input(struct client_conn *client, size_t consumed) {
-  if (consumed >= client->in_len) {
-    client->in_len = 0;
+  size_t buffered = client->in_end - client->in_start;
+  if (consumed >= buffered) {
+    client->in_start = 0;
+    client->in_end = 0;
     return;
   }
 
-  memmove(client->in_buf, client->in_buf + consumed, client->in_len - consumed);
-  client->in_len -= consumed;
+  client->in_start += consumed;
+}
+
+static void ensure_input_space(struct client_conn *client) {
+  if (client->in_end < sizeof(client->in_buf)) {
+    return;
+  }
+
+  if (client->in_start == 0) {
+    return;
+  }
+
+  size_t buffered = client->in_end - client->in_start;
+  memmove(client->in_buf, client->in_buf + client->in_start, buffered);
+  client->in_start = 0;
+  client->in_end = buffered;
 }
 
 static void close_client(int epoll_fd, int index) {
@@ -533,7 +561,8 @@ static int process_requests(int epoll_fd, int index) {
       update_interest(epoll_fd, client->fd, 0);
     }
 
-    struct parse_result parsed = parse_request(client->in_buf, client->in_len);
+    size_t buffered = client->in_end - client->in_start;
+    struct parse_result parsed = parse_request(client->in_buf + client->in_start, buffered);
     if (parsed.status == PARSE_NEED) {
       return 0;
     }
@@ -599,14 +628,16 @@ static int handle_client_read(int epoll_fd, int index) {
   struct client_conn *client = &clients[index];
 
   for (;;) {
-    if (client->in_len == sizeof(client->in_buf)) {
+    ensure_input_space(client);
+
+    if (client->in_end == sizeof(client->in_buf)) {
       return -1;
     }
 
     ssize_t received =
-      recv(client->fd, client->in_buf + client->in_len, sizeof(client->in_buf) - client->in_len, 0);
+      recv(client->fd, client->in_buf + client->in_end, sizeof(client->in_buf) - client->in_end, 0);
     if (received > 0) {
-      client->in_len += (size_t)received;
+      client->in_end += (size_t)received;
       break;
     }
 
