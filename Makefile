@@ -12,7 +12,7 @@ TARGETARCH := arm64
 endif
 endif
 
-CFLAGS_BASE := -Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -Wall -Wextra -std=c11
+CFLAGS_BASE := -Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -Wall -Wextra -std=c11 -pthread
 ifeq ($(TARGETARCH),amd64)
 CFLAGS_ARCH := -march=haswell -mtune=haswell
 else

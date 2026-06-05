@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,7 +82,11 @@ static const struct response FRAUD_SCORE_RESPONSES[] = {
 #define CONN_BUF_CAP 16384
 #define WRITE_BUF_CAP 512
 #define MAX_EVENTS 128
-#define MAX_CLIENTS 2048
+#define MAX_CLIENTS 512
+#define WORKER_COUNT 2
+#define MAX_CLIENTS_PER_WORKER (MAX_CLIENTS / WORKER_COUNT)
+#define PENDING_QUEUE_CAP 4096
+#define WORKER_STACK_SIZE (1024 * 1024)
 #define MAX_TRACKED_FDS 65536
 struct epoll_params {
   uint32_t busy_poll_usecs;
@@ -94,6 +99,7 @@ enum fd_kind {
   FD_NONE = 0,
   FD_CONTROL = 1,
   FD_CLIENT = 2,
+  FD_NOTIFY = 3,
 };
 
 struct tracked_fd {
@@ -120,6 +126,18 @@ struct client_conn {
   uint8_t write_buf[WRITE_BUF_CAP];
 };
 
+struct worker_ctx {
+  int epoll_fd;
+  int notify_rfd;
+  int notify_wfd;
+  pthread_mutex_t queue_mu;
+  int pending_fds[PENDING_QUEUE_CAP];
+  size_t pending_head;
+  size_t pending_len;
+  struct tracked_fd fd_table[MAX_TRACKED_FDS];
+  struct client_conn clients[MAX_CLIENTS_PER_WORKER];
+};
+
 enum {
   PARSE_NEED = 0,
   PARSE_BAD = 1,
@@ -128,8 +146,6 @@ enum {
   PARSE_READY = 4,
 };
 
-static struct tracked_fd fd_table[MAX_TRACKED_FDS];
-static struct client_conn clients[MAX_CLIENTS];
 static XScoreIndexView xscore;
 
 static int set_nonblocking(int fd) {
@@ -306,13 +322,13 @@ static size_t parse_content_length(const uint8_t *headers, size_t header_len) {
   return SIZE_MAX;
 }
 
-static void update_interest(int epoll_fd, int fd, int want_write) {
-  int index = (fd >= 0 && fd < MAX_TRACKED_FDS) ? fd_table[fd].index : -1;
-  if (index >= 0 && index < MAX_CLIENTS && clients[index].active) {
-    if (clients[index].want_write == (uint8_t)want_write) {
+static void update_interest(struct worker_ctx *worker, int fd, int want_write) {
+  int index = (fd >= 0 && fd < MAX_TRACKED_FDS) ? worker->fd_table[fd].index : -1;
+  if (index >= 0 && index < MAX_CLIENTS_PER_WORKER && worker->clients[index].active) {
+    if (worker->clients[index].want_write == (uint8_t)want_write) {
       return;
     }
-    clients[index].want_write = (uint8_t)want_write;
+    worker->clients[index].want_write = (uint8_t)want_write;
   }
 
   struct epoll_event event;
@@ -323,7 +339,7 @@ static void update_interest(int epoll_fd, int fd, int want_write) {
   }
   event.data.fd = fd;
 
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+  if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
     fatal("epoll_ctl mod");
   }
 }
@@ -362,14 +378,14 @@ static void ensure_input_space(struct client_conn *client) {
   client->in_end = buffered;
 }
 
-static void close_client(int epoll_fd, int index) {
-  struct client_conn *client = &clients[index];
+static void close_client(struct worker_ctx *worker, int index) {
+  struct client_conn *client = &worker->clients[index];
   int fd = client->fd;
   if (fd >= 0) {
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     if (fd < MAX_TRACKED_FDS) {
-      fd_table[fd].kind = FD_NONE;
-      fd_table[fd].index = -1;
+      worker->fd_table[fd].kind = FD_NONE;
+      worker->fd_table[fd].index = -1;
     }
     close(fd);
   }
@@ -378,12 +394,12 @@ static void close_client(int epoll_fd, int index) {
   client->fd = -1;
 }
 
-static int alloc_client(void) {
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (!clients[i].active) {
-      memset(&clients[i], 0, sizeof(clients[i]));
-      clients[i].active = 1;
-      clients[i].fd = -1;
+static int alloc_client_from_worker(struct worker_ctx *worker) {
+  for (int i = 0; i < MAX_CLIENTS_PER_WORKER; i++) {
+    if (!worker->clients[i].active) {
+      memset(&worker->clients[i], 0, sizeof(worker->clients[i]));
+      worker->clients[i].active = 1;
+      worker->clients[i].fd = -1;
       return i;
     }
   }
@@ -391,15 +407,15 @@ static int alloc_client(void) {
   return -1;
 }
 
-static int register_client(int epoll_fd, int client_fd) {
-  int index = alloc_client();
+static int register_client(struct worker_ctx *worker, int client_fd) {
+  int index = alloc_client_from_worker(worker);
   if (index < 0) {
     close(client_fd);
     return -1;
   }
 
-  clients[index].fd = client_fd;
-  reset_client(&clients[index]);
+  worker->clients[index].fd = client_fd;
+  reset_client(&worker->clients[index]);
   set_quickack(client_fd);
 
   struct epoll_event event;
@@ -407,14 +423,14 @@ static int register_client(int epoll_fd, int client_fd) {
   event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
   event.data.fd = client_fd;
 
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
-    close_client(epoll_fd, index);
+  if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+    close_client(worker, index);
     return -1;
   }
 
   if (client_fd < MAX_TRACKED_FDS) {
-    fd_table[client_fd].kind = FD_CLIENT;
-    fd_table[client_fd].index = index;
+    worker->fd_table[client_fd].kind = FD_CLIENT;
+    worker->fd_table[client_fd].index = index;
   }
 
   return index;
@@ -592,8 +608,8 @@ static int flush_write(struct client_conn *client) {
   return 1;
 }
 
-static int process_requests(int epoll_fd, int index) {
-  struct client_conn *client = &clients[index];
+static int process_requests(struct worker_ctx *worker, int index) {
+  struct client_conn *client = &worker->clients[index];
 
   for (;;) {
     if (client->write_pos < client->write_len) {
@@ -602,10 +618,10 @@ static int process_requests(int epoll_fd, int index) {
         return -1;
       }
       if (flushed == 0) {
-        update_interest(epoll_fd, client->fd, 1);
+        update_interest(worker, client->fd, 1);
         return 0;
       }
-      update_interest(epoll_fd, client->fd, 0);
+      update_interest(worker, client->fd, 0);
     }
 
     size_t buffered = client->in_end - client->in_start;
@@ -659,34 +675,14 @@ static int process_requests(int epoll_fd, int index) {
       memcpy(client->write_buf, response + written_total, remaining);
       client->write_len = remaining;
       client->write_pos = 0;
-      update_interest(epoll_fd, client->fd, 1);
+      update_interest(worker, client->fd, 1);
       return 0;
     }
   }
 }
 
-static void handle_control_fd(int epoll_fd, int control_fd) {
-  for (;;) {
-    int client_fd = recv_fd(control_fd);
-    if (client_fd == -2) {
-      return;
-    }
-
-    if (client_fd < 0) {
-      return;
-    }
-
-    int index = register_client(epoll_fd, client_fd);
-    if (index >= 0) {
-      if (process_requests(epoll_fd, index) != 0) {
-        close_client(epoll_fd, index);
-      }
-    }
-  }
-}
-
-static int handle_client_read(int epoll_fd, int index) {
-  struct client_conn *client = &clients[index];
+static int handle_client_read(struct worker_ctx *worker, int index) {
+  struct client_conn *client = &worker->clients[index];
 
   for (;;) {
     ensure_input_space(client);
@@ -717,11 +713,176 @@ static int handle_client_read(int epoll_fd, int index) {
     return -1;
   }
 
-  return process_requests(epoll_fd, index);
+  return process_requests(worker, index);
 }
 
-static int handle_client_write(int epoll_fd, int index) {
-  return process_requests(epoll_fd, index);
+static int handle_client_write(struct worker_ctx *worker, int index) {
+  return process_requests(worker, index);
+}
+
+static int enqueue_client_fd(struct worker_ctx *worker, int client_fd) {
+  int notify = 0;
+
+  pthread_mutex_lock(&worker->queue_mu);
+  if (worker->pending_len >= PENDING_QUEUE_CAP) {
+    pthread_mutex_unlock(&worker->queue_mu);
+    return -1;
+  }
+
+  notify = (worker->pending_len == 0);
+  worker->pending_fds[(worker->pending_head + worker->pending_len) % PENDING_QUEUE_CAP] = client_fd;
+  worker->pending_len++;
+  pthread_mutex_unlock(&worker->queue_mu);
+
+  if (notify) {
+    uint8_t token = 1;
+    ssize_t written;
+    do {
+      written = write(worker->notify_wfd, &token, sizeof(token));
+    } while (written < 0 && errno == EINTR);
+  }
+
+  return 0;
+}
+
+static int dequeue_client_fd(struct worker_ctx *worker) {
+  int client_fd = -1;
+
+  pthread_mutex_lock(&worker->queue_mu);
+  if (worker->pending_len > 0) {
+    client_fd = worker->pending_fds[worker->pending_head];
+    worker->pending_head = (worker->pending_head + 1) % PENDING_QUEUE_CAP;
+    worker->pending_len--;
+  }
+  pthread_mutex_unlock(&worker->queue_mu);
+
+  return client_fd;
+}
+
+static void handle_notify_fd(struct worker_ctx *worker) {
+  uint8_t buf[64];
+
+  for (;;) {
+    ssize_t n = read(worker->notify_rfd, buf, sizeof(buf));
+    if (n > 0) {
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+
+  for (;;) {
+    int client_fd = dequeue_client_fd(worker);
+    if (client_fd < 0) {
+      break;
+    }
+
+    {
+      int index = register_client(worker, client_fd);
+      if (index >= 0) {
+        if (process_requests(worker, index) != 0) {
+          close_client(worker, index);
+        }
+      }
+    }
+  }
+}
+
+static void *worker_main(void *arg) {
+  struct worker_ctx *worker = (struct worker_ctx *)arg;
+  struct epoll_event events[MAX_EVENTS];
+
+  for (;;) {
+    int ready = wait_events(worker->epoll_fd, events, MAX_EVENTS);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      fatal("epoll_wait");
+    }
+
+    for (int i = 0; i < ready; i++) {
+      int fd = events[i].data.fd;
+      if (fd == worker->notify_rfd) {
+        handle_notify_fd(worker);
+        continue;
+      }
+
+      if (fd < 0 || fd >= MAX_TRACKED_FDS) {
+        continue;
+      }
+      if (worker->fd_table[fd].kind != FD_CLIENT) {
+        continue;
+      }
+
+      {
+        int index = worker->fd_table[fd].index;
+        if (index < 0 || index >= MAX_CLIENTS_PER_WORKER || !worker->clients[index].active) {
+          continue;
+        }
+
+        if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+          close_client(worker, index);
+          continue;
+        }
+
+        if ((events[i].events & EPOLLIN) && handle_client_read(worker, index) != 0) {
+          close_client(worker, index);
+          continue;
+        }
+
+        if ((events[i].events & EPOLLOUT) && handle_client_write(worker, index) != 0) {
+          close_client(worker, index);
+        }
+      }
+    }
+  }
+}
+
+static void init_worker(struct worker_ctx *worker) {
+  int pipefd[2];
+  struct epoll_event event;
+
+  memset(worker, 0, sizeof(*worker));
+  for (int i = 0; i < MAX_CLIENTS_PER_WORKER; i++) {
+    worker->clients[i].fd = -1;
+  }
+  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
+    worker->fd_table[i].index = -1;
+  }
+
+  if (pthread_mutex_init(&worker->queue_mu, NULL) != 0) {
+    fatal("pthread_mutex_init");
+  }
+
+  if (pipe(pipefd) != 0) {
+    fatal("pipe");
+  }
+  worker->notify_rfd = pipefd[0];
+  worker->notify_wfd = pipefd[1];
+  if (set_nonblocking(worker->notify_rfd) < 0 || set_nonblocking(worker->notify_wfd) < 0) {
+    fatal("set_nonblocking");
+  }
+
+  worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (worker->epoll_fd < 0) {
+    fatal("epoll_create1");
+  }
+  configure_busy_poll(worker->epoll_fd);
+
+  memset(&event, 0, sizeof(event));
+  event.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  event.data.fd = worker->notify_rfd;
+  if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->notify_rfd, &event) < 0) {
+    fatal("epoll_ctl add notify");
+  }
+
+  if (worker->notify_rfd < MAX_TRACKED_FDS) {
+    worker->fd_table[worker->notify_rfd].kind = FD_NOTIFY;
+    worker->fd_table[worker->notify_rfd].index = -1;
+  }
 }
 
 int main(int argc, char **argv) {
@@ -734,12 +895,30 @@ int main(int argc, char **argv) {
     fatal("x_score_open");
   }
 
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    clients[i].fd = -1;
+  struct worker_ctx *workers =
+    (struct worker_ctx *)calloc((size_t)WORKER_COUNT, sizeof(struct worker_ctx));
+  pthread_t worker_threads[WORKER_COUNT];
+  pthread_attr_t attr;
+
+  if (workers == NULL) {
+    fatal("calloc workers");
   }
-  for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-    fd_table[i].index = -1;
+
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    init_worker(&workers[i]);
   }
+  if (pthread_attr_init(&attr) != 0) {
+    fatal("pthread_attr_init");
+  }
+  if (pthread_attr_setstacksize(&attr, WORKER_STACK_SIZE) != 0) {
+    fatal("pthread_attr_setstacksize");
+  }
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    if (pthread_create(&worker_threads[i], &attr, worker_main, &workers[i]) != 0) {
+      fatal("pthread_create");
+    }
+  }
+  pthread_attr_destroy(&attr);
 
   int listener_fd = create_listener(socket_path, 4);
   int control_fd;
@@ -762,69 +941,29 @@ int main(int argc, char **argv) {
     fatal("set_nonblocking");
   }
 
-  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-  if (epoll_fd < 0) {
-    fatal("epoll_create1");
-  }
-  configure_busy_poll(epoll_fd);
-
-  struct epoll_event control_event;
-  memset(&control_event, 0, sizeof(control_event));
-  control_event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-  control_event.data.fd = control_fd;
-
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, control_fd, &control_event) < 0) {
-    fatal("epoll_ctl add control");
-  }
-
-  if (control_fd < MAX_TRACKED_FDS) {
-    fd_table[control_fd].kind = FD_CONTROL;
-    fd_table[control_fd].index = -1;
-  }
-
-  struct epoll_event events[MAX_EVENTS];
+  int next_worker = 0;
   for (;;) {
-    int ready = wait_events(epoll_fd, events, MAX_EVENTS);
-    if (ready < 0) {
-      if (errno == EINTR) {
+    int client_fd = recv_fd(control_fd);
+    if (client_fd == -2) {
+      struct pollfd pfd;
+      memset(&pfd, 0, sizeof(pfd));
+      pfd.fd = control_fd;
+      pfd.events = POLLIN;
+      if (poll(&pfd, 1, -1) < 0 && errno != EINTR) {
+        fatal("poll");
+      }
+      continue;
+    }
+    if (client_fd < 0) {
+      if (client_fd == -1 && errno == EINTR) {
         continue;
       }
-      fatal("epoll_wait");
+      fatal("recv_fd");
     }
 
-    for (int i = 0; i < ready; i++) {
-      int fd = events[i].data.fd;
-      if (fd < 0 || fd >= MAX_TRACKED_FDS) {
-        continue;
-      }
-
-      if (fd_table[fd].kind == FD_CONTROL) {
-        handle_control_fd(epoll_fd, fd);
-        continue;
-      }
-
-      if (fd_table[fd].kind != FD_CLIENT) {
-        continue;
-      }
-
-      int index = fd_table[fd].index;
-      if (index < 0 || index >= MAX_CLIENTS || !clients[index].active) {
-        continue;
-      }
-
-      if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-        close_client(epoll_fd, index);
-        continue;
-      }
-
-      if ((events[i].events & EPOLLIN) && handle_client_read(epoll_fd, index) != 0) {
-        close_client(epoll_fd, index);
-        continue;
-      }
-
-      if ((events[i].events & EPOLLOUT) && handle_client_write(epoll_fd, index) != 0) {
-        close_client(epoll_fd, index);
-      }
+    if (enqueue_client_fd(&workers[next_worker], client_fd) != 0) {
+      close(client_fd);
     }
+    next_worker = (next_worker + 1) % WORKER_COUNT;
   }
 }
