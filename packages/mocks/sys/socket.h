@@ -66,6 +66,10 @@ struct cmsghdr {
 #define SO_SNDBUF 0x1001
 #endif
 
+#ifndef SO_RCVBUF
+#define SO_RCVBUF 0x1002
+#endif
+
 #ifndef SOCK_STREAM
 #define SOCK_STREAM 1
 #endif
@@ -115,15 +119,14 @@ struct cmsghdr {
 #endif
 
 #ifndef CMSG_FIRSTHDR
-#define CMSG_FIRSTHDR(mhdr)                                                    \
-  ((mhdr) != NULL && (mhdr)->msg_controllen >= sizeof(struct cmsghdr)          \
-       ? (struct cmsghdr *)((mhdr)->msg_control)                               \
-       : (struct cmsghdr *)0)
+#define CMSG_FIRSTHDR(mhdr)                                                                        \
+  ((mhdr) != NULL && (mhdr)->msg_controllen >= sizeof(struct cmsghdr)                              \
+     ? (struct cmsghdr *)((mhdr)->msg_control)                                                     \
+     : (struct cmsghdr *)0)
 #endif
 
 #ifndef CMSG_DATA
-#define CMSG_DATA(cmsg)                                                        \
-  ((unsigned char *)(cmsg) + CMSG_ALIGN(sizeof(struct cmsghdr)))
+#define CMSG_DATA(cmsg) ((unsigned char *)(cmsg) + CMSG_ALIGN(sizeof(struct cmsghdr)))
 #endif
 
 int socket(int domain, int type, int protocol);

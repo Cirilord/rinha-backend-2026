@@ -88,6 +88,7 @@ static const struct response FRAUD_SCORE_RESPONSES[] = {
 #define PENDING_QUEUE_CAP 4096
 #define WORKER_STACK_SIZE (1024 * 1024)
 #define MAX_TRACKED_FDS 65536
+
 struct epoll_params {
   uint32_t busy_poll_usecs;
   uint16_t busy_poll_budget;
@@ -779,12 +780,10 @@ static void handle_notify_fd(struct worker_ctx *worker) {
       break;
     }
 
-    {
-      int index = register_client(worker, client_fd);
-      if (index >= 0) {
-        if (process_requests(worker, index) != 0) {
-          close_client(worker, index);
-        }
+    int index = register_client(worker, client_fd);
+    if (index >= 0) {
+      if (process_requests(worker, index) != 0) {
+        close_client(worker, index);
       }
     }
   }
@@ -817,25 +816,23 @@ static void *worker_main(void *arg) {
         continue;
       }
 
-      {
-        int index = worker->fd_table[fd].index;
-        if (index < 0 || index >= MAX_CLIENTS_PER_WORKER || !worker->clients[index].active) {
-          continue;
-        }
+      int index = worker->fd_table[fd].index;
+      if (index < 0 || index >= MAX_CLIENTS_PER_WORKER || !worker->clients[index].active) {
+        continue;
+      }
 
-        if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-          close_client(worker, index);
-          continue;
-        }
+      if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        close_client(worker, index);
+        continue;
+      }
 
-        if ((events[i].events & EPOLLIN) && handle_client_read(worker, index) != 0) {
-          close_client(worker, index);
-          continue;
-        }
+      if ((events[i].events & EPOLLIN) && handle_client_read(worker, index) != 0) {
+        close_client(worker, index);
+        continue;
+      }
 
-        if ((events[i].events & EPOLLOUT) && handle_client_write(worker, index) != 0) {
-          close_client(worker, index);
-        }
+      if ((events[i].events & EPOLLOUT) && handle_client_write(worker, index) != 0) {
+        close_client(worker, index);
       }
     }
   }
@@ -920,7 +917,7 @@ int main(int argc, char **argv) {
   }
   pthread_attr_destroy(&attr);
 
-  int listener_fd = create_listener(socket_path, 4);
+  int listener_fd = create_listener(socket_path, 64);
   int control_fd;
   for (;;) {
     control_fd = accept4(listener_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -939,6 +936,11 @@ int main(int argc, char **argv) {
   close(listener_fd);
   if (set_nonblocking(control_fd) < 0) {
     fatal("set_nonblocking");
+  }
+  {
+    int buf = 256 * 1024;
+    setsockopt(control_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    setsockopt(control_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
   }
 
   int next_worker = 0;

@@ -19,6 +19,10 @@ int create_listener(const char *socket_path, int backlog) {
     fatal("socket");
   }
 
+  int buf = 256 * 1024;
+  setsockopt(listener_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+  setsockopt(listener_fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
