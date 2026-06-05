@@ -3,7 +3,7 @@ name: rinha-backend
 services:
   load-balancer:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-c9dda312f897d3fa3f04727ba4495b83a09101fa
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-01876ae43fc9794a9b6695c8106a106853abbf53
     depends_on:
       - api1
       - api2
@@ -27,7 +27,7 @@ services:
 
   api1:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-c9dda312f897d3fa3f04727ba4495b83a09101fa
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-01876ae43fc9794a9b6695c8106a106853abbf53
     command: ["/tmp/server-1.sock"]
     cpus: 0.4
     mem_limit: 165m
@@ -55,7 +55,7 @@ services:
 
   api2:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-c9dda312f897d3fa3f04727ba4495b83a09101fa
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-01876ae43fc9794a9b6695c8106a106853abbf53
     command: ["/tmp/server-2.sock"]
     cpus: 0.4
     mem_limit: 165m
