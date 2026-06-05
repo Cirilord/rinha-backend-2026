@@ -25,11 +25,8 @@
 #include "listener.h"
 #include "transaction_context.h"
 #include "utils.h"
+#include "x_score.h"
 
-static const uint8_t RESPONSE[] = "HTTP/1.1 200 OK\r\n"
-                                  "Content-Length: 33\r\n"
-                                  "\r\n"
-                                  "{\"approved\":true,\"fraud_score\":0}";
 static const uint8_t RESPONSE_READY[] = "HTTP/1.1 200 OK\r\n"
                                         "Content-Length: 0\r\n"
                                         "\r\n";
@@ -38,6 +35,46 @@ static const uint8_t RESPONSE_404[] = "HTTP/1.1 404 Not Found\r\n"
                                       "\r\n";
 static const char REQ_GET_READY[] = "GET /ready ";
 static const char REQ_POST_FRAUD_SCORE[] = "POST /fraud-score ";
+
+struct response {
+  const uint8_t *data;
+  size_t len;
+};
+
+#define RESPONSE(s) {(const uint8_t *)(s), sizeof(s) - 1}
+
+static const struct response FRAUD_SCORE_RESPONSES[] = {
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 35\r\n"
+           "\r\n"
+           "{\"approved\":true,\"fraud_score\":0.0}"),
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 35\r\n"
+           "\r\n"
+           "{\"approved\":true,\"fraud_score\":0.2}"),
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 35\r\n"
+           "\r\n"
+           "{\"approved\":true,\"fraud_score\":0.4}"),
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 36\r\n"
+           "\r\n"
+           "{\"approved\":false,\"fraud_score\":0.6}"),
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 36\r\n"
+           "\r\n"
+           "{\"approved\":false,\"fraud_score\":0.8}"),
+  RESPONSE("HTTP/1.1 200 OK\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: 36\r\n"
+           "\r\n"
+           "{\"approved\":false,\"fraud_score\":1.0}"),
+};
 
 #define MAX_REQ_HEAD 4096
 #define MAX_BODY 4096
@@ -93,6 +130,7 @@ enum {
 
 static struct tracked_fd fd_table[MAX_TRACKED_FDS];
 static struct client_conn clients[MAX_CLIENTS];
+static XScoreIndexView xscore;
 
 static int set_nonblocking(int fd) {
 #ifdef __linux__
@@ -580,14 +618,22 @@ static int process_requests(int epoll_fd, int index) {
       return -1;
     }
 
-    const uint8_t *response = RESPONSE;
-    size_t response_len = sizeof(RESPONSE) - 1;
+    const uint8_t *response = FRAUD_SCORE_RESPONSES[0].data;
+    size_t response_len = FRAUD_SCORE_RESPONSES[0].len;
     if (parsed.status == PARSE_GOT) {
       transaction_context ctx = transaction_context__from_body(
         (const char *)(client->in_buf + client->in_start + parsed.body_start), parsed.body_len);
       double vector[14];
       transaction_context__to_vector(&ctx, vector);
       transaction_context__destroy(&ctx);
+      int fraud_count = x_score_predict_fraud_count(&xscore, vector);
+      if (fraud_count < 0) {
+        fraud_count = 0;
+      } else if (fraud_count > 5) {
+        fraud_count = 5;
+      }
+      response = FRAUD_SCORE_RESPONSES[fraud_count].data;
+      response_len = FRAUD_SCORE_RESPONSES[fraud_count].len;
     } else if (parsed.status == PARSE_READY) {
       response = RESPONSE_READY;
       response_len = sizeof(RESPONSE_READY) - 1;
@@ -682,6 +728,10 @@ int main(int argc, char **argv) {
   const char *socket_path = "/tmp/server.sock";
   if (argc > 1 && argv[1][0] != '\0') {
     socket_path = argv[1];
+  }
+
+  if (!x_score_open("/resources/references.idx", &xscore)) {
+    fatal("x_score_open");
   }
 
   for (int i = 0; i < MAX_CLIENTS; i++) {
