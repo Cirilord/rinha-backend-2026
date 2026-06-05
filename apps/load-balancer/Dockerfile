@@ -1,17 +1,15 @@
 FROM alpine:3.22 AS build
 
-RUN apk add --no-cache build-base linux-headers
+RUN apk add --no-cache build-base linux-headers make
 
 ARG CC=gcc
 ARG TARGETARCH
-ARG CFLAGS_BASE="-Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -std=c11 -Wall -Wextra"
-ARG CFLAGS_ARCH=""
 
 WORKDIR /src
-COPY apps/load-balancer/src/ /src/
-RUN mkdir -p /out && \
-    ${CC} ${CFLAGS_BASE} ${CFLAGS_ARCH} -o /out/load-balancer /src/*.c
+COPY Makefile /src/Makefile
+COPY apps/load-balancer/src/ /src/apps/load-balancer/src/
+RUN make -C /src load-balancer CC="${CC}" TARGETARCH="${TARGETARCH}"
 
 FROM scratch
-COPY --from=build /out/load-balancer /load-balancer
+COPY --from=build /src/load-balancer /load-balancer
 ENTRYPOINT ["/load-balancer"]

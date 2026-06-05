@@ -1,5 +1,3 @@
-PROJECT_NAME := rinha-backend
-
 CC ?= gcc
 
 TARGETARCH ?=
@@ -14,53 +12,34 @@ TARGETARCH := arm64
 endif
 endif
 
-CFLAGS_BASE := -Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -std=c11 -Wall -Wextra
+CFLAGS_BASE := -Ofast -DNDEBUG -fomit-frame-pointer -flto -fno-plt -s -static -Wall -Wextra -std=c11
 ifeq ($(TARGETARCH),amd64)
 CFLAGS_ARCH := -march=haswell -mtune=haswell
 else
 CFLAGS_ARCH :=
 endif
 
-BUILD_ARGS := \
-	--build-arg CC=$(CC) \
-	--build-arg TARGETARCH=$(TARGETARCH) \
-	--build-arg CFLAGS_BASE="$(CFLAGS_BASE)" \
-	--build-arg CFLAGS_ARCH="$(CFLAGS_ARCH)"
+CFLAGS ?= $(CFLAGS_BASE) $(CFLAGS_ARCH)
 
-COMPOSE ?= docker compose
-COMPOSE_FILE ?= docker-compose.yml
+SERVER_SRCS := apps/server/src/main.c \
+               apps/server/src/listener.c \
+               apps/server/src/transaction_context.c \
+               apps/server/src/utils.c \
+               apps/server/src/x_score.c
 
-.PHONY: build up down logs smoke test print-flags
+LB_SRCS := apps/load-balancer/src/main.c \
+           apps/load-balancer/src/env.c \
+           apps/load-balancer/src/listener.c \
+           apps/load-balancer/src/upstream.c \
+           apps/load-balancer/src/utils.c
 
-build:
-	$(COMPOSE) -f $(COMPOSE_FILE) build $(BUILD_ARGS)
+.PHONY: server load-balancer clean
 
-up:
-	$(MAKE) build COMPOSE_FILE=$(COMPOSE_FILE) TARGETARCH=$(TARGETARCH) CC=$(CC)
-	$(COMPOSE) -f $(COMPOSE_FILE) up -d
+server:
+	$(CC) $(CFLAGS) -o server $(SERVER_SRCS)
 
-down:
-	$(COMPOSE) -f $(COMPOSE_FILE) down -v
+load-balancer:
+	$(CC) $(CFLAGS) -o load-balancer $(LB_SRCS)
 
-logs:
-	$(COMPOSE) -f $(COMPOSE_FILE) logs -f --tail=200
-
-smoke:
-	docker run --rm -i \
-	  --network $(PROJECT_NAME)_rinha \
-	  -v "$$PWD:/work" -w /work \
-	  -e BASE_URL=http://load-balancer:9999 \
-	  grafana/k6 run test/smoke.js
-
-test:
-	docker run --rm -i \
-	  --network $(PROJECT_NAME)_rinha \
-	  -v "$$PWD:/work" -w /work \
-	  -e BASE_URL=http://load-balancer:9999 \
-	  grafana/k6 run test/test.js
-
-print-flags:
-	@echo "TARGETARCH=$(TARGETARCH)"
-	@echo "CC=$(CC)"
-	@echo "CFLAGS_BASE=$(CFLAGS_BASE)"
-	@echo "CFLAGS_ARCH=$(CFLAGS_ARCH)"
+clean:
+	rm -f server load-balancer
