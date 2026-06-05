@@ -730,7 +730,7 @@ int main(int argc, char **argv) {
     socket_path = argv[1];
   }
 
-  if (!x_score_open("/resources/references.idx", &xscore)) {
+  if (!x_score_open("/resources/kdtree.bin", &xscore)) {
     fatal("x_score_open");
   }
 

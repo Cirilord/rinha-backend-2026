@@ -16,5 +16,6 @@ RUN make -C /src server CC="${CC}" TARGETARCH="${TARGETARCH}"
 
 FROM scratch
 COPY --from=build /src/server /server
-COPY --from=build /src/resources/references.idx /resources/references.idx
+COPY --from=build /src/resources/refs.bin /resources/refs.bin
+COPY --from=build /src/resources/kdtree.bin /resources/kdtree.bin
 ENTRYPOINT ["/server"]

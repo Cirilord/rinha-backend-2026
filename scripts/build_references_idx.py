@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 """
-Build `resources/references.idx` in a specialist exact-kNN format.
-
-Input:
-- resources/references.json.gz
-
-Output:
-- resources/references.idx
-
-Layout (little-endian):
-- header: magic(8) + scale(i32) + dims(i32) + ref_count(i32) +
-          partition_count(i32) + node_count(i32) + block_count(i32)
-- partition directory (72 bytes each)
-- node directory (72 bytes each)
-- vectors in AoSoA blocks (LANES=8): for each block -> dims -> lanes -> i16
-- labels in block order: for each block -> lanes -> u8
+Build `resources/refs.bin` and `resources/kdtree.bin` for the KD-tree search.
 """
 
 from __future__ import annotations
@@ -22,70 +8,46 @@ from __future__ import annotations
 import gzip
 import json
 import struct
-from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 
 INPUT_PATH = Path("resources/references.json.gz")
-OUTPUT_IDX_PATH = Path("resources/references.idx")
+REFS_OUTPUT_PATH = Path("resources/refs.bin")
+TREE_OUTPUT_PATH = Path("resources/kdtree.bin")
 
 DIMS = 14
 LANES = 8
-SCALE = 10000
-MAGIC = b"RNSPCST1"
-
-# Second-level split bits (inside each primary partition key)
-SUBINDEX_SPLITS: tuple[tuple[int, int], ...] = (
-    (4, 2500),   # day_of_week
-    (4, 5000),   # day_of_week
-    (4, 7500),   # day_of_week
-    (0, 2500),   # amount
-    (8, 2500),   # tx_count_24h
-    (13, 2000),  # merchant_avg_amount
-)
+LEAF_SIZE = 80
+LEAF_FLAG = 0xFFFFFFFF
 
 
 @dataclass
-class BucketData:
-    count: int = 0
-    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
-    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
-    vectors: array = field(default_factory=lambda: array("h"))
-    labels: bytearray = field(default_factory=bytearray)
+class Ref:
+    qvec: list[int]
+    label: int
 
 
 @dataclass
-class PartitionData:
-    key: int
-    count: int = 0
-    minv: list[int] = field(default_factory=lambda: [32767] * DIMS)
-    maxv: list[int] = field(default_factory=lambda: [-32768] * DIMS)
-    buckets: dict[int, BucketData] = field(default_factory=dict)
-
-
-@dataclass
-class TreeNode:
+class Node:
     minv: list[int]
     maxv: list[int]
-    length: int
-    left: TreeNode | None = None
-    right: TreeNode | None = None
-    bucket: BucketData | None = None
+    indices: list[int] | None = None
+    left: "Node | None" = None
+    right: "Node | None" = None
 
 
 def quantize(value: float) -> int:
     if value <= -1.0:
-        return -SCALE
+        return -10000
     if value <= 0.0:
         return 0
     if value >= 1.0:
-        return SCALE
-    return int(round(value * SCALE))
+        return 10000
+    return int(round(value * 10000.0))
 
 
-def compute_partition_key(qvec: list[int]) -> int:
+def partition_key(qvec: list[int]) -> int:
     key = 0
-
     if qvec[5] >= 0:
         key |= 1 << 0
     if qvec[9] > 0:
@@ -109,122 +71,69 @@ def compute_partition_key(qvec: list[int]) -> int:
         key |= 1 << 6
     if qvec[8] > 2500:
         key |= 1 << 7
-
     return key
 
 
-def compute_subindex_key(qvec: list[int]) -> int:
-    key = 0
-    for bit, (dim, cutoff) in enumerate(SUBINDEX_SPLITS):
-        if qvec[dim] > cutoff:
-            key |= 1 << bit
-    return key
+def compute_bounds(refs: list[Ref], indices: list[int]) -> tuple[list[int], list[int]]:
+    minv = [32767] * DIMS
+    maxv = [-32768] * DIMS
+    for idx in indices:
+        qvec = refs[idx].qvec
+        for d, value in enumerate(qvec):
+            if value < minv[d]:
+                minv[d] = value
+            if value > maxv[d]:
+                maxv[d] = value
+    return minv, maxv
 
 
-def update_minmax(minv: list[int], maxv: list[int], qvec: list[int]) -> None:
-    for d, v in enumerate(qvec):
-        if v < minv[d]:
-            minv[d] = v
-        if v > maxv[d]:
-            maxv[d] = v
+def build_tree(refs: list[Ref], indices: list[int]) -> Node:
+    minv, maxv = compute_bounds(refs, indices)
+    if len(indices) <= LEAF_SIZE:
+        return Node(minv=minv, maxv=maxv, indices=indices.copy())
 
-
-def merge_bounds(a_min: list[int], a_max: list[int], b_min: list[int], b_max: list[int]) -> tuple[list[int], list[int]]:
-    out_min = [0] * DIMS
-    out_max = [0] * DIMS
-    for d in range(DIMS):
-        out_min[d] = a_min[d] if a_min[d] < b_min[d] else b_min[d]
-        out_max[d] = a_max[d] if a_max[d] > b_max[d] else b_max[d]
-    return out_min, out_max
-
-
-def build_tree_from_leaves(leaves: list[TreeNode]) -> TreeNode:
-    if len(leaves) == 1:
-        return leaves[0]
-
-    gmin = [32767] * DIMS
-    gmax = [-32768] * DIMS
-    for leaf in leaves:
-        for d in range(DIMS):
-            if leaf.minv[d] < gmin[d]:
-                gmin[d] = leaf.minv[d]
-            if leaf.maxv[d] > gmax[d]:
-                gmax[d] = leaf.maxv[d]
-
-    split_dim = 0
-    split_span = gmax[0] - gmin[0]
-    for d in range(1, DIMS):
-        span = gmax[d] - gmin[d]
-        if span > split_span:
-            split_span = span
-            split_dim = d
-
-    ordered = sorted(leaves, key=lambda n: n.minv[split_dim] + n.maxv[split_dim])
+    split_dim = max(range(DIMS), key=lambda d: maxv[d] - minv[d])
+    ordered = sorted(indices, key=lambda idx: refs[idx].qvec[split_dim])
     mid = len(ordered) // 2
-    left = build_tree_from_leaves(ordered[:mid])
-    right = build_tree_from_leaves(ordered[mid:])
+    if mid <= 0 or mid >= len(ordered):
+        return Node(minv=minv, maxv=maxv, indices=ordered)
 
-    merged_min, merged_max = merge_bounds(left.minv, left.maxv, right.minv, right.maxv)
-    return TreeNode(
-        minv=merged_min,
-        maxv=merged_max,
-        length=left.length + right.length,
-        left=left,
-        right=right,
-        bucket=None,
+    left = build_tree(refs, ordered[:mid])
+    right = build_tree(refs, ordered[mid:])
+    return Node(minv=minv, maxv=maxv, left=left, right=right)
+
+
+def emit_tree(node: Node, node_records: list[bytes], members: list[int]) -> int:
+    if node.indices is not None:
+        member_start = len(members)
+        members.extend(node.indices)
+        record = (
+            struct.pack("<" + "h" * DIMS, *node.minv)
+            + struct.pack("<" + "h" * DIMS, *node.maxv)
+            + struct.pack("<III", LEAF_FLAG, member_start, len(node.indices))
+        )
+        node_records.append(record)
+        return len(node_records) - 1
+
+    assert node.left is not None
+    assert node.right is not None
+    left_idx = emit_tree(node.left, node_records, members)
+    right_idx = emit_tree(node.right, node_records, members)
+    record = (
+        struct.pack("<" + "h" * DIMS, *node.minv)
+        + struct.pack("<" + "h" * DIMS, *node.maxv)
+        + struct.pack("<III", left_idx, right_idx, subtree_len(node))
     )
+    node_records.append(record)
+    return len(node_records) - 1
 
 
-def emit_bucket(bucket: BucketData, vectors_blob: array, labels_blob: bytearray, running_blocks: int) -> tuple[int, int]:
-    start_block = running_blocks
-    count = bucket.count
-    blocks = (count + LANES - 1) // LANES
-
-    data = bucket.vectors
-    labels = bucket.labels
-
-    for b in range(blocks):
-        base_idx = b * LANES
-        for d in range(DIMS):
-            for lane in range(LANES):
-                i = base_idx + lane
-                if i < count:
-                    vectors_blob.append(data[i * DIMS + d])
-                else:
-                    vectors_blob.append(0)
-        for lane in range(LANES):
-            i = base_idx + lane
-            if i < count:
-                labels_blob.append(labels[i])
-            else:
-                labels_blob.append(0)
-
-    return start_block, blocks
-
-
-def emit_tree(
-    node: TreeNode,
-    vectors_blob: array,
-    labels_blob: bytearray,
-    node_entries: list[tuple[int, int, int, int, list[int], list[int]]],
-    running_blocks: int,
-) -> tuple[int, int]:
-    if node.bucket is not None:
-        start_block, blocks = emit_bucket(node.bucket, vectors_blob, labels_blob, running_blocks)
-        running_blocks += blocks
-        node_idx = len(node_entries)
-        node_entries.append((-1, -1, start_block, node.length, node.minv, node.maxv))
-        return node_idx, running_blocks
-
-    if node.left is None or node.right is None:
-        raise RuntimeError("invalid internal tree node")
-
-    left_idx, running_blocks = emit_tree(node.left, vectors_blob, labels_blob, node_entries, running_blocks)
-    right_idx, running_blocks = emit_tree(node.right, vectors_blob, labels_blob, node_entries, running_blocks)
-
-    node_idx = len(node_entries)
-    node_entries.append((left_idx, right_idx, -1, node.length, node.minv, node.maxv))
-    return node_idx, running_blocks
+def subtree_len(node: Node) -> int:
+    if node.indices is not None:
+        return len(node.indices)
+    assert node.left is not None
+    assert node.right is not None
+    return subtree_len(node.left) + subtree_len(node.right)
 
 
 def main() -> None:
@@ -234,11 +143,8 @@ def main() -> None:
     with gzip.open(INPUT_PATH, "rt", encoding="utf-8") as f:
         rows = json.load(f)
 
-    if not isinstance(rows, list) or len(rows) == 0:
-        raise ValueError("invalid or empty dataset")
-
-    partitions: dict[int, PartitionData] = {}
-    total_count = 0
+    refs: list[Ref] = []
+    partitions: dict[int, list[int]] = {}
 
     for i, row in enumerate(rows):
         vector = row.get("vector")
@@ -248,120 +154,52 @@ def main() -> None:
 
         qvec = [quantize(float(x)) for x in vector]
         lbl = 1 if label == "fraud" else 0
-        pkey = compute_partition_key(qvec)
+        refs.append(Ref(qvec=qvec, label=lbl))
+        key = partition_key(qvec)
+        partitions.setdefault(key, []).append(i)
 
-        p = partitions.get(pkey)
-        if p is None:
-            p = PartitionData(key=pkey)
-            partitions[pkey] = p
+    refs_blob = bytearray()
+    refs_blob.extend(b"RINH")
+    refs_blob.extend(struct.pack("<II", 3, len(refs)))
+    for ref in refs:
+        refs_blob.extend(struct.pack("<" + "h" * DIMS, *ref.qvec))
+        refs_blob.append(ref.label)
 
-        p.count += 1
-        update_minmax(p.minv, p.maxv, qvec)
+    partition_entries: list[bytes] = []
+    node_records: list[bytes] = []
+    members: list[int] = []
 
-        skey = compute_subindex_key(qvec)
-        bucket = p.buckets.get(skey)
-        if bucket is None:
-            bucket = BucketData()
-            p.buckets[skey] = bucket
-
-        bucket.count += 1
-        bucket.labels.append(lbl)
-        bucket.vectors.extend(qvec)
-        update_minmax(bucket.minv, bucket.maxv, qvec)
-
-        total_count += 1
-
-    sorted_keys = sorted(partitions.keys())
-    partition_count = len(sorted_keys)
-
-    partition_entries: list[tuple[int, int, int, list[int], list[int], int]] = []
-    node_entries: list[tuple[int, int, int, int, list[int], list[int]]] = []
-
-    vectors_blob = array("h")
-    labels_blob = bytearray()
-    running_blocks = 0
-    max_leaves_per_partition = 0
-
-    for key in sorted_keys:
-        p = partitions[key]
-
-        leaves: list[TreeNode] = []
-        for _, bucket in sorted(p.buckets.items(), key=lambda kv: kv[0]):
-            if bucket.count <= 0:
-                continue
-            leaves.append(
-                TreeNode(
-                    minv=bucket.minv.copy(),
-                    maxv=bucket.maxv.copy(),
-                    length=bucket.count,
-                    left=None,
-                    right=None,
-                    bucket=bucket,
-                )
-            )
-
-        if not leaves:
-            continue
-
-        if len(leaves) > max_leaves_per_partition:
-            max_leaves_per_partition = len(leaves)
-
-        root = build_tree_from_leaves(leaves)
-        root_idx, running_blocks = emit_tree(root, vectors_blob, labels_blob, node_entries, running_blocks)
-        partition_entries.append((key, root_idx, p.count, p.minv, p.maxv, len(leaves)))
-
-        # release partition payload after emitting
-        for bucket in p.buckets.values():
-            bucket.vectors = array("h")
-            bucket.labels = bytearray()
-        p.buckets.clear()
-
-    node_count = len(node_entries)
-    total_blocks = running_blocks
-
-    if len(vectors_blob) != total_blocks * DIMS * LANES:
-        raise RuntimeError("invalid vectors blob size")
-    if len(labels_blob) != total_blocks * LANES:
-        raise RuntimeError("invalid labels blob size")
-    if partition_count != len(partition_entries):
-        raise RuntimeError("partition count mismatch")
-
-    out = bytearray()
-    out.extend(
-        struct.pack(
-            "<8siiiiii",
-            MAGIC,
-            SCALE,
-            DIMS,
-            total_count,
-            partition_count,
-            node_count,
-            total_blocks,
+    for key in sorted(partitions.keys()):
+        indices = partitions[key]
+        tree = build_tree(refs, indices)
+        root_idx = emit_tree(tree, node_records, members)
+        part_record = (
+            struct.pack("<III", key, root_idx, len(indices))
+            + struct.pack("<" + "h" * DIMS, *tree.minv)
+            + struct.pack("<" + "h" * DIMS, *tree.maxv)
         )
-    )
+        partition_entries.append(part_record)
 
-    for key, root, length, minv, maxv, _leaf_count in partition_entries:
-        out.extend(struct.pack("<Iiii", key, root, 0, length))
-        out.extend(struct.pack("<" + "h" * DIMS, *minv))
-        out.extend(struct.pack("<" + "h" * DIMS, *maxv))
+    tree_blob = bytearray()
+    tree_blob.extend(b"RKDT")
+    tree_blob.extend(struct.pack("<IIIII", 2, len(refs), DIMS, len(node_records), 0))
+    tree_blob.extend(struct.pack("<I", len(partition_entries)))
+    for part in partition_entries:
+        tree_blob.extend(part)
+    for record in node_records:
+        tree_blob.extend(record)
+    for ref_idx in members:
+        tree_blob.extend(struct.pack("<I", ref_idx))
 
-    for left, right, start_block, length, minv, maxv in node_entries:
-        out.extend(struct.pack("<iiii", left, right, start_block, length))
-        out.extend(struct.pack("<" + "h" * DIMS, *minv))
-        out.extend(struct.pack("<" + "h" * DIMS, *maxv))
+    REFS_OUTPUT_PATH.write_bytes(refs_blob)
+    TREE_OUTPUT_PATH.write_bytes(tree_blob)
 
-    out.extend(vectors_blob.tobytes())
-    out.extend(labels_blob)
-
-    OUTPUT_IDX_PATH.write_bytes(out)
-
-    print(f"done: {total_count} vectors")
-    print(f"partitions: {partition_count}")
-    print(f"nodes: {node_count}")
-    print(f"blocks: {total_blocks}")
-    print(f"max leaves per partition: {max_leaves_per_partition}")
-    print(f"wrote: {OUTPUT_IDX_PATH}")
-    print(f"size: {len(out)} bytes")
+    print(f"done: {len(refs)} vectors")
+    print(f"partitions: {len(partition_entries)}")
+    print(f"nodes: {len(node_records)}")
+    print(f"members: {len(members)}")
+    print(f"wrote: {REFS_OUTPUT_PATH}")
+    print(f"wrote: {TREE_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

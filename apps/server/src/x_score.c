@@ -2,6 +2,8 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -12,898 +14,1147 @@
 #include <immintrin.h>
 #endif
 
-#if defined(__ARM_NEON__)
-#include <arm_neon.h>
-#endif
+#define PACKED_DIMENSIONS 16
+#define DIM_PAIRS 7
+#define LANES 8
+#define MAX_PARTITIONS 512
+#define LEAF_FLAG UINT32_MAX
+#define Q_SCALE 10000.0f
+#define REFS_RECORD_BYTES (X_SCORE_DIMS * 2 + 1)
+#define FILE_NODE_BYTES (X_SCORE_DIMS * 2 * 2 + 4 * 3)
+#define FILE_PARTITION_BYTES (4 * 3 + X_SCORE_DIMS * 2 * 2)
 
 typedef struct {
-  unsigned long long bound;
-  uint32_t index;
-} PartitionCandidate;
+  int16_t aabb_min[X_SCORE_DIMS];
+  int16_t aabb_max[X_SCORE_DIMS];
+  uint32_t left;
+  uint32_t right;
+  uint32_t count;
+} FileNode;
 
 typedef struct {
-  uint32_t node_index;
-  unsigned long long bound;
+  uint32_t key;
+  uint32_t root;
+  uint32_t count;
+  int16_t aabb_min[X_SCORE_DIMS];
+  int16_t aabb_max[X_SCORE_DIMS];
+} FilePartition;
+
+typedef struct {
+  int16_t aabb_min[PACKED_DIMENSIONS];
+  int16_t aabb_max[PACKED_DIMENSIONS];
+  uint32_t left;
+  uint32_t right;
+  uint32_t chunk_start;
+  uint32_t chunk_end;
+  uint16_t parent_diff_mask;
+  uint8_t label_mask;
+} KdNode;
+
+typedef struct {
+  uint32_t key;
+  uint32_t root;
+  int16_t aabb_min[PACKED_DIMENSIONS];
+  int16_t aabb_max[PACKED_DIMENSIONS];
+} KdPartition;
+
+typedef struct {
+  int16_t pairs[DIM_PAIRS][2 * LANES];
+} LeafVecChunk;
+
+typedef struct {
+  uint32_t ref_indices[LANES];
+  uint8_t labels[LANES];
+  uint8_t len;
+} LeafMeta;
+
+typedef struct {
+  uint32_t idx;
+  int64_t bound;
 } NodeStackEntry;
 
 typedef struct {
-  int16_t q[X_SCORE_DIMS];
+  const XScoreIndexView *index;
+  const int32_t *query_q;
+  const int16_t *query_q16;
 #if defined(__AVX2__)
-  __m256i q32[X_SCORE_DIMS];
-#elif defined(__ARM_NEON__)
-  int16x8_t q16x8[X_SCORE_DIMS];
+  __m256i query_pairs[DIM_PAIRS];
 #endif
-} XScoreQueryContext;
+  int64_t top_dist[X_SCORE_TOPK];
+  uint8_t top_label[X_SCORE_TOPK];
+  uint32_t top_indices[X_SCORE_TOPK];
+} Search;
 
-#ifndef X_SCORE_EARLY_DISTANCE_MILLI
-#define X_SCORE_EARLY_DISTANCE_MILLI 143
-#endif
+typedef struct {
+  int64_t bound;
+  uint32_t idx;
+} PartitionEntry;
 
-#ifndef X_SCORE_GROUP_BLOCKS
-#define X_SCORE_GROUP_BLOCKS 16U
-#endif
+static const int g_c_kd_bound_thread = 1;
+static const int g_c_kd_primary_map = 1;
+static const int g_c_kd_inline_sort = 1;
+static const int g_c_kd_best_first = 0;
+static const int g_c_kd_best_first_primary_only = 0;
+static const int g_c_kd_delta_bounds = 0;
+static const int g_c_kd_pair_leaf = 0;
+static const int g_c_kd_prefetch_dist = 3;
+static const int g_c_kd_prefetch_meta = 0;
+static const int g_c_quant_once = 0;
+static const int g_c_kdtree_extra_split = 0;
+static const int64_t g_c_kd_early_limit = 0;
 
-static const unsigned long long x_score_early_distance_limit =
-  ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL) *
-  ((unsigned long long)X_SCORE_SCALE * (unsigned long long)X_SCORE_EARLY_DISTANCE_MILLI / 1000ULL);
+static int le16s(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 
-static inline void insert_partition_candidate_sorted(PartitionCandidate entries[256],
-                                                     uint32_t *entry_len,
-                                                     unsigned long long bound, uint32_t index) {
-  uint32_t pos = *entry_len;
-  while (pos > 0 && entries[pos - 1].bound > bound) {
-    entries[pos] = entries[pos - 1];
-    pos--;
-  }
-  entries[pos].bound = bound;
-  entries[pos].index = index;
-  (*entry_len)++;
+static uint32_t le32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static int16_t quantize_value(double value) {
-  if (value <= -1.0) {
-    return (int16_t)-X_SCORE_SCALE;
+static void *xmalloc(size_t size) {
+  void *ptr = malloc(size);
+  if (ptr == NULL && size != 0) {
+    abort();
   }
-  if (value <= 0.0) {
-    return 0;
-  }
-  if (value >= 1.0) {
-    return (int16_t)X_SCORE_SCALE;
-  }
-  double scaled = value * (double)X_SCORE_SCALE;
-  if (scaled >= 0.0) {
-    scaled += 0.5;
-  } else {
-    scaled -= 0.5;
-  }
-  return (int16_t)scaled;
+  return ptr;
 }
 
-static uint32_t compute_partition_key(const int16_t q[X_SCORE_DIMS]) {
+static void *hot_alloc(size_t size) { return xmalloc(size); }
+
+static void hot_prefetch(void *ptr, size_t size) {
+#ifdef MADV_WILLNEED
+  if (ptr != NULL && size > 0) {
+    (void)madvise(ptr, size, MADV_WILLNEED);
+  }
+#else
+  (void)ptr;
+  (void)size;
+#endif
+}
+
+static void derive_resource_paths(const char *hint, char *refs_path, size_t refs_len,
+                                  char *tree_path, size_t tree_len) {
+  const char *slash = strrchr(hint, '/');
+  size_t dir_len = slash ? (size_t)(slash - hint) : 0;
+  if (dir_len == 0) {
+    (void)snprintf(refs_path, refs_len, "refs.bin");
+    (void)snprintf(tree_path, tree_len, "kdtree.bin");
+    return;
+  }
+
+  if (dir_len >= refs_len) {
+    dir_len = refs_len - 1;
+  }
+  memcpy(refs_path, hint, dir_len);
+  refs_path[dir_len] = '\0';
+  memcpy(tree_path, hint, dir_len);
+  tree_path[dir_len] = '\0';
+  (void)snprintf(refs_path + dir_len, refs_len - dir_len, "/refs.bin");
+  (void)snprintf(tree_path + dir_len, tree_len - dir_len, "/kdtree.bin");
+}
+
+static FileNode decode_node(const uint8_t buf[FILE_NODE_BYTES]) {
+  FileNode n;
+  size_t p = 0;
+  for (int d = 0; d < X_SCORE_DIMS; d++, p += 2) {
+    n.aabb_min[d] = (int16_t)le16s(buf + p);
+  }
+  for (int d = 0; d < X_SCORE_DIMS; d++, p += 2) {
+    n.aabb_max[d] = (int16_t)le16s(buf + p);
+  }
+  n.left = le32(buf + p);
+  n.right = le32(buf + p + 4);
+  n.count = le32(buf + p + 8);
+  return n;
+}
+
+static FilePartition decode_partition(const uint8_t buf[FILE_PARTITION_BYTES]) {
+  FilePartition part;
+  size_t p = 0;
+  part.key = le32(buf + p);
+  p += 4;
+  part.root = le32(buf + p);
+  p += 4;
+  part.count = le32(buf + p);
+  p += 4;
+  for (int d = 0; d < X_SCORE_DIMS; d++, p += 2) {
+    part.aabb_min[d] = (int16_t)le16s(buf + p);
+  }
+  for (int d = 0; d < X_SCORE_DIMS; d++, p += 2) {
+    part.aabb_max[d] = (int16_t)le16s(buf + p);
+  }
+  return part;
+}
+
+static inline int32_t q_i32(float v) { return (int32_t)lrintf(v * Q_SCALE); }
+
+static inline int16_t q_i16(float v) {
+  int32_t q = q_i32(v);
+  if (q < INT16_MIN) {
+    q = INT16_MIN;
+  }
+  if (q > INT16_MAX) {
+    q = INT16_MAX;
+  }
+  return (int16_t)q;
+}
+
+static uint32_t partition_key_i16(const int16_t v[X_SCORE_DIMS]) {
   uint32_t key = 0;
-
-  if (q[5] >= 0) {
+  if (v[5] >= 0) {
     key |= 1u << 0;
   }
-  if (q[9] > 0) {
+  if (v[9] > 0) {
     key |= 1u << 1;
   }
-  if (q[10] > 0) {
+  if (v[10] > 0) {
     key |= 1u << 2;
   }
-  if (q[11] > 0) {
+  if (v[11] > 0) {
     key |= 1u << 3;
   }
 
-  uint32_t mcc_bucket = 0;
-  if (q[12] <= 2000) {
-    mcc_bucket = 0;
-  } else if (q[12] <= 3000) {
-    mcc_bucket = 1;
-  } else if (q[12] <= 7500) {
-    mcc_bucket = 2;
-  } else {
-    mcc_bucket = 3;
+  {
+    uint32_t mcc_bucket = 3;
+    if (v[12] <= 2047) {
+      mcc_bucket = 0;
+    } else if (v[12] <= 4095) {
+      mcc_bucket = 1;
+    } else if (v[12] <= 6143) {
+      mcc_bucket = 2;
+    }
+    key |= mcc_bucket << 4;
   }
-  key |= mcc_bucket << 4;
 
-  if (q[2] > 1013) {
+  if (v[2] > 4096) {
     key |= 1u << 6;
   }
-  if (q[8] > 2500) {
+  if (v[8] > 2048) {
     key |= 1u << 7;
+  }
+
+  switch (g_c_kdtree_extra_split) {
+    case 1:
+      if (v[7] > 2048) {
+        key |= 1u << 8;
+      }
+      break;
+    case 2:
+      if (v[0] > 2048) {
+        key |= 1u << 8;
+      }
+      break;
+    case 3:
+      if (v[6] > 2048) {
+        key |= 1u << 8;
+      }
+      break;
+    case 4:
+      if (v[3] > 5000) {
+        key |= 1u << 8;
+      }
+      break;
+    case 5:
+      if (v[13] > 200) {
+        key |= 1u << 8;
+      }
+      break;
+    default:
+      break;
   }
 
   return key;
 }
 
-static inline unsigned long long lower_bound_partition_sq_cutoff(
-  const int16_t q[X_SCORE_DIMS], const XScorePartitionEntry *partition, unsigned long long cutoff) {
-  unsigned long long sum = 0;
-  for (int d = 0; d < X_SCORE_DIMS; d++) {
-    long long qq = (long long)q[d];
-    long long lo = (long long)partition->min[d];
-    long long hi = (long long)partition->max[d];
-    long long diff = 0;
-    if (qq < lo) {
-      diff = lo - qq;
-    } else if (qq > hi) {
-      diff = qq - hi;
-    }
-    sum += (unsigned long long)(diff * diff);
-    if (sum > cutoff) {
-      return sum;
-    }
+static inline int64_t dim_gap_sq_i64(int16_t q, int16_t lo, int16_t hi) {
+  int64_t gap = 0;
+  if (q < lo) {
+    gap = (int64_t)lo - q;
+  } else if (q > hi) {
+    gap = (int64_t)q - hi;
   }
-  return sum;
+  return gap * gap;
 }
 
-static inline unsigned long long lower_bound_node_sq_cutoff(const int16_t q[X_SCORE_DIMS],
-                                                            const XScoreNodeEntry *node,
-                                                            unsigned long long cutoff) {
-  unsigned long long sum = 0;
-  for (int d = 0; d < X_SCORE_DIMS; d++) {
-    long long qq = (long long)q[d];
-    long long lo = (long long)node->min[d];
-    long long hi = (long long)node->max[d];
-    long long diff = 0;
-    if (qq < lo) {
-      diff = lo - qq;
-    } else if (qq > hi) {
-      diff = qq - hi;
+static inline int64_t aabb_lower_bound_i64(const int16_t q[PACKED_DIMENSIONS],
+                                           const int16_t lo[PACKED_DIMENSIONS],
+                                           const int16_t hi[PACKED_DIMENSIONS]) {
+#if defined(__AVX2__)
+  __m256i qv = _mm256_loadu_si256((const __m256i *)(const void *)q);
+  __m256i lov = _mm256_loadu_si256((const __m256i *)(const void *)lo);
+  __m256i hiv = _mm256_loadu_si256((const __m256i *)(const void *)hi);
+  __m256i zero = _mm256_setzero_si256();
+  __m256i low_gap = _mm256_max_epi16(_mm256_sub_epi16(lov, qv), zero);
+  __m256i high_gap = _mm256_max_epi16(_mm256_sub_epi16(qv, hiv), zero);
+  __m256i gap = _mm256_max_epi16(low_gap, high_gap);
+  __m256i pair_sums = _mm256_madd_epi16(gap, gap);
+  int32_t tmp[8];
+  _mm256_storeu_si256((__m256i *)(void *)tmp, pair_sums);
+  {
+    int64_t sum = 0;
+    for (int i = 0; i < 8; i++) {
+      sum += tmp[i];
     }
-    sum += (unsigned long long)(diff * diff);
-    if (sum > cutoff) {
-      return sum;
-    }
+    return sum;
+  }
+#else
+  int64_t sum = 0;
+  for (int i = 0; i < PACKED_DIMENSIONS; i++) {
+    sum += dim_gap_sq_i64(q[i], lo[i], hi[i]);
   }
   return sum;
+#endif
 }
 
-static inline void insert_best(unsigned long long dist, uint8_t label,
-                               unsigned long long top_dist[X_SCORE_TOPK],
-                               uint8_t top_label[X_SCORE_TOPK]) {
-  if (dist >= top_dist[4]) {
+static inline bool candidate_before(int64_t dist, uint32_t ref_index, int64_t other_dist,
+                                    uint32_t other_index) {
+  return dist < other_dist || (dist == other_dist && ref_index < other_index);
+}
+
+static inline bool can_still_improve(Search *s, int64_t lb) {
+  int64_t cutoff = s->top_dist[X_SCORE_TOPK - 1];
+  return cutoff == INT64_MAX || lb <= cutoff;
+}
+
+static inline void insert_top(Search *s, int64_t dist, uint8_t label, uint32_t ref_index) {
+  if (!candidate_before(dist, ref_index, s->top_dist[X_SCORE_TOPK - 1],
+                        s->top_indices[X_SCORE_TOPK - 1])) {
     return;
   }
 
-  if (dist < top_dist[3]) {
-    top_dist[4] = top_dist[3];
-    top_label[4] = top_label[3];
-    if (dist < top_dist[2]) {
-      top_dist[3] = top_dist[2];
-      top_label[3] = top_label[2];
-      if (dist < top_dist[1]) {
-        top_dist[2] = top_dist[1];
-        top_label[2] = top_label[1];
-        if (dist < top_dist[0]) {
-          top_dist[1] = top_dist[0];
-          top_label[1] = top_label[0];
-          top_dist[0] = dist;
-          top_label[0] = label;
-          return;
-        }
-        top_dist[1] = dist;
-        top_label[1] = label;
-        return;
-      }
-      top_dist[2] = dist;
-      top_label[2] = label;
+  int i = X_SCORE_TOPK;
+  while (i > 0 &&
+         candidate_before(dist, ref_index, s->top_dist[i - 1], s->top_indices[i - 1])) {
+    i--;
+  }
+  if (i >= X_SCORE_TOPK) {
+    return;
+  }
+
+  for (int j = X_SCORE_TOPK - 1; j > i; j--) {
+    s->top_dist[j] = s->top_dist[j - 1];
+    s->top_label[j] = s->top_label[j - 1];
+    s->top_indices[j] = s->top_indices[j - 1];
+  }
+  s->top_dist[i] = dist;
+  s->top_label[i] = label;
+  s->top_indices[i] = ref_index;
+}
+
+static inline void insert_top_from_meta(Search *s, int64_t dist, const LeafMeta *m, int lane) {
+  int64_t cutoff = s->top_dist[X_SCORE_TOPK - 1];
+  if (dist > cutoff) {
+    return;
+  }
+  {
+    uint32_t ref_index = m->ref_indices[lane];
+    if (!candidate_before(dist, ref_index, cutoff, s->top_indices[X_SCORE_TOPK - 1])) {
       return;
     }
-    top_dist[3] = dist;
-    top_label[3] = label;
-    return;
+    insert_top(s, dist, m->labels[lane], ref_index);
   }
-
-  top_dist[4] = dist;
-  top_label[4] = label;
 }
 
-static inline bool early_done(const unsigned long long top_dist[X_SCORE_TOPK]) {
-  return top_dist[X_SCORE_TOPK - 1] <= x_score_early_distance_limit;
+static inline bool early_done(Search *s) {
+  if (g_c_kd_early_limit <= 0 || s->top_dist[X_SCORE_TOPK - 1] > g_c_kd_early_limit) {
+    return false;
+  }
+  return true;
 }
 
-static inline void prepare_query_context(const double query[X_SCORE_DIMS], XScoreQueryContext *ctx) {
-  for (int d = 0; d < X_SCORE_DIMS; d++) {
-    int16_t qd = quantize_value(query[d]);
-    ctx->q[d] = qd;
+static inline void chunk_distances_madd(Search *s, const LeafVecChunk *c, int64_t dist[LANES]) {
 #if defined(__AVX2__)
-    ctx->q32[d] = _mm256_set1_epi32((int)qd);
-#elif defined(__ARM_NEON__)
-    ctx->q16x8[d] = vdupq_n_s16(qd);
-#endif
+  __m256i acc = _mm256_setzero_si256();
+  for (int p = 0; p < DIM_PAIRS; p++) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)c->pairs[p]);
+    __m256i diff = _mm256_sub_epi16(v, s->query_pairs[p]);
+    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff, diff));
   }
-}
-
-static inline void scan_block(const int16_t *block, const XScoreQueryContext *ctx,
-                              unsigned long long out_dist[X_SCORE_LANES]) {
-#if defined(__AVX2__)
-  __m256i acc_lo = _mm256_setzero_si256();
-  __m256i acc_hi = _mm256_setzero_si256();
-  __m256i acc32 = _mm256_setzero_si256();
-
-#define X_SCORE_FLUSH_ACC32()                                                                      \
-  do {                                                                                             \
-    const __m128i sq_lo = _mm256_castsi256_si128(acc32);                                           \
-    const __m128i sq_hi = _mm256_extracti128_si256(acc32, 1);                                      \
-    acc_lo = _mm256_add_epi64(acc_lo, _mm256_cvtepi32_epi64(sq_lo));                               \
-    acc_hi = _mm256_add_epi64(acc_hi, _mm256_cvtepi32_epi64(sq_hi));                               \
-    acc32 = _mm256_setzero_si256();                                                                 \
-  } while (0)
-
-  for (int d = 0; d < 5; d++) {
-    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)(block + (size_t)d * 8));
-    const __m256i values = _mm256_cvtepi16_epi32(packed);
-    const __m256i diff = _mm256_sub_epi32(values, ctx->q32[d]);
-    const __m256i sq = _mm256_mullo_epi32(diff, diff);
-    acc32 = _mm256_add_epi32(acc32, sq);
+  {
+    __m128i lo = _mm256_castsi256_si128(acc);
+    __m128i hi = _mm256_extracti128_si256(acc, 1);
+    _mm256_storeu_si256((__m256i *)(void *)dist, _mm256_cvtepi32_epi64(lo));
+    _mm256_storeu_si256((__m256i *)(void *)(dist + 4), _mm256_cvtepi32_epi64(hi));
   }
-  X_SCORE_FLUSH_ACC32();
-
-  for (int d = 5; d < 10; d++) {
-    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)(block + (size_t)d * 8));
-    const __m256i values = _mm256_cvtepi16_epi32(packed);
-    const __m256i diff = _mm256_sub_epi32(values, ctx->q32[d]);
-    const __m256i sq = _mm256_mullo_epi32(diff, diff);
-    acc32 = _mm256_add_epi32(acc32, sq);
-  }
-  X_SCORE_FLUSH_ACC32();
-
-  for (int d = 10; d < X_SCORE_DIMS; d++) {
-    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)(block + (size_t)d * 8));
-    const __m256i values = _mm256_cvtepi16_epi32(packed);
-    const __m256i diff = _mm256_sub_epi32(values, ctx->q32[d]);
-    const __m256i sq = _mm256_mullo_epi32(diff, diff);
-    acc32 = _mm256_add_epi32(acc32, sq);
-  }
-  X_SCORE_FLUSH_ACC32();
-
-#undef X_SCORE_FLUSH_ACC32
-
-  _mm256_storeu_si256((__m256i *)(void *)out_dist, acc_lo);
-  _mm256_storeu_si256((__m256i *)(void *)(out_dist + 4), acc_hi);
-#elif defined(__ARM_NEON__)
-  int64x2_t acc0 = vdupq_n_s64(0);
-  int64x2_t acc1 = vdupq_n_s64(0);
-  int64x2_t acc2 = vdupq_n_s64(0);
-  int64x2_t acc3 = vdupq_n_s64(0);
-  int32x4_t acc_lo32 = vdupq_n_s32(0);
-  int32x4_t acc_hi32 = vdupq_n_s32(0);
-
-#define X_SCORE_FLUSH_ACC32()                                                                      \
-  do {                                                                                             \
-    acc0 = vaddq_s64(acc0, vmovl_s32(vget_low_s32(acc_lo32)));                                     \
-    acc1 = vaddq_s64(acc1, vmovl_s32(vget_high_s32(acc_lo32)));                                    \
-    acc2 = vaddq_s64(acc2, vmovl_s32(vget_low_s32(acc_hi32)));                                     \
-    acc3 = vaddq_s64(acc3, vmovl_s32(vget_high_s32(acc_hi32)));                                    \
-    acc_lo32 = vdupq_n_s32(0);                                                                      \
-    acc_hi32 = vdupq_n_s32(0);                                                                      \
-  } while (0)
-
-  for (int d = 0; d < 5; d++) {
-    const int16x8_t v = vld1q_s16(block + (size_t)d * 8);
-    const int16x8_t diff = vsubq_s16(v, ctx->q16x8[d]);
-    acc_lo32 = vaddq_s32(acc_lo32, vmull_s16(vget_low_s16(diff), vget_low_s16(diff)));
-    acc_hi32 = vaddq_s32(acc_hi32, vmull_s16(vget_high_s16(diff), vget_high_s16(diff)));
-  }
-  X_SCORE_FLUSH_ACC32();
-
-  for (int d = 5; d < 10; d++) {
-    const int16x8_t v = vld1q_s16(block + (size_t)d * 8);
-    const int16x8_t diff = vsubq_s16(v, ctx->q16x8[d]);
-    acc_lo32 = vaddq_s32(acc_lo32, vmull_s16(vget_low_s16(diff), vget_low_s16(diff)));
-    acc_hi32 = vaddq_s32(acc_hi32, vmull_s16(vget_high_s16(diff), vget_high_s16(diff)));
-  }
-  X_SCORE_FLUSH_ACC32();
-
-  for (int d = 10; d < X_SCORE_DIMS; d++) {
-    const int16x8_t v = vld1q_s16(block + (size_t)d * 8);
-    const int16x8_t diff = vsubq_s16(v, ctx->q16x8[d]);
-    acc_lo32 = vaddq_s32(acc_lo32, vmull_s16(vget_low_s16(diff), vget_low_s16(diff)));
-    acc_hi32 = vaddq_s32(acc_hi32, vmull_s16(vget_high_s16(diff), vget_high_s16(diff)));
-  }
-  X_SCORE_FLUSH_ACC32();
-
-#undef X_SCORE_FLUSH_ACC32
-
-  int64_t tmp0[2];
-  int64_t tmp1[2];
-  int64_t tmp2[2];
-  int64_t tmp3[2];
-  vst1q_s64(tmp0, acc0);
-  vst1q_s64(tmp1, acc1);
-  vst1q_s64(tmp2, acc2);
-  vst1q_s64(tmp3, acc3);
-
-  out_dist[0] = (unsigned long long)tmp0[0];
-  out_dist[1] = (unsigned long long)tmp0[1];
-  out_dist[2] = (unsigned long long)tmp1[0];
-  out_dist[3] = (unsigned long long)tmp1[1];
-  out_dist[4] = (unsigned long long)tmp2[0];
-  out_dist[5] = (unsigned long long)tmp2[1];
-  out_dist[6] = (unsigned long long)tmp3[0];
-  out_dist[7] = (unsigned long long)tmp3[1];
 #else
-  for (int lane = 0; lane < X_SCORE_LANES; lane++) {
-    out_dist[lane] = 0;
-  }
-  for (int d = 0; d < X_SCORE_DIMS; d++) {
-    long long qq = (long long)ctx->q[d];
-    const int16_t *dim = block + (size_t)d * X_SCORE_LANES;
-    for (int lane = 0; lane < X_SCORE_LANES; lane++) {
-      long long diff = qq - (long long)dim[lane];
-      out_dist[lane] += (unsigned long long)(diff * diff);
+  for (int lane = 0; lane < LANES; lane++) {
+    int64_t acc = 0;
+    for (int d = 0; d < X_SCORE_DIMS; d++) {
+      int64_t diff = (int64_t)s->query_q[d] - c->pairs[d >> 1][(lane << 1) | (d & 1)];
+      acc += diff * diff;
     }
+    dist[lane] = acc;
   }
 #endif
 }
 
-static inline bool scan_blocks_linear(const XScoreIndexView *view, uint32_t start_block, uint32_t len,
-                                      const XScoreQueryContext *ctx,
-                                      unsigned long long top_dist[X_SCORE_TOPK],
-                                      uint8_t top_label[X_SCORE_TOPK]) {
-  if (len == 0) {
+static inline void chunk_distances_pair_madd(Search *s, const LeafVecChunk *c0,
+                                             const LeafVecChunk *c1, int64_t dist0[LANES],
+                                             int64_t dist1[LANES]) {
+#if defined(__AVX2__)
+  __m256i acc0 = _mm256_setzero_si256();
+  __m256i acc1 = _mm256_setzero_si256();
+  for (int p = 0; p < DIM_PAIRS; p++) {
+    __m256i q = s->query_pairs[p];
+    __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)c0->pairs[p]);
+    __m256i d0 = _mm256_sub_epi16(v0, q);
+    acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(d0, d0));
+    __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)c1->pairs[p]);
+    __m256i d1 = _mm256_sub_epi16(v1, q);
+    acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(d1, d1));
+  }
+  {
+    __m128i lo0 = _mm256_castsi256_si128(acc0);
+    __m128i hi0 = _mm256_extracti128_si256(acc0, 1);
+    __m128i lo1 = _mm256_castsi256_si128(acc1);
+    __m128i hi1 = _mm256_extracti128_si256(acc1, 1);
+    _mm256_storeu_si256((__m256i *)(void *)dist0, _mm256_cvtepi32_epi64(lo0));
+    _mm256_storeu_si256((__m256i *)(void *)(dist0 + 4), _mm256_cvtepi32_epi64(hi0));
+    _mm256_storeu_si256((__m256i *)(void *)dist1, _mm256_cvtepi32_epi64(lo1));
+    _mm256_storeu_si256((__m256i *)(void *)(dist1 + 4), _mm256_cvtepi32_epi64(hi1));
+  }
+#else
+  chunk_distances_madd(s, c0, dist0);
+  chunk_distances_madd(s, c1, dist1);
+#endif
+}
+
+static inline void insert_chunk_distances(Search *s, const LeafMeta *m, const int64_t dist[LANES],
+                                          int lane_count) {
+  for (int lane = 0; lane < lane_count; lane++) {
+    insert_top_from_meta(s, dist[lane], m, lane);
+  }
+}
+
+static void scan_chunk(Search *s, size_t chunk_id, int lane_count) {
+  const LeafVecChunk *c = &((const LeafVecChunk *)s->index->chunks)[chunk_id];
+  const LeafMeta *m = &((const LeafMeta *)s->index->metas)[chunk_id];
+  int64_t distances[LANES];
+  chunk_distances_madd(s, c, distances);
+  insert_chunk_distances(s, m, distances, lane_count);
+}
+
+static inline int64_t child_lb(Search *s, uint32_t node_idx) {
+  const KdNode *n = &((const KdNode *)s->index->nodes)[node_idx];
+  return aabb_lower_bound_i64(s->query_q16, n->aabb_min, n->aabb_max);
+}
+
+static inline int64_t child_lb_from_parent(Search *s, const KdNode *parent, uint32_t node_idx,
+                                           int64_t parent_bound) {
+  const KdNode *child = &((const KdNode *)s->index->nodes)[node_idx];
+  if (!g_c_kd_delta_bounds) {
+    return aabb_lower_bound_i64(s->query_q16, child->aabb_min, child->aabb_max);
+  }
+
+  {
+    int64_t bound = parent_bound;
+    uint16_t mask = child->parent_diff_mask;
+    while (mask != 0) {
+      int d = __builtin_ctz(mask);
+      mask = (uint16_t)(mask - 1);
+      bound -= dim_gap_sq_i64(s->query_q16[d], parent->aabb_min[d], parent->aabb_max[d]);
+      bound += dim_gap_sq_i64(s->query_q16[d], child->aabb_min[d], child->aabb_max[d]);
+    }
+    return bound;
+  }
+}
+
+static inline bool node_entry_before(NodeStackEntry a, NodeStackEntry b) {
+  return a.bound < b.bound || (a.bound == b.bound && a.idx < b.idx);
+}
+
+static bool node_heap_push(NodeStackEntry *heap, size_t *len, NodeStackEntry e) {
+  if (*len >= 8192) {
     return false;
   }
 
-  const int16_t *vectors = view->vectors_q16;
-  const uint8_t *labels = view->labels;
-  unsigned long long dists[X_SCORE_LANES];
-  uint32_t blocks = (len + X_SCORE_LANES - 1U) / X_SCORE_LANES;
-  uint32_t remaining = len;
-
-  for (uint32_t b = 0; b < blocks; b++) {
-    uint32_t block_idx = start_block + b;
-    const int16_t *block = vectors + (size_t)block_idx * X_SCORE_DIMS * X_SCORE_LANES;
-#if defined(__GNUC__)
-    if (b + 2 < blocks) {
-      const int16_t *next =
-        vectors + (size_t)(start_block + b + 2) * X_SCORE_DIMS * X_SCORE_LANES;
-      __builtin_prefetch(next, 0, 1);
-    }
-#endif
-    scan_block(block, ctx, dists);
-
-    uint32_t lane_count = (remaining >= X_SCORE_LANES) ? X_SCORE_LANES : remaining;
-    remaining -= lane_count;
-
-    size_t label_base = (size_t)block_idx * X_SCORE_LANES;
-    unsigned long long worst = top_dist[X_SCORE_TOPK - 1];
-    for (uint32_t lane = 0; lane < lane_count; lane++) {
-      unsigned long long d = dists[lane];
-      if (d < worst) {
-        insert_best(d, labels[label_base + lane], top_dist, top_label);
-        worst = top_dist[X_SCORE_TOPK - 1];
+  {
+    size_t i = (*len)++;
+    while (i > 0) {
+      size_t parent = (i - 1) >> 1;
+      if (!node_entry_before(e, heap[parent])) {
+        break;
       }
+      heap[i] = heap[parent];
+      i = parent;
     }
-
-    if (early_done(top_dist)) {
-      return true;
-    }
+    heap[i] = e;
   }
-
-  return false;
+  return true;
 }
 
-static inline bool scan_partition_grouped(const XScoreIndexView *view, uint32_t partition_index,
-                                          const XScoreQueryContext *ctx,
-                                          unsigned long long top_dist[X_SCORE_TOPK],
-                                          uint8_t top_label[X_SCORE_TOPK]) {
-  if (!view->direct_leaf_mode || !view->partition_start_blocks || !view->partition_lens ||
-      !view->partition_group_offsets || !view->groups) {
-    return false;
-  }
-  if (partition_index >= view->partition_count) {
-    return false;
+static NodeStackEntry node_heap_pop(NodeStackEntry *heap, size_t *len) {
+  NodeStackEntry out = heap[0];
+  NodeStackEntry last = heap[--(*len)];
+  if (*len == 0) {
+    return out;
   }
 
-  uint32_t start_block = view->partition_start_blocks[partition_index];
-  uint32_t plen = view->partition_lens[partition_index];
-  if (plen == 0) {
-    return false;
+  {
+    size_t i = 0;
+    while (1) {
+      size_t left = i * 2 + 1;
+      if (left >= *len) {
+        break;
+      }
+      size_t right = left + 1;
+      size_t child = left;
+      if (right < *len && node_entry_before(heap[right], heap[left])) {
+        child = right;
+      }
+      if (!node_entry_before(heap[child], last)) {
+        break;
+      }
+      heap[i] = heap[child];
+      i = child;
+    }
+    heap[i] = last;
   }
-
-  uint32_t begin = view->partition_group_offsets[partition_index];
-  uint32_t end = view->partition_group_offsets[partition_index + 1];
-  if (end <= begin) {
-    return scan_blocks_linear(view, start_block, plen, ctx, top_dist, top_label);
-  }
-  (void)begin;
-  return scan_blocks_linear(view, start_block, plen, ctx, top_dist, top_label);
+  return out;
 }
 
-static inline bool search_node_iterative(const XScoreIndexView *view, uint32_t root,
-                                         unsigned long long root_bound,
-                                         const XScoreQueryContext *ctx,
-                                         unsigned long long top_dist[X_SCORE_TOPK],
-                                         uint8_t top_label[X_SCORE_TOPK]) {
-  if (!view->nodes || root >= view->node_count) {
-    return false;
-  }
+static void visit_node_dfs(Search *s, uint32_t node_idx, int64_t bound) {
+  NodeStackEntry stack[1024];
+  size_t sp = 0;
+  uint32_t current = node_idx;
+  int64_t current_bound = bound;
+  const KdNode *nodes = (const KdNode *)s->index->nodes;
+  const LeafMeta *metas = (const LeafMeta *)s->index->metas;
 
-  const XScoreNodeEntry *nodes = view->nodes;
-  NodeStackEntry stack[256];
-  uint32_t stack_len = 0;
+  while (1) {
+    if (!g_c_kd_bound_thread) {
+      current_bound = child_lb(s, current);
+    }
 
-  uint32_t current = root;
-  unsigned long long current_bound = root_bound;
+    if (can_still_improve(s, current_bound)) {
+      const KdNode *n = &nodes[current];
+      if (n->left == LEAF_FLAG) {
+        for (uint32_t cid = n->chunk_start; cid < n->chunk_end; cid++) {
+          if (g_c_kd_prefetch_dist > 0) {
+            uint32_t target = cid + (uint32_t)g_c_kd_prefetch_dist;
+            if (target < n->chunk_end) {
+              __builtin_prefetch(&((const LeafVecChunk *)s->index->chunks)[target], 0, 3);
+              if (g_c_kd_prefetch_meta) {
+                __builtin_prefetch(&metas[target], 0, 3);
+              }
+            }
+          }
 
-  for (;;) {
-    unsigned long long worst = top_dist[X_SCORE_TOPK - 1];
-    if (current_bound <= worst) {
-      const XScoreNodeEntry *node = &nodes[current];
-      if (node->left < 0 || node->right < 0) {
-        if (node->start_block >= 0 && node->len > 0) {
-          if (scan_blocks_linear(view, (uint32_t)node->start_block, (uint32_t)node->len, ctx,
-                                 top_dist, top_label)) {
-            return true;
+          if (g_c_kd_pair_leaf && cid + 1 < n->chunk_end) {
+            int64_t dist0[LANES];
+            int64_t dist1[LANES];
+            chunk_distances_pair_madd(
+              s, &((const LeafVecChunk *)s->index->chunks)[cid],
+              &((const LeafVecChunk *)s->index->chunks)[cid + 1], dist0, dist1);
+            insert_chunk_distances(s, &metas[cid], dist0, LANES);
+            if (early_done(s)) {
+              return;
+            }
+            {
+              int lane_count1 = (cid + 2 == n->chunk_end) ? metas[cid + 1].len : LANES;
+              insert_chunk_distances(s, &metas[cid + 1], dist1, lane_count1);
+            }
+            if (early_done(s)) {
+              return;
+            }
+            cid++;
+            continue;
+          }
+
+          {
+            int lane_count = (cid + 1 == n->chunk_end) ? metas[cid].len : LANES;
+            scan_chunk(s, cid, lane_count);
+            if (early_done(s)) {
+              return;
+            }
           }
         }
       } else {
-        uint32_t left = (uint32_t)node->left;
-        uint32_t right = (uint32_t)node->right;
-        if (left < view->node_count && right < view->node_count) {
-          unsigned long long lb = lower_bound_node_sq_cutoff(ctx->q, &nodes[left], worst);
-          unsigned long long rb = lower_bound_node_sq_cutoff(ctx->q, &nodes[right], worst);
+        uint32_t l = n->left;
+        uint32_t r = n->right;
+        int64_t dl = child_lb_from_parent(s, n, l, current_bound);
+        int64_t dr = child_lb_from_parent(s, n, r, current_bound);
+        uint32_t near = l;
+        uint32_t far = r;
+        int64_t near_b = dl;
+        int64_t far_b = dr;
 
-          uint32_t near_idx = left;
-          uint32_t far_idx = right;
-          unsigned long long near_bound = lb;
-          unsigned long long far_bound = rb;
-
-          if (rb < lb) {
-            near_idx = right;
-            far_idx = left;
-            near_bound = rb;
-            far_bound = lb;
-          }
-
-          if (far_bound <= worst && stack_len < (uint32_t)(sizeof(stack) / sizeof(stack[0]))) {
-            stack[stack_len].node_index = far_idx;
-            stack[stack_len].bound = far_bound;
-            stack_len++;
-          }
-
-          if (near_bound <= worst) {
-            current = near_idx;
-            current_bound = near_bound;
-            continue;
-          }
+        if (dr < dl) {
+          near = r;
+          far = l;
+          near_b = dr;
+          far_b = dl;
         }
+
+        if (can_still_improve(s, far_b) && sp < 1024) {
+          stack[sp++] = (NodeStackEntry){far, far_b};
+        }
+        current = near;
+        current_bound = near_b;
+        continue;
       }
     }
 
-    if (stack_len == 0) {
-      break;
+    if (sp == 0 || early_done(s)) {
+      return;
     }
-    stack_len--;
-    current = stack[stack_len].node_index;
-    current_bound = stack[stack_len].bound;
+    {
+      NodeStackEntry next = stack[--sp];
+      current = next.idx;
+      current_bound = next.bound;
+    }
   }
-
-  return false;
 }
 
-static inline void search_exact(const XScoreIndexView *view, const XScoreQueryContext *ctx,
-                                unsigned long long top_dist[X_SCORE_TOPK],
-                                uint8_t top_label[X_SCORE_TOPK]) {
-  const int16_t *vectors = view->vectors_q16;
-  const uint8_t *labels = view->labels;
-  unsigned long long dists[X_SCORE_LANES];
-  size_t remaining = view->count;
+static void visit_node_best_first(Search *s, uint32_t node_idx, int64_t bound) {
+  NodeStackEntry heap[8192];
+  size_t len = 0;
+  const KdNode *nodes = (const KdNode *)s->index->nodes;
+  const LeafMeta *metas = (const LeafMeta *)s->index->metas;
 
-  for (uint32_t b = 0; b < view->block_count && remaining > 0; b++) {
-    const int16_t *block = vectors + (size_t)b * X_SCORE_DIMS * X_SCORE_LANES;
-    scan_block(block, ctx, dists);
-    uint32_t lane_count = (remaining >= X_SCORE_LANES) ? X_SCORE_LANES : (uint32_t)remaining;
-    size_t label_base = (size_t)b * X_SCORE_LANES;
-    for (uint32_t lane = 0; lane < lane_count; lane++) {
-      insert_best(dists[lane], labels[label_base + lane], top_dist, top_label);
+  (void)node_heap_push(heap, &len, (NodeStackEntry){node_idx, bound});
+  while (len > 0 && !early_done(s)) {
+    NodeStackEntry e = node_heap_pop(heap, &len);
+    if (!can_still_improve(s, e.bound)) {
+      continue;
     }
-    remaining -= lane_count;
+
+    {
+      const KdNode *n = &nodes[e.idx];
+      if (n->left == LEAF_FLAG) {
+        for (uint32_t cid = n->chunk_start; cid < n->chunk_end; cid++) {
+          if (g_c_kd_prefetch_dist > 0) {
+            uint32_t target = cid + (uint32_t)g_c_kd_prefetch_dist;
+            if (target < n->chunk_end) {
+              __builtin_prefetch(&((const LeafVecChunk *)s->index->chunks)[target], 0, 3);
+              if (g_c_kd_prefetch_meta) {
+                __builtin_prefetch(&metas[target], 0, 3);
+              }
+            }
+          }
+
+          if (g_c_kd_pair_leaf && cid + 1 < n->chunk_end) {
+            int64_t dist0[LANES];
+            int64_t dist1[LANES];
+            chunk_distances_pair_madd(
+              s, &((const LeafVecChunk *)s->index->chunks)[cid],
+              &((const LeafVecChunk *)s->index->chunks)[cid + 1], dist0, dist1);
+            insert_chunk_distances(s, &metas[cid], dist0, LANES);
+            if (early_done(s)) {
+              return;
+            }
+            {
+              int lane_count1 = (cid + 2 == n->chunk_end) ? metas[cid + 1].len : LANES;
+              insert_chunk_distances(s, &metas[cid + 1], dist1, lane_count1);
+            }
+            if (early_done(s)) {
+              return;
+            }
+            cid++;
+            continue;
+          }
+
+          {
+            int lane_count = (cid + 1 == n->chunk_end) ? metas[cid].len : LANES;
+            scan_chunk(s, cid, lane_count);
+            if (early_done(s)) {
+              return;
+            }
+          }
+        }
+      } else {
+        uint32_t l = n->left;
+        uint32_t r = n->right;
+        int64_t dl = child_lb_from_parent(s, n, l, e.bound);
+        int64_t dr = child_lb_from_parent(s, n, r, e.bound);
+        if (can_still_improve(s, dl) && !node_heap_push(heap, &len, (NodeStackEntry){l, dl})) {
+          visit_node_dfs(s, l, dl);
+        }
+        if (early_done(s)) {
+          return;
+        }
+        if (can_still_improve(s, dr) && !node_heap_push(heap, &len, (NodeStackEntry){r, dr})) {
+          visit_node_dfs(s, r, dr);
+        }
+      }
+    }
   }
+}
+
+static void visit_node_bound(Search *s, uint32_t node_idx, int64_t bound) {
+  if (g_c_kd_best_first) {
+    visit_node_best_first(s, node_idx, bound);
+  } else {
+    visit_node_dfs(s, node_idx, bound);
+  }
+}
+
+static inline bool use_best_first_for_primary_key(uint32_t query_key) {
+  (void)query_key;
+  return g_c_kd_best_first;
+}
+
+static void visit_primary_node(Search *s, uint32_t node_idx, int64_t bound, uint32_t query_key) {
+  if (use_best_first_for_primary_key(query_key)) {
+    visit_node_best_first(s, node_idx, bound);
+  } else {
+    visit_node_dfs(s, node_idx, bound);
+  }
+}
+
+static inline bool partition_before(PartitionEntry a, PartitionEntry b) {
+  return a.bound < b.bound || (a.bound == b.bound && a.idx < b.idx);
+}
+
+static void sort_partition_entries(PartitionEntry *entries, size_t len) {
+  for (size_t i = 1; i < len; i++) {
+    PartitionEntry key = entries[i];
+    size_t j = i;
+    while (j > 0 && partition_before(key, entries[j - 1])) {
+      entries[j] = entries[j - 1];
+      j--;
+    }
+    entries[j] = key;
+  }
+}
+
+static int cmp_partition_entry_qsort(const void *a, const void *b) {
+  const PartitionEntry *x = (const PartitionEntry *)a;
+  const PartitionEntry *y = (const PartitionEntry *)b;
+  if (x->bound != y->bound) {
+    return (x->bound > y->bound) ? 1 : -1;
+  }
+  return (x->idx > y->idx) - (x->idx < y->idx);
+}
+
+static void visit_partitions(Search *s, uint32_t query_key) {
+  PartitionEntry entries[MAX_PARTITIONS];
+  size_t len = 0;
+  int32_t primary_idx = -1;
+  const KdPartition *partitions = (const KdPartition *)s->index->partitions;
+
+  if (g_c_kd_primary_map) {
+    primary_idx = (query_key < MAX_PARTITIONS) ? s->index->part_by_key[query_key] : -1;
+  } else {
+    for (size_t i = 0; i < s->index->partition_count; i++) {
+      if (partitions[i].key == query_key) {
+        primary_idx = (int32_t)i;
+        break;
+      }
+    }
+  }
+
+  if (primary_idx >= 0) {
+    const KdPartition *primary = &partitions[primary_idx];
+    int64_t primary_bound =
+      aabb_lower_bound_i64(s->query_q16, primary->aabb_min, primary->aabb_max);
+    if (can_still_improve(s, primary_bound)) {
+      visit_primary_node(s, primary->root, primary_bound, query_key);
+    }
+    if (early_done(s)) {
+      return;
+    }
+  }
+
+  for (size_t i = 0; i < s->index->partition_count; i++) {
+    if ((int32_t)i == primary_idx) {
+      continue;
+    }
+    {
+      const KdPartition *p = &partitions[i];
+      int64_t bound = aabb_lower_bound_i64(s->query_q16, p->aabb_min, p->aabb_max);
+      if (can_still_improve(s, bound)) {
+        entries[len++] = (PartitionEntry){bound, (uint32_t)i};
+      }
+    }
+  }
+
+  if (g_c_kd_inline_sort) {
+    sort_partition_entries(entries, len);
+  } else {
+    qsort(entries, len, sizeof(entries[0]), cmp_partition_entry_qsort);
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    if (!can_still_improve(s, entries[i].bound)) {
+      break;
+    }
+    if (g_c_kd_best_first_primary_only) {
+      visit_node_dfs(s, partitions[entries[i].idx].root, entries[i].bound);
+    } else {
+      visit_node_bound(s, partitions[entries[i].idx].root, entries[i].bound);
+    }
+    if (early_done(s)) {
+      break;
+    }
+  }
+}
+
+static uint8_t finalize_search(Search *s) {
+  uint8_t sum = 0;
+  for (int i = 0; i < X_SCORE_TOPK; i++) {
+    sum = (uint8_t)(sum + s->top_label[i]);
+  }
+  return sum;
+}
+
+static uint8_t kdtree_fraud_count(const XScoreIndexView *idx, const float query[X_SCORE_DIMS]) {
+  int32_t q[X_SCORE_DIMS];
+  int16_t qi16[PACKED_DIMENSIONS] = {0};
+  Search s;
+  memset(&s, 0, sizeof(s));
+  s.index = idx;
+  s.query_q = q;
+  s.query_q16 = qi16;
+
+  if (g_c_quant_once) {
+    for (int d = 0; d < X_SCORE_DIMS; d++) {
+      int32_t qd = q_i32(query[d]);
+      q[d] = qd;
+      if (qd < INT16_MIN) {
+        qd = INT16_MIN;
+      }
+      if (qd > INT16_MAX) {
+        qd = INT16_MAX;
+      }
+      qi16[d] = (int16_t)qd;
+    }
+  } else {
+    for (int d = 0; d < X_SCORE_DIMS; d++) {
+      q[d] = q_i32(query[d]);
+      qi16[d] = q_i16(query[d]);
+    }
+  }
+
+#if defined(__AVX2__)
+  for (int p = 0; p < DIM_PAIRS; p++) {
+    int32_t packed =
+      (int32_t)((uint16_t)qi16[2 * p] | ((uint32_t)(uint16_t)qi16[2 * p + 1] << 16));
+    s.query_pairs[p] = _mm256_set1_epi32(packed);
+  }
+#endif
+
+  for (int i = 0; i < X_SCORE_TOPK; i++) {
+    s.top_dist[i] = INT64_MAX;
+    s.top_indices[i] = UINT32_MAX;
+    s.top_label[i] = 0;
+  }
+
+  visit_partitions(&s, partition_key_i16(qi16));
+  return finalize_search(&s);
 }
 
 bool x_score_open(const char *path, XScoreIndexView *out_view) {
-  if (!path || !out_view) {
+  char refs_path[512];
+  char tree_path[512];
+  struct stat refs_st;
+  struct stat tree_st;
+  int refs_fd = -1;
+  int tree_fd = -1;
+  uint8_t *refs_raw = NULL;
+  uint8_t *tree_raw = NULL;
+  FilePartition *fparts = NULL;
+  FileNode *fnodes = NULL;
+  uint32_t *members = NULL;
+  KdNode *nodes = NULL;
+  uint32_t *slot = NULL;
+  uint32_t *leaf_node_by_ref = NULL;
+  uint8_t *node_masks = NULL;
+  uint8_t *chunk_lens = NULL;
+  LeafVecChunk *chunks = NULL;
+  LeafMeta *metas = NULL;
+  KdPartition *parts = NULL;
+  size_t chunk_count = 0;
+
+  if (path == NULL || out_view == NULL) {
     return false;
   }
 
   memset(out_view, 0, sizeof(*out_view));
-
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) {
-    return false;
+  for (int i = 0; i < MAX_PARTITIONS; i++) {
+    out_view->part_by_key[i] = -1;
   }
 
-  struct stat st;
-  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-    close(fd);
-    return false;
+  derive_resource_paths(path, refs_path, sizeof(refs_path), tree_path, sizeof(tree_path));
+
+  refs_fd = open(refs_path, O_RDONLY);
+  if (refs_fd < 0) {
+    goto fail;
+  }
+  tree_fd = open(tree_path, O_RDONLY);
+  if (tree_fd < 0) {
+    goto fail;
+  }
+  if (fstat(refs_fd, &refs_st) != 0 || refs_st.st_size <= 0) {
+    goto fail;
+  }
+  if (fstat(tree_fd, &tree_st) != 0 || tree_st.st_size <= 0) {
+    goto fail;
   }
 
-  size_t size = (size_t)st.st_size;
-  uint8_t *raw = (uint8_t *)mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-  close(fd);
-  if (raw == MAP_FAILED) {
-    return false;
+  refs_raw = (uint8_t *)mmap(NULL, (size_t)refs_st.st_size, PROT_READ, MAP_SHARED, refs_fd, 0);
+  tree_raw = (uint8_t *)mmap(NULL, (size_t)tree_st.st_size, PROT_READ, MAP_SHARED, tree_fd, 0);
+  close(refs_fd);
+  close(tree_fd);
+  refs_fd = -1;
+  tree_fd = -1;
+  if (refs_raw == MAP_FAILED || tree_raw == MAP_FAILED) {
+    goto fail;
   }
 
-  if (size < sizeof(XScoreIndexHeader)) {
-    munmap(raw, size);
-    return false;
+  if ((size_t)tree_st.st_size < 28 || memcmp(tree_raw, "RKDT", 4) != 0) {
+    goto fail;
   }
-
-  const XScoreIndexHeader *header = (const XScoreIndexHeader *)raw;
-  if (memcmp(header->magic, X_SCORE_MAGIC, 8) != 0) {
-    munmap(raw, size);
-    return false;
+  if (le32(tree_raw + 4) != 2) {
+    goto fail;
   }
-  if (header->scale != X_SCORE_SCALE || header->dims != X_SCORE_DIMS) {
-    munmap(raw, size);
-    return false;
-  }
-  if (header->count < 0 || header->partition_count < 0 || header->node_count < 0 ||
-      header->block_count < 0) {
-    munmap(raw, size);
-    return false;
-  }
-
-  uint32_t count = (uint32_t)header->count;
-  uint32_t partition_count = (uint32_t)header->partition_count;
-  uint32_t node_count = (uint32_t)header->node_count;
-  uint32_t block_count = (uint32_t)header->block_count;
-
-  size_t offset = sizeof(XScoreIndexHeader);
-  size_t partitions_bytes = (size_t)partition_count * sizeof(XScorePartitionEntry);
-  size_t nodes_bytes = (size_t)node_count * sizeof(XScoreNodeEntry);
-  size_t vectors_len = (size_t)block_count * X_SCORE_DIMS * X_SCORE_LANES;
-  size_t vectors_bytes = vectors_len * sizeof(int16_t);
-  size_t labels_bytes = (size_t)block_count * X_SCORE_LANES;
-
-  if (offset + partitions_bytes > size) {
-    munmap(raw, size);
-    return false;
-  }
-  const XScorePartitionEntry *partitions = (const XScorePartitionEntry *)(raw + offset);
-  offset += partitions_bytes;
-
-  if (offset + nodes_bytes > size) {
-    munmap(raw, size);
-    return false;
-  }
-  const XScoreNodeEntry *nodes = (const XScoreNodeEntry *)(raw + offset);
-  offset += nodes_bytes;
-  size_t vectors_off = offset;
-
-  if (offset + vectors_bytes > size) {
-    munmap(raw, size);
-    return false;
-  }
-  const int16_t *vectors_q16 = (const int16_t *)(raw + offset);
-  offset += vectors_bytes;
-
-  if (offset + labels_bytes > size) {
-    munmap(raw, size);
-    return false;
-  }
-  const uint8_t *labels = (const uint8_t *)(raw + offset);
-  size_t labels_end = offset + labels_bytes;
-
-  if ((size_t)count > labels_bytes) {
-    munmap(raw, size);
-    return false;
-  }
-
-  uint32_t *key_partition_indices = NULL;
-  if (partition_count > 0) {
-    key_partition_indices = (uint32_t *)malloc((size_t)partition_count * sizeof(uint32_t));
-    if (key_partition_indices == NULL) {
-      munmap(raw, size);
-      return false;
-    }
-  }
-
-  uint32_t key_counts[256];
-  memset(key_counts, 0, sizeof(key_counts));
-  for (uint32_t i = 0; i < partition_count; i++) {
-    uint32_t key = partitions[i].key & 255u;
-    key_counts[key]++;
-  }
-
-  uint32_t running = 0;
-  for (uint32_t k = 0; k < 256; k++) {
-    out_view->key_partition_offsets[k] = running;
-    out_view->key_partition_direct[k] = -1;
-    running += key_counts[k];
-  }
-  out_view->key_partition_offsets[256] = running;
-
-  uint32_t key_pos[256];
-  memcpy(key_pos, out_view->key_partition_offsets, sizeof(key_pos));
-  for (uint32_t i = 0; i < partition_count; i++) {
-    uint32_t key = partitions[i].key & 255u;
-    key_partition_indices[key_pos[key]++] = i;
-
-    if (out_view->key_partition_direct[key] == -1) {
-      out_view->key_partition_direct[key] = (int32_t)i;
-    } else {
-      out_view->key_partition_direct[key] = -2;
-    }
-  }
-
-  out_view->raw = raw;
-  out_view->size = size;
-  out_view->mapped = 1;
-  out_view->header = header;
-  out_view->partitions = partitions;
-  out_view->nodes = nodes;
-  out_view->vectors_q16 = vectors_q16;
-  out_view->labels = labels;
-  out_view->key_partition_indices = key_partition_indices;
-  out_view->count = count;
-  out_view->partition_count = partition_count;
-  out_view->node_count = node_count;
-  out_view->block_count = block_count;
-
-  // Build per-partition block groups for tighter lower-bound pruning in large
-  // leaf partitions.
-  if (partition_count > 0 && nodes != NULL) {
-    bool valid_leaf_layout = true;
-    uint32_t total_groups = 0;
-    uint32_t max_groups = 0;
-
-    for (uint32_t i = 0; i < partition_count; i++) {
-      int32_t root = partitions[i].root;
-      if (root < 0 || (uint32_t)root >= node_count) {
-        valid_leaf_layout = false;
-        break;
-      }
-
-      const XScoreNodeEntry *node = &nodes[(uint32_t)root];
-      if (node->left >= 0 || node->right >= 0 || node->start_block < 0 || node->len <= 0) {
-        valid_leaf_layout = false;
-        break;
-      }
-
-      uint32_t start_block = (uint32_t)node->start_block;
-      uint32_t len = (uint32_t)node->len;
-      uint32_t blocks = (len + X_SCORE_LANES - 1U) / X_SCORE_LANES;
-      if ((size_t)start_block + (size_t)blocks > (size_t)block_count) {
-        valid_leaf_layout = false;
-        break;
-      }
-
-      uint32_t groups = (blocks + X_SCORE_GROUP_BLOCKS - 1U) / X_SCORE_GROUP_BLOCKS;
-      total_groups += groups;
-      if (groups > max_groups) {
-        max_groups = groups;
-      }
-    }
-
-    if (valid_leaf_layout && total_groups > 0) {
-      uint32_t *partition_start_blocks =
-        (uint32_t *)malloc((size_t)partition_count * sizeof(uint32_t));
-      uint32_t *partition_lens = (uint32_t *)malloc((size_t)partition_count * sizeof(uint32_t));
-      uint32_t *partition_group_offsets =
-        (uint32_t *)malloc((size_t)(partition_count + 1U) * sizeof(uint32_t));
-      XScoreBlockGroup *groups = (XScoreBlockGroup *)malloc((size_t)total_groups * sizeof(*groups));
-
-      if (partition_start_blocks != NULL && partition_lens != NULL &&
-          partition_group_offsets != NULL && groups != NULL) {
-        uint32_t gcursor = 0;
-        for (uint32_t i = 0; i < partition_count; i++) {
-          int32_t root = partitions[i].root;
-          const XScoreNodeEntry *node = &nodes[(uint32_t)root];
-          uint32_t start_block = (uint32_t)node->start_block;
-          uint32_t len = (uint32_t)node->len;
-          uint32_t blocks = (len + X_SCORE_LANES - 1U) / X_SCORE_LANES;
-          uint32_t group_count = (blocks + X_SCORE_GROUP_BLOCKS - 1U) / X_SCORE_GROUP_BLOCKS;
-
-          partition_start_blocks[i] = start_block;
-          partition_lens[i] = len;
-          partition_group_offsets[i] = gcursor;
-
-          for (uint32_t g = 0; g < group_count; g++) {
-            uint32_t rel_block = g * X_SCORE_GROUP_BLOCKS;
-            uint32_t gblocks = blocks - rel_block;
-            if (gblocks > X_SCORE_GROUP_BLOCKS) {
-              gblocks = X_SCORE_GROUP_BLOCKS;
-            }
-
-            uint32_t consumed = rel_block * X_SCORE_LANES;
-            uint32_t glen = len - consumed;
-            uint32_t max_len = gblocks * X_SCORE_LANES;
-            if (glen > max_len) {
-              glen = max_len;
-            }
-
-            XScoreBlockGroup *grp = &groups[gcursor++];
-            grp->start_block = start_block + rel_block;
-            grp->block_count = (uint16_t)gblocks;
-            grp->len = (uint16_t)glen;
-          }
-        }
-        partition_group_offsets[partition_count] = gcursor;
-
-        out_view->partition_start_blocks = partition_start_blocks;
-        out_view->partition_lens = partition_lens;
-        out_view->partition_group_offsets = partition_group_offsets;
-        out_view->groups = groups;
-        out_view->total_groups = gcursor;
-        out_view->max_groups_per_partition = max_groups;
-        out_view->direct_leaf_mode = 1;
-      } else {
-        free(partition_start_blocks);
-        free(partition_lens);
-        free(partition_group_offsets);
-        free(groups);
-      }
-    }
-  }
-
-  (void)vectors_off;
-  (void)labels_end;
-
-#ifdef MADV_HUGEPAGE
-  (void)madvise(raw + vectors_off, labels_end - vectors_off, MADV_HUGEPAGE);
-#endif
-#ifdef MADV_WILLNEED
-  (void)madvise(raw + vectors_off, labels_end - vectors_off, MADV_WILLNEED);
-#endif
-
-  // Pre-fault mapped pages to reduce first-request latency variance.
   {
-    volatile uint8_t sink = 0;
-    size_t i = 0;
-    for (i = 0; i < size; i += 4096) {
-      sink ^= raw[i];
+    uint32_t count = le32(tree_raw + 8);
+    uint32_t dim = le32(tree_raw + 12);
+    uint32_t n_nodes = le32(tree_raw + 16);
+    uint32_t n_parts = le32(tree_raw + 24);
+    size_t offset = 28;
+
+    if (dim != X_SCORE_DIMS || n_parts > MAX_PARTITIONS) {
+      goto fail;
     }
-    sink ^= raw[size - 1];
-    (void)sink;
+    if (memcmp(refs_raw, "RINH", 4) != 0 || le32(refs_raw + 4) != 3 || le32(refs_raw + 8) != count) {
+      goto fail;
+    }
+
+    if (offset + (size_t)n_parts * FILE_PARTITION_BYTES > (size_t)tree_st.st_size) {
+      goto fail;
+    }
+    fparts = (FilePartition *)xmalloc((size_t)n_parts * sizeof(FilePartition));
+    for (uint32_t i = 0; i < n_parts; i++) {
+      fparts[i] = decode_partition(tree_raw + offset + (size_t)i * FILE_PARTITION_BYTES);
+    }
+    offset += (size_t)n_parts * FILE_PARTITION_BYTES;
+
+    if (offset + (size_t)n_nodes * FILE_NODE_BYTES > (size_t)tree_st.st_size) {
+      goto fail;
+    }
+    fnodes = (FileNode *)xmalloc((size_t)n_nodes * sizeof(FileNode));
+    for (uint32_t i = 0; i < n_nodes; i++) {
+      fnodes[i] = decode_node(tree_raw + offset + (size_t)i * FILE_NODE_BYTES);
+    }
+    offset += (size_t)n_nodes * FILE_NODE_BYTES;
+
+    if (offset + (size_t)count * sizeof(uint32_t) > (size_t)tree_st.st_size) {
+      goto fail;
+    }
+    members = (uint32_t *)xmalloc((size_t)count * sizeof(uint32_t));
+    memcpy(members, tree_raw + offset, (size_t)count * sizeof(uint32_t));
+
+    nodes = (KdNode *)hot_alloc((size_t)n_nodes * sizeof(KdNode));
+    slot = (uint32_t *)xmalloc((size_t)count * sizeof(uint32_t));
+    leaf_node_by_ref = (uint32_t *)xmalloc((size_t)count * sizeof(uint32_t));
+    node_masks = (uint8_t *)xmalloc((size_t)n_nodes);
+    memset(slot, 0xff, (size_t)count * sizeof(uint32_t));
+    memset(leaf_node_by_ref, 0xff, (size_t)count * sizeof(uint32_t));
+    memset(node_masks, 0, (size_t)n_nodes);
+    chunk_lens = (uint8_t *)xmalloc((size_t)count);
+
+    for (uint32_t i = 0; i < n_nodes; i++) {
+      FileNode *f = &fnodes[i];
+      KdNode *n = &nodes[i];
+      memcpy(n->aabb_min, f->aabb_min, sizeof(f->aabb_min));
+      memcpy(n->aabb_max, f->aabb_max, sizeof(f->aabb_max));
+      n->aabb_min[14] = 0;
+      n->aabb_min[15] = 0;
+      n->aabb_max[14] = 0;
+      n->aabb_max[15] = 0;
+      n->left = f->left;
+      n->right = f->right;
+      n->chunk_start = 0;
+      n->chunk_end = 0;
+      n->parent_diff_mask = 0;
+      n->label_mask = 0;
+
+      if (f->left == LEAF_FLAG) {
+        size_t member_start = f->right;
+        size_t cnt = f->count;
+        size_t n_chunks = (cnt + LANES - 1U) / LANES;
+        size_t chunk_start = chunk_count;
+
+        for (size_t ci = 0; ci < n_chunks; ci++) {
+          size_t take = cnt - ci * LANES;
+          if (take > LANES) {
+            take = LANES;
+          }
+          chunk_lens[chunk_count++] = (uint8_t)take;
+        }
+
+        for (size_t j = 0; j < cnt; j++) {
+          uint32_t ref_idx = members[member_start + j];
+          uint32_t chunk_id = (uint32_t)(chunk_start + j / LANES);
+          uint32_t lane = (uint32_t)(j % LANES);
+          slot[ref_idx] = (chunk_id << 3) | lane;
+          leaf_node_by_ref[ref_idx] = i;
+        }
+
+        n->right = 0;
+        n->chunk_start = (uint32_t)chunk_start;
+        n->chunk_end = (uint32_t)chunk_count;
+      }
+    }
+
+    for (uint32_t i = 0; i < n_nodes; i++) {
+      KdNode *n = &nodes[i];
+      if (n->left == LEAF_FLAG) {
+        continue;
+      }
+      {
+        uint32_t child_ids[2] = {n->left, n->right};
+        for (int ci = 0; ci < 2; ci++) {
+          KdNode *child = &nodes[child_ids[ci]];
+          uint16_t mask = 0;
+          for (int d = 0; d < X_SCORE_DIMS; d++) {
+            if (child->aabb_min[d] != n->aabb_min[d] || child->aabb_max[d] != n->aabb_max[d]) {
+              mask |= (uint16_t)(1u << d);
+            }
+          }
+          child->parent_diff_mask = mask;
+        }
+      }
+    }
+
+    chunks = (LeafVecChunk *)hot_alloc(chunk_count * sizeof(LeafVecChunk));
+    metas = (LeafMeta *)hot_alloc(chunk_count * sizeof(LeafMeta));
+    memset(chunks, 0, chunk_count * sizeof(LeafVecChunk));
+    memset(metas, 0, chunk_count * sizeof(LeafMeta));
+    for (size_t i = 0; i < chunk_count; i++) {
+      metas[i].len = chunk_lens[i];
+    }
+
+    if ((size_t)refs_st.st_size < 12 + (size_t)count * REFS_RECORD_BYTES) {
+      goto fail;
+    }
+    {
+      const uint8_t *rec = refs_raw + 12;
+      for (uint32_t ref_idx = 0; ref_idx < count; ref_idx++, rec += REFS_RECORD_BYTES) {
+        uint32_t packed = slot[ref_idx];
+        LeafVecChunk *c = &chunks[packed >> 3];
+        LeafMeta *m = &metas[packed >> 3];
+        int lane = (int)(packed & 7);
+        for (int d = 0; d < X_SCORE_DIMS; d++) {
+          c->pairs[d >> 1][(lane << 1) | (d & 1)] = (int16_t)le16s(rec + d * 2);
+        }
+        m->labels[lane] = rec[X_SCORE_DIMS * 2];
+        m->ref_indices[lane] = ref_idx;
+        node_masks[leaf_node_by_ref[ref_idx]] |= (uint8_t)(1u << m->labels[lane]);
+      }
+    }
+
+    for (int64_t i = (int64_t)n_nodes - 1; i >= 0; i--) {
+      KdNode *n = &nodes[i];
+      if (n->left == LEAF_FLAG) {
+        n->label_mask = node_masks[i];
+      } else {
+        n->label_mask = (uint8_t)(nodes[n->left].label_mask | nodes[n->right].label_mask);
+      }
+    }
+
+    parts = (KdPartition *)hot_alloc((size_t)n_parts * sizeof(KdPartition));
+    for (uint32_t i = 0; i < n_parts; i++) {
+      parts[i].key = fparts[i].key;
+      parts[i].root = fparts[i].root;
+      memcpy(parts[i].aabb_min, fparts[i].aabb_min, sizeof(fparts[i].aabb_min));
+      memcpy(parts[i].aabb_max, fparts[i].aabb_max, sizeof(fparts[i].aabb_max));
+      parts[i].aabb_min[14] = 0;
+      parts[i].aabb_min[15] = 0;
+      parts[i].aabb_max[14] = 0;
+      parts[i].aabb_max[15] = 0;
+      if (parts[i].key < MAX_PARTITIONS) {
+        out_view->part_by_key[parts[i].key] = (int32_t)i;
+      }
+    }
+
+    out_view->refs_raw = refs_raw;
+    out_view->refs_size = (size_t)refs_st.st_size;
+    out_view->tree_raw = tree_raw;
+    out_view->tree_size = (size_t)tree_st.st_size;
+    out_view->mapped = 1;
+    out_view->nodes = nodes;
+    out_view->node_count = n_nodes;
+    out_view->partitions = parts;
+    out_view->partition_count = n_parts;
+    out_view->chunks = chunks;
+    out_view->metas = metas;
+    out_view->chunk_count = chunk_count;
+    out_view->count = count;
+
+    hot_prefetch(nodes, (size_t)n_nodes * sizeof(KdNode));
+    hot_prefetch(parts, (size_t)n_parts * sizeof(KdPartition));
+    hot_prefetch(chunks, chunk_count * sizeof(LeafVecChunk));
   }
 
+  free(fparts);
+  free(fnodes);
+  free(members);
+  free(slot);
+  free(leaf_node_by_ref);
+  free(node_masks);
+  free(chunk_lens);
   return true;
+
+fail:
+  free(fparts);
+  free(fnodes);
+  free(members);
+  free(slot);
+  free(leaf_node_by_ref);
+  free(node_masks);
+  free(chunk_lens);
+  free(nodes);
+  free(parts);
+  free(chunks);
+  free(metas);
+  if (refs_fd >= 0) {
+    close(refs_fd);
+  }
+  if (tree_fd >= 0) {
+    close(tree_fd);
+  }
+  if (refs_raw != NULL && refs_raw != MAP_FAILED) {
+    munmap(refs_raw, (size_t)refs_st.st_size);
+  }
+  if (tree_raw != NULL && tree_raw != MAP_FAILED) {
+    munmap(tree_raw, (size_t)tree_st.st_size);
+  }
+  memset(out_view, 0, sizeof(*out_view));
+  for (int i = 0; i < MAX_PARTITIONS; i++) {
+    out_view->part_by_key[i] = -1;
+  }
+  return false;
 }
 
 void x_score_close(XScoreIndexView *view) {
-  if (!view) {
+  if (view == NULL) {
     return;
   }
 
-  free(view->groups);
-  free(view->partition_group_offsets);
-  free(view->partition_lens);
-  free(view->partition_start_blocks);
-  free(view->key_partition_indices);
+  free(view->nodes);
+  free(view->partitions);
+  free(view->chunks);
+  free(view->metas);
 
-  if (view->mapped && view->raw && view->size > 0) {
-    munmap(view->raw, view->size);
+  if (view->mapped) {
+    if (view->refs_raw != NULL && view->refs_size > 0) {
+      munmap(view->refs_raw, view->refs_size);
+    }
+    if (view->tree_raw != NULL && view->tree_size > 0) {
+      munmap(view->tree_raw, view->tree_size);
+    }
   }
 
   memset(view, 0, sizeof(*view));
 }
 
 uint8_t x_score_predict_fraud_count(const XScoreIndexView *view, const double query[X_SCORE_DIMS]) {
-  uint8_t fraud_count = 0;
-
-  if (!view || !query || !view->header || !view->vectors_q16 || !view->labels) {
-    return 0;
+  float qf[X_SCORE_DIMS];
+  for (int i = 0; i < X_SCORE_DIMS; i++) {
+    qf[i] = (float)query[i];
   }
-  if (view->count == 0) {
-    return 0;
-  }
-
-  XScoreQueryContext qctx;
-  prepare_query_context(query, &qctx);
-
-  unsigned long long top_dist[X_SCORE_TOPK];
-  uint8_t top_label[X_SCORE_TOPK];
-  for (int i = 0; i < X_SCORE_TOPK; i++) {
-    top_dist[i] = ULLONG_MAX;
-    top_label[i] = 0;
-  }
-
-  if (view->partition_count == 0 || !view->partitions || !view->key_partition_indices ||
-      view->partition_count > 256U) {
-    search_exact(view, &qctx, top_dist, top_label);
-  } else if (view->direct_leaf_mode && view->partition_start_blocks && view->partition_lens &&
-             view->partition_group_offsets && view->groups) {
-    uint32_t qkey = compute_partition_key(qctx.q) & 255u;
-    int32_t direct = view->key_partition_direct[qkey];
-
-    if (direct >= 0) {
-      (void)scan_partition_grouped(view, (uint32_t)direct, &qctx, top_dist, top_label);
-    } else {
-      uint32_t begin = view->key_partition_offsets[qkey];
-      uint32_t end = view->key_partition_offsets[qkey + 1];
-      for (uint32_t pos = begin; pos < end && !early_done(top_dist); pos++) {
-        uint32_t pidx = view->key_partition_indices[pos];
-        (void)scan_partition_grouped(view, pidx, &qctx, top_dist, top_label);
-      }
-    }
-
-    PartitionCandidate entries[256];
-    uint32_t entry_len = 0;
-    unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
-
-    for (uint32_t i = 0; i < view->partition_count && !early_done(top_dist); i++) {
-      const XScorePartitionEntry *p = &view->partitions[i];
-      if ((p->key & 255u) == qkey) {
-        continue;
-      }
-      unsigned long long bound = lower_bound_partition_sq_cutoff(qctx.q, p, cutoff);
-      if (bound < cutoff) {
-        insert_partition_candidate_sorted(entries, &entry_len, bound, i);
-      }
-    }
-
-    for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
-      if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
-        break;
-      }
-      (void)scan_partition_grouped(view, entries[i].index, &qctx, top_dist, top_label);
-    }
-  } else if (view->nodes) {
-    uint32_t qkey = compute_partition_key(qctx.q) & 255u;
-    int32_t direct = view->key_partition_direct[qkey];
-
-    if (direct >= 0) {
-      const XScorePartitionEntry *p = &view->partitions[(uint32_t)direct];
-      if (p->root >= 0) {
-        (void)search_node_iterative(view, (uint32_t)p->root, 0, &qctx, top_dist, top_label);
-      }
-    } else {
-      uint32_t begin = view->key_partition_offsets[qkey];
-      uint32_t end = view->key_partition_offsets[qkey + 1];
-      for (uint32_t pos = begin; pos < end && !early_done(top_dist); pos++) {
-        uint32_t pidx = view->key_partition_indices[pos];
-        const XScorePartitionEntry *p = &view->partitions[pidx];
-        if (p->root < 0) {
-          continue;
-        }
-        (void)search_node_iterative(view, (uint32_t)p->root, 0, &qctx, top_dist, top_label);
-      }
-    }
-
-    PartitionCandidate entries[256];
-    uint32_t entry_len = 0;
-    unsigned long long cutoff = top_dist[X_SCORE_TOPK - 1];
-
-    for (uint32_t i = 0; i < view->partition_count && !early_done(top_dist); i++) {
-      const XScorePartitionEntry *p = &view->partitions[i];
-      if ((p->key & 255u) == qkey) {
-        continue;
-      }
-      unsigned long long bound = lower_bound_partition_sq_cutoff(qctx.q, p, cutoff);
-      if (bound < cutoff && p->root >= 0) {
-        insert_partition_candidate_sorted(entries, &entry_len, bound, i);
-      }
-    }
-
-    for (uint32_t i = 0; i < entry_len && !early_done(top_dist); i++) {
-      if (entries[i].bound >= top_dist[X_SCORE_TOPK - 1]) {
-        break;
-      }
-      const XScorePartitionEntry *p = &view->partitions[entries[i].index];
-      (void)search_node_iterative(view, (uint32_t)p->root, entries[i].bound, &qctx, top_dist,
-                                  top_label);
-    }
-  } else {
-    search_exact(view, &qctx, top_dist, top_label);
-  }
-
-  for (int i = 0; i < X_SCORE_TOPK; i++) {
-    if (top_dist[i] == ULLONG_MAX) {
-      continue;
-    }
-    if (top_label[i] == 1) {
-      fraud_count++;
-    }
-  }
-
-  return fraud_count;
+  return kdtree_fraud_count(view, qf);
 }
 
 uint8_t x_score_predict_label(const XScoreIndexView *view, const double query[X_SCORE_DIMS]) {
