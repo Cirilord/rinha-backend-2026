@@ -171,7 +171,6 @@ static void set_quickack(int fd) {
 #endif
 }
 
-#ifdef __linux__
 static int getenv_int(const char *name, int fallback) {
   const char *value = getenv(name);
   if (!value || !*value) {
@@ -197,6 +196,7 @@ static unsigned long iow(unsigned int ty, unsigned int nr, unsigned int size) {
 }
 
 static void configure_busy_poll(int epoll_fd) {
+#ifdef __linux__
   struct epoll_params params;
   memset(&params, 0, sizeof(params));
   params.busy_poll_usecs = (uint32_t)getenv_int("EPOLL_BUSY_POLL_US", 100);
@@ -208,9 +208,13 @@ static void configure_busy_poll(int epoll_fd) {
 
   unsigned long ep_iocsparams = iow(0x8A, 0x01, (unsigned int)sizeof(params));
   ioctl(epoll_fd, ep_iocsparams, &params);
+#else
+  (void)epoll_fd;
+#endif
 }
 
 static int wait_events(int epoll_fd, struct epoll_event *events, int max_events) {
+#ifdef __linux__
   long spin_us = getenv_long("EPOLL_SPIN_US", 0);
   int timeout_ms = getenv_int("EPOLL_TIMEOUT_MS", 1);
 
@@ -255,14 +259,10 @@ static int wait_events(int epoll_fd, struct epoll_event *events, int max_events)
 #endif
 
   return epoll_wait(epoll_fd, events, max_events, timeout_ms);
-}
 #else
-static void configure_busy_poll(int epoll_fd) { (void)epoll_fd; }
-
-static int wait_events(int epoll_fd, struct epoll_event *events, int max_events) {
   return epoll_wait(epoll_fd, events, max_events, -1);
-}
 #endif
+}
 
 static ssize_t find_double_crlf(const uint8_t *buf, size_t len) {
   if (len < 4) {
