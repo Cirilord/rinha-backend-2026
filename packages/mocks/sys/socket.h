@@ -70,6 +70,10 @@ struct cmsghdr {
 #define SO_RCVBUF 0x1002
 #endif
 
+#ifndef SO_BUSY_POLL
+#define SO_BUSY_POLL 46
+#endif
+
 #ifndef SOCK_STREAM
 #define SOCK_STREAM 1
 #endif

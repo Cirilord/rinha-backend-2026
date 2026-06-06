@@ -148,6 +148,7 @@ enum {
 };
 
 static XScoreIndexView xscore;
+static int socket_busy_poll_cached = -1;
 
 static int set_nonblocking(int fd) {
 #ifdef __linux__
@@ -189,6 +190,23 @@ static long getenv_long(const char *name, long fallback) {
 
   long parsed = strtol(value, NULL, 10);
   return parsed >= 0 ? parsed : fallback;
+}
+
+static void set_busy_poll(int fd) {
+#ifdef __linux__
+#ifndef SO_BUSY_POLL
+#define SO_BUSY_POLL 46
+#endif
+  if (socket_busy_poll_cached < 0) {
+    socket_busy_poll_cached = getenv_int("SO_BUSY_POLL_US", 64);
+  }
+  if (socket_busy_poll_cached > 0) {
+    setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &socket_busy_poll_cached,
+               sizeof(socket_busy_poll_cached));
+  }
+#else
+  (void)fd;
+#endif
 }
 
 static unsigned long iow(unsigned int ty, unsigned int nr, unsigned int size) {
@@ -418,6 +436,7 @@ static int register_client(struct worker_ctx *worker, int client_fd) {
   worker->clients[index].fd = client_fd;
   reset_client(&worker->clients[index]);
   set_quickack(client_fd);
+  set_busy_poll(client_fd);
 
   struct epoll_event event;
   memset(&event, 0, sizeof(event));
@@ -937,6 +956,7 @@ int main(int argc, char **argv) {
   if (set_nonblocking(control_fd) < 0) {
     fatal("set_nonblocking");
   }
+  set_busy_poll(control_fd);
   {
     int buf = 256 * 1024;
     setsockopt(control_fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));

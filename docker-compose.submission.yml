@@ -9,7 +9,7 @@ services:
       - api2
     ports:
       - "9999:9999"
-    cpus: 0.2
+    cpus: 0.12
     mem_limit: 20m
     environment:
       UPSTREAM_SOCKETS: "/tmp/server-1.sock,/tmp/server-2.sock"
@@ -29,13 +29,13 @@ services:
     platform: linux/amd64
     image: __API_IMAGE__
     command: ["/tmp/server-1.sock"]
-    cpus: 0.4
+    cpus: 0.44
     mem_limit: 165m
     environment:
       CONN_POOL_CAP: "512"
       EPOLL_SPIN_US: "0"
       EPOLL_IDLE_US: "60"
-      EPOLL_BUSY_POLL_US: "100"
+      EPOLL_BUSY_POLL_US: "150"
       EPOLL_BUSY_POLL_BUDGET: "8"
       EPOLL_PREFER_BUSY_POLL: "1"
     logging:
@@ -57,13 +57,13 @@ services:
     platform: linux/amd64
     image: __API_IMAGE__
     command: ["/tmp/server-2.sock"]
-    cpus: 0.4
+    cpus: 0.44
     mem_limit: 165m
     environment:
       CONN_POOL_CAP: "512"
       EPOLL_SPIN_US: "0"
       EPOLL_IDLE_US: "60"
-      EPOLL_BUSY_POLL_US: "100"
+      EPOLL_BUSY_POLL_US: "150"
       EPOLL_BUSY_POLL_BUDGET: "8"
       EPOLL_PREFER_BUSY_POLL: "1"
     logging:
