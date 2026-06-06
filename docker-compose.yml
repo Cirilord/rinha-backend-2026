@@ -3,13 +3,13 @@ name: rinha-backend
 services:
   load-balancer:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-d42d53a36f6ba8bba33de7c4138537c8b3b42bed
+    image: ghcr.io/cirilord/rinha-backend-2026-lb:sha-2a7c3fa04f88d35ee3c5379827407f088f7b15ab
     depends_on:
       - api1
       - api2
     ports:
       - "9999:9999"
-    cpus: 0.16
+    cpus: 0.12
     mem_limit: 20m
     environment:
       UPSTREAM_SOCKETS: "/tmp/server-1.sock,/tmp/server-2.sock"
@@ -27,9 +27,9 @@ services:
 
   api1:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-d42d53a36f6ba8bba33de7c4138537c8b3b42bed
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2a7c3fa04f88d35ee3c5379827407f088f7b15ab
     command: ["/tmp/server-1.sock"]
-    cpus: 0.42
+    cpus: 0.44
     mem_limit: 165m
     environment:
       CONN_POOL_CAP: "512"
@@ -55,9 +55,9 @@ services:
 
   api2:
     platform: linux/amd64
-    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-d42d53a36f6ba8bba33de7c4138537c8b3b42bed
+    image: ghcr.io/cirilord/rinha-backend-2026-api:sha-2a7c3fa04f88d35ee3c5379827407f088f7b15ab
     command: ["/tmp/server-2.sock"]
-    cpus: 0.42
+    cpus: 0.44
     mem_limit: 165m
     environment:
       CONN_POOL_CAP: "512"
