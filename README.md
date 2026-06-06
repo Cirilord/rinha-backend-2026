@@ -1,382 +1,305 @@
-# rinha-backend
+# rinha-backend-2026
 
-High-performance C implementation for **Rinha de Backend 2026**, using:
-- a custom TCP load balancer
-- two API instances
-- Unix socket FD passing (`SCM_RIGHTS`) between LB and APIs
-- a prebuilt binary index for fraud scoring
+`C` implementation of a backend with:
 
-## 1. Architecture
+- a TCP `load-balancer`
+- an HTTP `server`
+- connection handoff via `SCM_RIGHTS`
+- vector search over a custom index
+- a strong focus on low latency and high Rinha score
 
-### Services
-- `load-balancer`
-  - Listens on `:9999`
-  - Accepts TCP connections
-  - Forwards accepted client FDs to API instances via `sendmsg(..., SCM_RIGHTS)`
-- `api1`, `api2`
-  - Listen on Unix sockets (`/shared/api1.sock`, `/shared/api2.sock`)
-  - Receive forwarded client FDs from the LB
-  - Parse HTTP request and return scoring result
+## Overview
 
-### FD Passing Flow
-1. LB accepts TCP client.
-2. LB sends client FD to one API (round-robin).
-3. API reads request directly from received FD.
-4. API writes HTTP response to same FD and closes it.
+The project is split into two binaries:
 
-This avoids extra TCP hops between LB and API.
+- `apps/load-balancer`
+  accepts HTTP connections on `:9999` and forwards sockets to the API instances
+- `apps/server`
+  receives sockets through a Unix Domain Socket, handles `GET /ready` and `POST /fraud-score`, runs the index search, and returns a prebuilt response
 
-## 2. Strategy Used in Each App
+The system runs with:
 
-### `apps/load-balancer`
-- **Round-robin dispatch** across API Unix sockets.
-- **Persistent control sockets** to APIs, with eager startup preconnect before serving external traffic.
-- **FD passing via libc `sendmsg(SCM_RIGHTS)`** over persistent Unix control sockets, using `MSG_NOSIGNAL`.
-- **Persistent Unix worker sockets** kept connected for the full process lifetime, reducing reconnect churn in the LB -> API handoff.
-- **Linux-only epoll listener loop** with non-blocking accept drain.
-- **Non-blocking listener + accept drain loop**: uses `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)` and drains until `EAGAIN` per wakeup.
-- **Light TCP tuning on the LB path**: applies `TCP_DEFER_ACCEPT` on the listener and `TCP_NODELAY` on accepted client sockets before FD passing.
-- **Background e2e startup warmup**: the LB issues internal `/fraud-score` requests against `127.0.0.1:PORT` to warm the full path (listener, fd passing, server parsing, response path).
-- **Readiness gating during warmup**: `/ready` is held at `503` until the e2e warmup finishes, reducing cold-start impact on the first benchmark run.
-- **Zero-copy request forwarding at LB layer**: accept -> select upstream -> pass client FD -> close local duplicate.
-- **Non-Linux editor mocks** under `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h`, intended only to avoid local typing/tooling errors.
-- **Minimal dependencies** (single C binary).
+- `1` load balancer
+- `2` API instances
+- a shared `tmpfs` for Unix sockets
 
-### `apps/server`
-- **Linux-only epoll multiplexing for both control sockets and forwarded client sockets**.
-- **Control channel accepts via `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`** for LB FD-passing sockets.
-- **FD-indexed state tables in the worker hot path**: control sockets and active client state are resolved directly by file descriptor, avoiding linear scans and fixed client slot caps after FD passing.
-- **Reused client-state allocations** via a local freelist, reducing `malloc`/`free` churn for the per-connection request buffers after FD passing.
-- **Incremental non-blocking request reads** with per-client buffers; no blocking `poll()` fallback in the request path.
-- **Non-blocking response writes** via `send(..., MSG_NOSIGNAL | MSG_DONTWAIT)` with partial-write handling, while the connection itself is still closed after each response for benchmark stability.
-- **Non-Linux editor mocks** reuse `packages/mocks/sys/epoll.h` and `packages/mocks/sys/socket.h` for local typing/tooling compatibility.
-- **Minimal HTTP parsing** optimized for the challenge endpoints:
-  - `GET /ready`
-  - `POST /fraud-score`
-  - fixed-format request-line matching with a single header-boundary scan
-- **Fast body extraction with known request length** (`get_body(..., request_len, ...)`) to avoid extra scans.
-- **Warm-up phase** at startup to reduce first-request latency variance:
-  - touches parser/vector path
-  - touches x-score pages
+## Architecture
 
-### Scoring (`apps/server/src/x-score.c`)
-- Uses an **IVF (Inverted File Index)** with learned centroids.
-- Chooses nearest centroid lists using **`nprobe`** (how many lists to probe per query).
-- Runs SIMD block scan only inside probed lists to maintain top-k nearest labels.
-- SIMD hot path in `scan_block`:
-  - `__AVX2__` on `amd64`
-  - `__ARM_NEON__` on `arm64`
-  - scalar fallback otherwise
-- Quantized `int16` vectors (`q16`) keep memory compact and cache-friendly.
+### 1. Load Balancer
 
-## 3. Vector Search Details (x-score)
+Main files:
 
-This section describes the vector search strategy used in `apps/server/src/x-score.c`.
+- [apps/load-balancer/src/main.c](/Users/cirilo/Desktop/test-load-balancer/apps/load-balancer/src/main.c)
+- [apps/load-balancer/src/upstream.c](/Users/cirilo/Desktop/test-load-balancer/apps/load-balancer/src/upstream.c)
+- [apps/load-balancer/src/listener.c](/Users/cirilo/Desktop/test-load-balancer/apps/load-balancer/src/listener.c)
+- [apps/load-balancer/src/env.c](/Users/cirilo/Desktop/test-load-balancer/apps/load-balancer/src/env.c)
 
-### Concepts Used (Names)
+The load balancer:
 
-- **IVF (Inverted File Index)**
-- **k-Means Centroids (Coarse Quantizer)**
-- **nprobe List Selection**
-- **Feature Normalization**
-- **Quantization (float -> int16 / q16)**
-- **List Bounding Boxes (AABB Lower Bound)**
-- **Top-K Maintenance**
-- **AoSoA (Array of Structures of Arrays)**
-- **SIMD Vectorization (AVX2 / NEON)**
+- opens a TCP listener on `:9999`
+- accepts connections in batches with `accept4`
+- applies `TCP_NODELAY` and `TCP_QUICKACK`
+- uses round robin across upstreams
+- sends the `client_fd` to the API with `sendmsg(..., SCM_RIGHTS)`
 
-### Data Representation
+Important details:
 
-- Each request is transformed into a 14-dimensional feature vector.
-- Features are normalized and quantized to `int16` (`q16`) with scale `10000`.
-- References are stored in `resources/references.idx` (generated by `scripts/build_binary_references.py`) as IVF data.
+- it uses `AF_UNIX + SOCK_SEQPACKET` for the internal channel
+- it uses `MSG_DONTWAIT` when sending the `fd`, with a blocking fallback
+- it uses `poll()` to sleep while the listener is idle
+- it reads internal socket paths from the `UPSTREAM_SOCKETS` environment variable
 
-### Index Layout
+### 2. Server
 
-- Header: metadata (magic, scale, dims, counts).
-- Centroid table: `nlist` centroid vectors (`int16`).
-- List directory: start block, block count, list length, and min/max bounds per list.
-- Vector storage: AoSoA blocks (`LANES=8`) for SIMD-friendly scans.
-- Labels: packed per block lane (fraud/legit).
+Main files:
 
-### Query Flow
+- [apps/server/src/main.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/main.c)
+- [apps/server/src/listener.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/listener.c)
+- [apps/server/src/transaction_context.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/transaction_context.c)
+- [apps/server/src/x_score.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/x_score.c)
 
-1. Quantize query vector (`double -> int16 q16`).
-2. Compute distance to all IVF centroids.
-3. Select the nearest centroid lists using:
-   - `X_SCORE_NPROBE` by default
-   - `X_SCORE_NPROBE_BORDERLINE` for borderline transactions (when configured)
-4. Optionally prune lists using list AABB lower bound vs current top-k worst distance.
-5. Scan selected list blocks (AoSoA + SIMD) and update top-k (`K=5`).
-6. If top-k fraud count is ambiguous, run a bounded repair pass over extra candidate lists.
-7. Count fraud labels in top-k and return fraud count.
+The server:
 
-### SIMD and Hot Path
+- creates one Unix listener per instance
+- accepts a single connection from the load balancer
+- receives `client_fd`s through `recvmsg(..., SCM_RIGHTS)`
+- distributes those `fd`s across `2` workers
+- lets each worker process its own clients with a dedicated `epoll` instance
 
-The `scan_block` hot path is architecture-specific:
-- `__AVX2__` for `amd64`
-- `__ARM_NEON__` for `arm64`
-- scalar fallback otherwise
+Current concurrency model:
 
-Runtime tuning:
-- `X_SCORE_NPROBE` (default `12`)
-- `X_SCORE_NPROBE_BORDERLINE` (default `0`, disabled)
-- `X_SCORE_REPAIR_MIN` (default `2`)
-- `X_SCORE_REPAIR_MAX` (default `3`)
+- `2` worker threads per API
+- one queue per worker
+- round robin in the main dispatcher
+- each worker manages its own sockets through `epoll`
 
-## 4. Build System (Makefile)
+### 3. HTTP Parsing
 
-Root `Makefile` controls binary compilation used by Docker builds.
+The HTTP parser is intentionally simple and narrow.
 
-Targets:
-- `make server`
+Supported routes:
+
+- `GET /ready`
+- `POST /fraud-score`
+
+Any other valid route returns:
+
+- `404 Not Found`
+
+Parsing includes:
+
+- header end detection through `\r\n\r\n`
+- `Content-Length` parsing
+- max-size validation
+- correct body consumption before sending the response
+
+### 4. Transaction Context
+
+Files:
+
+- [apps/server/src/transaction_context.h](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/transaction_context.h)
+- [apps/server/src/transaction_context.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/transaction_context.c)
+
+Responsibilities:
+
+- parse the JSON body of `POST /fraud-score`
+- map the fields into a `transaction_context`
+- convert that context into the numeric vector used by the scorer
+
+Request flow:
+
+1. parse the body
+2. call `transaction_context__to_vector(...)`
+3. call the scorer
+4. destroy the context
+
+## Index and Search
+
+Files:
+
+- [apps/server/src/x_score.h](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/x_score.h)
+- [apps/server/src/x_score.c](/Users/cirilo/Desktop/test-load-balancer/apps/server/src/x_score.c)
+- [scripts/build_references_idx.py](/Users/cirilo/Desktop/test-load-balancer/scripts/build_references_idx.py)
+- [resources/references.json.gz](/Users/cirilo/Desktop/test-load-balancer/resources/references.json.gz)
+
+The index is built at image build time from `references.json.gz`.
+
+Generated artifacts:
+
+- `/resources/refs.bin`
+- `/resources/kdtree.bin`
+
+Scorer characteristics:
+
+- `k-NN` search with `k = 5`
+- primary-key partitioning
+- a custom KD-tree
+- SIMD-friendly leaf layout
+- prebuilt responses for `fraud_score`
+
+Possible outputs:
+
+- `0.0`
+- `0.2`
+- `0.4`
+- `0.6`
+- `0.8`
+- `1.0`
+
+Decision rule:
+
+- count how many of the `top 5` neighbors are fraud
+- choose the matching response
+
+### SIMD
+
+The scorer uses architecture-specific vectorized paths:
+
+- `AVX2` on `amd64`
+- a compatible fallback path in the local environment
+
+## Current Tuning
+
+Tuning currently enabled:
+
+- `SO_SNDBUF` on the LB Unix socket
+- `SO_RCVBUF` and `SO_SNDBUF` on the API `control_fd`
+- larger backlog on the internal Unix listener
+- `EPOLL_BUSY_POLL_*`
+- `EPOLL_IDLE_US`
+- `SOCK_CLOEXEC`
+- `MSG_NOSIGNAL`
+- `TCP_NODELAY`
+- `TCP_QUICKACK`
+- batched `accept` on the load balancer
+
+Current compose sizing:
+
+- `load-balancer`: `0.20 CPU`, `20MB`
+- `api1`: `0.40 CPU`, `165MB`
+- `api2`: `0.40 CPU`, `165MB`
+
+## Build
+
+Files:
+
+- [Makefile](/Users/cirilo/Desktop/test-load-balancer/Makefile)
+- [apps/load-balancer/Dockerfile](/Users/cirilo/Desktop/test-load-balancer/apps/load-balancer/Dockerfile)
+- [apps/server/Dockerfile](/Users/cirilo/Desktop/test-load-balancer/apps/server/Dockerfile)
+
+`Makefile` targets:
+
 - `make load-balancer`
+- `make server`
 - `make clean`
 
-Default release flags:
-- `-Ofast`
-- `-DNDEBUG`
-- `-fomit-frame-pointer`
-- `-flto`
+The `Makefile`:
 
-Architecture-aware flags (`TARGETARCH`):
-- `amd64`: adds `-march=haswell -mtune=haswell`
-- `arm64`: no extra architecture-specific flags
+- detects `TARGETARCH`
+- uses `-Ofast`
+- uses `-pthread`
+- adds `-march=haswell -mtune=haswell` on `amd64`
 
-Note:
-- `-fno-rtti` is not used because the project is compiled as C, not C++.
+The `Dockerfile`s:
 
-Examples:
+- invoke the `Makefile`
+- generate static binaries
+- build the final image on `scratch`
 
-```bash
-make server TARGETARCH=arm64
-make load-balancer TARGETARCH=arm64
-```
+## Docker Compose
 
-```bash
-make server TARGETARCH=amd64
-make load-balancer TARGETARCH=amd64
-```
+Files:
 
-### Git Hooks (Lefthook)
+- [docker-compose.yml](/Users/cirilo/Desktop/test-load-balancer/docker-compose.yml)
+- [docker-compose.submission.yml](/Users/cirilo/Desktop/test-load-balancer/docker-compose.submission.yml)
 
-This repo includes `lefthook.yml` to run C formatting on `pre-commit`.
+The main compose file:
 
-Hook behavior:
-- formats staged `*.c` and `*.h` files with `clang-format`
-- re-stages fixed files automatically (`stage_fixed: true`)
+- starts the local environment
+- publishes `9999`
+- uses `tmpfs` for `/tmp`
+- disables container logs
 
-Setup:
+The submission compose file:
 
-```bash
-brew install lefthook clang-format
-lefthook install
-```
+- isolates the `linux/amd64` submission configuration
+- keeps the same service layout
 
-Run manually (optional):
+## How To Run
+
+### Start the environment
 
 ```bash
-lefthook run pre-commit
+docker compose up -d --build
 ```
 
-## 5. Python Scripts
-
-### `scripts/build_binary_references.py`
-Builds the binary scoring index used at runtime.
-
-- Input: `resources/references.json.gz`
-- Output: `resources/references.idx`
-- Format: IVF binary layout (header + centroids + list directory + vectors + labels).
-- Trains centroids with k-means (vectorized with `numpy` when available).
-- Supports tuning build parameters: `--nlist`, `--max-iter`, `--chunk-size`, `--seed`.
-
-Command:
-
-```bash
-python3 scripts/build_binary_references.py
-```
-
-### `scripts/tune_partition_cutoffs.py`
-Legacy utility from the previous partitioned index format.
-
-Command:
-
-```bash
-python3 scripts/tune_partition_cutoffs.py --index resources/references.idx
-```
-
-Optional JSON output:
-
-```bash
-python3 scripts/tune_partition_cutoffs.py \
-  --index resources/references.idx \
-  --json /tmp/cutoffs.json
-```
-
-## 6. Project Structure
-
-```text
-.
-├── Makefile
-├── docker-compose.yml
-├── apps
-│   ├── load-balancer
-│   │   ├── Dockerfile
-│   │   └── src/
-│   │       ├── main.c
-│   │       ├── utils.c
-│   │       ├── utils.h
-│   │       ├── warmup.c
-│   │       └── warmup.h
-│   └── server
-│       ├── Dockerfile
-│       └── src/
-├── resources
-│   ├── references.json.gz
-│   └── references.idx
-├── scripts
-│   ├── build_binary_references.py
-│   └── tune_partition_cutoffs.py
-└── test
-    ├── smoke.js
-    ├── test.js
-    ├── test-data.json
-    └── results.json
-```
-
-## 7. Build and Run with Docker Compose
-
-### Build + start
-
-Use `--compatibility` so local Compose enforces `deploy.resources.limits`.
-
-```bash
-docker compose --compatibility up -d --build
-```
-
-### Stop
+### Stop the environment
 
 ```bash
 docker compose down
 ```
 
-### Logs
+### Health check
 
 ```bash
-docker compose logs -f
+curl http://127.0.0.1:9999/ready
 ```
 
-## 8. Resource Limits (Rinha Budget)
+## Tests
 
-Configured in `docker-compose.yml`:
-- `api1`: `0.47 CPU`, `150MB`
-- `api2`: `0.47 CPU`, `150MB`
-- `load-balancer`: `0.06 CPU`, `50MB`
+Files:
 
-Total: **1.00 CPU / 350MB**.
+- [test/test.js](/Users/cirilo/Desktop/test-load-balancer/test/test.js)
+- [test/smoke.js](/Users/cirilo/Desktop/test-load-balancer/test/smoke.js)
 
-## 9. Environment Variables
-
-### API
-- `UNIX_SOCKET_PATH` (required)
-- `X_SCORE_INDEX_PATH` (required)
-- `X_SCORE_NPROBE` (optional, default `12`)
-- `X_SCORE_NPROBE_BORDERLINE` (optional, default `0`, set `>0` to enable adaptive probes)
-- `X_SCORE_REPAIR_MIN` (optional, default `2`, set `0` to disable repair pass)
-- `X_SCORE_REPAIR_MAX` (optional, default `3`, set `0` to disable repair pass)
-
-### Load Balancer
-- `PORT` (default `9999`)
-- `WORKER_SOCKETS` (comma-separated Unix socket list)
-
-## 10. API Endpoints
-
-### `GET /ready`
-Health/readiness endpoint.
-
-### `POST /fraud-score`
-Scores a transaction payload and returns decision fields.
-
-## 11. Test Commands
-
-### Curl quick check
+If you have `k6` installed:
 
 ```bash
-curl -i http://localhost:9999/ready
+k6 run test/test.js
 ```
+
+Via Docker:
 
 ```bash
-curl -i http://localhost:9999/fraud-score \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  --data-raw '{
-    "id": "tx-3576980410",
-    "transaction": {
-      "amount": 384.88,
-      "installments": 3,
-      "requested_at": "2026-03-11T20:23:35Z"
-    },
-    "customer": {
-      "avg_amount": 769.76,
-      "tx_count_24h": 3,
-      "known_merchants": ["MERC-009", "MERC-001", "MERC-001"]
-    },
-    "merchant": {
-      "id": "MERC-001",
-      "mcc": "5912",
-      "avg_amount": 298.95
-    },
-    "terminal": {
-      "is_online": false,
-      "card_present": true,
-      "km_from_home": 13.7090520965
-    },
-    "last_transaction": {
-      "timestamp": "2026-03-11T14:58:35Z",
-      "km_from_current": 18.8626479774
-    }
-  }'
+docker run --rm --network host -v "$PWD":/work -w /work grafana/k6 run test/test.js
 ```
 
-### Smoke test (k6)
+Smoke test:
 
 ```bash
-docker run --rm -i \
-  --network rinha-backend_rinha \
-  -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://load-balancer:9999 \
-  grafana/k6 run test/smoke.js
+docker run --rm --network host -v "$PWD":/work -w /work grafana/k6 run test/smoke.js
 ```
 
-### Full load/scoring test (k6)
+Results are written to:
 
-```bash
-docker run --rm -i \
-  --network rinha-backend_rinha \
-  -v "$PWD:/work" -w /work \
-  -e BASE_URL=http://load-balancer:9999 \
-  grafana/k6 run test/test.js
-```
+- [test/results.json](/Users/cirilo/Desktop/test-load-balancer/test/results.json)
 
-Result summary is written to:
-- `test/results.json`
+## Development Mocks on macOS
 
-## 12. Building for Final Submission (`linux-amd64`)
+Files:
 
-Official target is `linux-amd64`.  
-This project enables AVX2 on `amd64` builds through the Makefile flags.
+- [packages/mocks/sys/socket.h](/Users/cirilo/Desktop/test-load-balancer/packages/mocks/sys/socket.h)
+- `packages/mocks/netinet/*.h`
 
-For Docker buildx:
+These mocks exist to:
 
-```bash
-docker buildx build --platform linux/amd64 -f apps/server/Dockerfile .
-docker buildx build --platform linux/amd64 -f apps/load-balancer/Dockerfile .
-```
+- satisfy `clangd`
+- avoid editor errors on macOS
+- keep Linux-like constants visible to the code
 
-## 13. Notes
+They are not used in the real Linux submission build.
 
-- Keep `resources/references.idx` synchronized with `resources/references.json.gz` whenever you rebuild the index.
-- For local performance comparison, always run with:
-  - same compose limits
-  - `--compatibility`
-  - same k6 script/options
+## Current Status
+
+The project is currently optimized for:
+
+- perfect detection accuracy
+- low latency
+- a very short hot path between `LB -> API -> scorer`
+
+Key points of the current state:
+
+- search is already in the best known form for this project
+- `2` workers per API gave the best trade-off observed so far
+- tuning on the internal Unix channel produced real gains
+- more aggressive experiments with a global queue and extra workers did not pay off
